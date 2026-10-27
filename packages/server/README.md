@@ -55,11 +55,13 @@ npm run dev           # wrangler dev on http://localhost:8787
    `INCONCLUSIVE` means it stayed in memory; Cloudflare doesn't promise
    when it hibernates, so try a longer idle.
 
-3. Check the billing side a few minutes later. Create an API token with
-   **Account Analytics: Read**, then:
+3. Check the billing side a few minutes later (analytics can lag by ten
+   minutes or more). The script uses wrangler's login, or
+   `CLOUDFLARE_API_TOKEN` if set; your account ID is in
+   `npx wrangler whoami`:
 
    ```
-   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... \
+   CLOUDFLARE_ACCOUNT_ID=... \
      npm run usage -- --since <time the probe started, ISO 8601>
    ```
 

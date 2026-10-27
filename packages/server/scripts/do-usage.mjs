@@ -3,13 +3,15 @@
 // to confirm that hibernated time isn't billed.
 //
 // Usage:
-//   CLOUDFLARE_API_TOKEN=... CLOUDFLARE_ACCOUNT_ID=... \
+//   CLOUDFLARE_ACCOUNT_ID=... \
 //     node scripts/do-usage.mjs [--since 2026-10-26T18:00:00Z] [--until ...]
 //
-// The token needs the "Account Analytics: Read" permission. The script
-// discovers the dataset's fields by introspection rather than hard-coding
-// them, since Cloudflare's docs don't list them all.
+// It uses wrangler's login, or CLOUDFLARE_API_TOKEN if set (that token
+// needs "Account Analytics: Read"). The script discovers the dataset's
+// fields by introspection rather than hard-coding them, since Cloudflare's
+// docs don't list them all.
 
+import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
 
 const { values: opts } = parseArgs({
@@ -18,10 +20,20 @@ const { values: opts } = parseArgs({
     until: { type: "string", default: new Date().toISOString() },
   },
 });
-const token = process.env.CLOUDFLARE_API_TOKEN;
+// Without CLOUDFLARE_API_TOKEN, use wrangler's own login, which can read
+// account analytics.
+function wranglerToken() {
+  try {
+    return execFileSync("npx", ["wrangler", "auth", "token"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+      .trim().split("\n").pop();
+  } catch {
+    return undefined;
+  }
+}
+const token = process.env.CLOUDFLARE_API_TOKEN || wranglerToken();
 const accountTag = process.env.CLOUDFLARE_ACCOUNT_ID;
 if (!token || !accountTag) {
-  console.error("set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID");
+  console.error("set CLOUDFLARE_ACCOUNT_ID, and either run `npx wrangler login` or set CLOUDFLARE_API_TOKEN");
   process.exit(2);
 }
 
