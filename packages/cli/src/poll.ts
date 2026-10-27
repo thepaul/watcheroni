@@ -1,0 +1,53 @@
+import type { WatchEvent } from "@watcheroni/protocol";
+import { diff, initialMemory } from "./diff.ts";
+import { LoginNeeded } from "./github.ts";
+import type { Inbox } from "./inbox.ts";
+import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
+
+export type Fetch = typeof fetchSnapshot;
+
+// Polls every PR watched in the inbox once, saving any new events. A PR
+// seen for the first time sets the starting point and reports nothing,
+// unless it has already ended. Ended PRs stop being watched.
+export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: Fetch = fetchSnapshot): Promise<WatchEvent[]> {
+  const added: WatchEvent[] = [];
+  for (const w of inbox.watched()) {
+    const key = `${w.target.owner}/${w.target.name}#${w.target.number}`;
+    let next: Snapshot;
+    try {
+      next = await fetch(w.target);
+    } catch (e) {
+      if (e instanceof LoginNeeded) throw e;
+      log(`${key}: ${(e as Error).message}; trying again next time`);
+      continue;
+    }
+    if (!w.snapshot || !w.memory) {
+      inbox.update(key, next, initialMemory(next));
+      if (next.state !== "OPEN") {
+        const reason = next.state === "MERGED" ? "merged" : "closed";
+        added.push(...inbox.append([{
+          v: 1,
+          id: `local:${key}:watch.ended:${reason}`,
+          sub: null,
+          kind: "watch.ended",
+          at: next.fetchedAt,
+          received_at: next.fetchedAt,
+          repo: next.repo,
+          pr: next.number,
+          actor: null,
+          data: { reason },
+          links: { html: next.url },
+        }]));
+        inbox.unwatch(key);
+      } else {
+        inbox.save();
+      }
+      continue;
+    }
+    const { events, memory } = diff(w.snapshot, next, w.memory);
+    inbox.update(key, next, memory);
+    added.push(...inbox.append(events));
+    if (events.some((e) => e.kind === "watch.ended")) inbox.unwatch(key);
+  }
+  return added;
+}

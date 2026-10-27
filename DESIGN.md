@@ -391,6 +391,31 @@ A scheduled (cron) handler runs every 10 minutes for redelivery (below).
 5. Return `202`. GitHub waits at most 10 seconds; this takes a few
    milliseconds plus one Durable Object call.
 
+### Webhook CPU
+
+Measured on the free plan on 2026-10-27 with `scripts/webhook-cpu.mjs`,
+which sends GitHub's example payloads and enlarged copies of them to the
+deployed Worker. The figures are CPU per request (signature check, parse,
+normalise), read from `wrangler tail`, which reports whole milliseconds:
+
+| Payload | Size | CPU, median | CPU, worst |
+|---|---|---|---|
+| Real examples (PRs, reviews, comments, checks, workflow runs) | 11–23 KB | 0 ms | 3 ms |
+| PR opened with a maximum-length body, 100 labels, 15 reviewers | 194 KB | 1 ms | 1 ms |
+| Issue comment with maximum-length comment and issue bodies | 290 KB | 2 ms | 3 ms |
+| Failed check run with maximum-length summary and text, 20 PRs | 276 KB | 2 ms | 3 ms |
+| Padded to 1 MB | 1 MB | 3 ms | 4 ms |
+| Padded to 5 MB | 5 MB | 11 ms | 22 ms |
+
+GitHub caps bodies, comments and check output at 65,536 characters, so
+the enlarged payloads are close to the largest that the subscribed events
+can be. They use 4-byte characters throughout. Cost grows at about
+2.5 ms per megabyte. Only `push`-style events with long commit lists get
+to several megabytes, and the App doesn't subscribe to those. So the
+Worker refuses webhook bodies over 2 MB (`413`, logged) before checking
+the signature. Requests over 10 ms still succeeded in these runs, but the
+design shouldn't count on that headroom.
+
 ### Missed deliveries
 
 GitHub doesn't retry failed deliveries. Every 10 minutes the cron handler
@@ -791,8 +816,15 @@ It runs on the deployer's own Cloudflare account, free plan included.
    billed while idle), and measure Worker CPU for normalising large
    webhook payloads. Also confirm that a background Bash command in
    Claude Code survives for hours.
+   *Done on 2026-10-27, except the background Bash check:* the object
+   hibernated with three clients and a bridge attached, with no duration
+   billed for the idle minutes (see `packages/server/README.md`), and
+   webhook CPU is under 4 ms for any realistic payload (see "Webhook
+   CPU").
 2. **CLI in local mode only** (`wait`, `stream`, `exec` polling GitHub).
    Useful on its own; replaces Auto-Fix for one user straight away.
+   *Built on 2026-10-27* in `packages/cli`, together with
+   `packages/protocol`, which now holds the shared types.
 3. **Server MVP:** webhook → RepoHub → Account → WebSocket for PR
    subscriptions, device-flow login, API keys. Develop with `wrangler dev`
    and `gh webhook forward` or smee relaying a test App's deliveries.

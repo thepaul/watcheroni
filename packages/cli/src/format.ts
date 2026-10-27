@@ -1,0 +1,114 @@
+import type { WatchEvent } from "@watcheroni/protocol";
+
+// `wait`'s text output, written so an agent can act on it without reading
+// docs. Each line ends with the command that fetches the content, since
+// events carry pointers, not text.
+
+export function formatText(events: WatchEvent[], stillWatching: string[]): string {
+  const groups = new Map<string, WatchEvent[]>();
+  for (const e of events) {
+    const key = e.repo ? (e.pr !== null ? `${e.repo.full_name}#${e.pr}` : e.repo.full_name) : "other";
+    groups.set(key, [...(groups.get(key) ?? []), e]);
+  }
+  const lines: string[] = [];
+  for (const [key, list] of groups) {
+    lines.push(`${key}: ${list.length} new event${list.length === 1 ? "" : "s"}`);
+    lines.push(...describeAll(list));
+    lines.push("");
+  }
+  lines.push(footer(stillWatching));
+  return lines.join("\n");
+}
+
+export function footer(stillWatching: string[]): string {
+  if (!stillWatching.length) return "Nothing is left to watch: every watched PR has been merged or closed.";
+  const what = stillWatching.length === 1 ? `${stillWatching[0]} is still open` : `Still watching ${stillWatching.join(", ")}`;
+  return `${what}. Run \`watcheroni wait\` again to keep watching.`;
+}
+
+function describeAll(events: WatchEvent[]): string[] {
+  const lines: string[] = [];
+  // A review's comments are listed under it, not one by one.
+  const byReview = new Map<number, WatchEvent[]>();
+  for (const e of events) {
+    const reviewId = e.data.review_id;
+    if (e.kind === "review_comment.created" && typeof reviewId === "number") {
+      byReview.set(reviewId, [...(byReview.get(reviewId) ?? []), e]);
+    }
+  }
+  const shownReviews = new Set<number>();
+  for (const e of events) {
+    const reviewId = typeof e.data.review_id === "number" ? e.data.review_id : null;
+    if (e.kind === "review_comment.created" && reviewId !== null && (byReview.get(reviewId)?.length ?? 0) > 1) {
+      if (shownReviews.has(reviewId)) continue;
+      shownReviews.add(reviewId);
+      const comments = byReview.get(reviewId)!;
+      const where = comments.map((c) => (c.data.path ? `${c.data.path}${c.data.line ? `:${c.data.line}` : ""}` : "?"));
+      lines.push(`- ${comments.length} review comments${by(e)} on ${where.join(", ")}`);
+      lines.push(`  gh api ${repoPath(e)}/pulls/${e.pr}/reviews/${reviewId}/comments`);
+      continue;
+    }
+    const [text, command] = describe(e);
+    lines.push(`- ${text}`);
+    if (command) lines.push(`  ${command}`);
+  }
+  return lines;
+}
+
+function describe(e: WatchEvent): [string, string | null] {
+  const d = e.data;
+  const repo = repoPath(e);
+  const short = (sha: unknown) => (typeof sha === "string" ? sha.slice(0, 7) : "?");
+  switch (e.kind) {
+    case "review.submitted":
+      return [`review.submitted${by(e)}: ${d.state}`, `gh api ${repo}/pulls/${e.pr}/reviews/${d.review_id}`];
+    case "review.dismissed":
+      return [`review.dismissed: review ${d.review_id}`, null];
+    case "review_comment.created": {
+      const where = d.path ? ` on ${d.path}${d.line ? `:${d.line}` : ""}` : "";
+      const reply = d.in_reply_to ? " (a reply)" : "";
+      return [`review_comment.created${by(e)}${where}${reply}`, `gh api ${repo}/pulls/comments/${d.comment_id}`];
+    }
+    case "comment.created":
+      return [`comment.created${by(e)}`, `gh api ${repo}/issues/comments/${d.comment_id}`];
+    case "thread.resolved":
+    case "thread.unresolved":
+      return [e.kind, null];
+    case "check.failed": {
+      const command = typeof d.workflow_run_id === "number"
+        ? `gh run view ${d.workflow_run_id} -R ${e.repo?.full_name} --log-failed`
+        : typeof d.check_run_id === "number" ? `gh api ${repo}/check-runs/${d.check_run_id}` : e.links.html ?? null;
+      return [`check.failed: "${d.name}" (${d.conclusion}) on ${short(d.head_sha)}`, command];
+    }
+    case "checks.completed": {
+      const failed = Array.isArray(d.failed) && d.failed.length ? `; failed: ${d.failed.join(", ")}` : "";
+      return [`checks.completed on ${short(d.head_sha)}: ${d.result}${failed}`, null];
+    }
+    case "workflow.completed":
+      return [`workflow.completed: "${d.workflow}" ${d.conclusion}`, d.conclusion === "success" ? null : `gh run view ${d.run_id} -R ${e.repo?.full_name} --log-failed`];
+    case "merge.conflict":
+      return [`merge.conflict with the base branch (head ${short(d.head_sha)}, base ${short(d.base_sha)})`, null];
+    case "merge.clean":
+      return ["merge.clean: the conflict is gone", null];
+    case "pr.pushed":
+      return [`pr.pushed: ${short(d.before)} -> ${short(d.after)}`, null];
+    case "pr.base_changed":
+      return [`pr.base_changed: ${d.from} -> ${d.to}`, null];
+    case "pr.review_requested":
+      return [`pr.review_requested: ${d.reviewer}`, null];
+    case "pr.merged":
+      return [`pr.merged as ${short(d.merge_sha)}`, null];
+    case "watch.ended":
+      return [`watch.ended: the PR was ${d.reason}`, null];
+    default:
+      return [`${e.kind}${by(e)}`, e.links.api ? `gh api ${e.links.api.replace("https://api.github.com/", "")}` : null];
+  }
+}
+
+function by(e: WatchEvent): string {
+  return e.actor ? ` by ${e.actor.login}` : "";
+}
+
+function repoPath(e: WatchEvent): string {
+  return `repos/${e.repo?.full_name ?? "?"}`;
+}

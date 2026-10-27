@@ -10,6 +10,6 @@
     "bindings": [{ "name": "ACCOUNT", "class_name": "Account" }]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Account"] }]
-  // Secret, not in this file: PROTO_TOKEN (wrangler secret put PROTO_TOKEN,
-  // or .dev.vars for wrangler dev).
+  // Secrets, not in this file: PROTO_TOKEN and GITHUB_WEBHOOK_SECRET
+  // (wrangler secret put, or .dev.vars for wrangler dev).
 }

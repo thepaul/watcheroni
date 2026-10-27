@@ -11,7 +11,9 @@ What's here, compared with the full design:
   `GET .../events?after=&wait=&limit=` long-polling through the Worker
   bridge, the WebSocket protocol (`hello`, `ready`, `events`, `ack`,
   `ping`/`pong` answered by the runtime), and the `watcheroni.v1`
-  subprotocol.
+  subprotocol. `POST /github/webhook` checks GitHub's signature and
+  normalises the payload into events, but routes them nowhere yet (the
+  response lists them).
 - **Stand-ins:** one shared `PROTO_TOKEN` instead of login and API keys
   (sent as `Authorization: Bearer`, or `?token=` on the WebSocket instead
   of tickets); `POST /debug/inboxes/{name}/events` instead of webhooks and
@@ -71,6 +73,21 @@ npm run dev           # wrangler dev on http://localhost:8787
 
 Live logs while probing: `npx wrangler tail`.
 
+## Measure webhook CPU
+
+Set `GITHUB_WEBHOOK_SECRET` on the Worker (`npx wrangler secret put`),
+then:
+
+```
+node scripts/webhook-cpu.mjs --url https://watcheroni-proto.<subdomain>.workers.dev \
+  --secret <GITHUB_WEBHOOK_SECRET> --repeat 15
+```
+
+It sends GitHub's example payloads and enlarged copies of them, and
+reads each request's CPU time from `wrangler tail`. Tail samples, so it
+usually sees about half the requests. Results are in DESIGN.md under
+"Webhook CPU".
+
 ## Result so far
 
 Locally (`wrangler dev`, workerd 1.20261023.1), on 2026-10-26: with three
@@ -82,5 +99,17 @@ On Cloudflare (free plan, `watcheroni-proto.shinycode.workers.dev`), on
 2026-10-27 at 01:22 UTC: three WebSocket clients and a long-poll held by
 the Worker for 182 s. The object was evicted during the 180-second idle,
 18 keepalive pings didn't wake it, no client socket dropped, and all four
-waiters received the injected event within 90 ms. PASS. The billing check
-(`npm run usage`) hasn't been run yet.
+waiters received the injected event within 90 ms. PASS.
+
+Billing for that run, from `npm run usage` (activeTime in microseconds,
+duration in GB-s):
+
+| Minute (UTC) | activeTime | cpuTime | duration | What happened |
+|---|---|---|---|---|
+| 01:22 | 194,753 | 9,883 | 0.0249 | sockets opened, bridge attached |
+| 01:23 | no row | | | idle, 4 sockets open |
+| 01:24 | no row | | | idle, 4 sockets open |
+| 01:25 | 41,119 | 3,796 | 0.0053 | event injected, all woken |
+
+Nothing was billed while the object hibernated. The whole run cost
+0.03 GB-s of the free plan's 13,000 GB-s a day.

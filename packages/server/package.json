@@ -15,8 +15,12 @@
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.8",
+    "@octokit/webhooks-examples": "^7.6.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.12",
     "wrangler": "^4.153.0"
+  },
+  "dependencies": {
+    "@watcheroni/protocol": "0.0.0"
   }
 }

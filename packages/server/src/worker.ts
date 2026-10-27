@@ -1,9 +1,12 @@
 // Prototype Worker: one Account Durable Object with hibernated WebSockets
 // and the long-poll bridge described in DESIGN.md. Login, API keys,
 // tickets and RepoHub are left out; a single shared PROTO_TOKEN stands in
-// for authentication, and /debug stands in for webhooks.
+// for authentication, and /debug stands in for RepoHub. GitHub webhooks
+// are verified and normalised but not yet routed anywhere.
 
 import type { Account, Delivery } from "./account";
+import { normalise } from "./webhook/normalise";
+import { verifySignature } from "./webhook/signature";
 import {
   INBOX_NAME,
   MAX_LIMIT,
@@ -21,6 +24,8 @@ export { Account } from "./account";
 // Everything in the prototype belongs to one account.
 const ACCOUNT_NAME = "acct:proto";
 
+const MAX_WEBHOOK_BYTES = 2 * 1024 * 1024;
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -34,6 +39,10 @@ export default {
         features: ["ws", "longpoll"],
         limits: { max_wait_seconds: MAX_WAIT_SECONDS },
       });
+    }
+
+    if (pathname === "/github/webhook" && request.method === "POST") {
+      return webhook(request, env);
     }
 
     if (!(await authorized(request, url, env))) {
@@ -103,6 +112,33 @@ export default {
     return problem(404, "not_found", "No such endpoint");
   },
 } satisfies ExportedHandler<Env>;
+
+// POST /github/webhook: steps 1 and 3 of "Webhook handling in the Worker"
+// in DESIGN.md. Until RepoHub exists the events go nowhere; the response
+// lists them, which GitHub ignores and tests and tools read.
+async function webhook(request: Request, env: Env): Promise<Response> {
+  const body = await request.arrayBuffer();
+  // Parsing costs about 2.5 ms of CPU a megabyte, and the free plan allows
+  // 10 ms a request. None of the events the App subscribes to come near
+  // this size; see "Webhook CPU" in DESIGN.md.
+  if (body.byteLength > MAX_WEBHOOK_BYTES) {
+    console.warn(`webhook ${request.headers.get("X-GitHub-Delivery")} dropped: ${body.byteLength} bytes`);
+    return problem(413, "too_large", "Webhook body too large");
+  }
+  if (!(await verifySignature(body, request.headers.get("X-Hub-Signature-256"), [env.GITHUB_WEBHOOK_SECRET]))) {
+    return problem(401, "unauthorized", "Bad webhook signature");
+  }
+  const event = request.headers.get("X-GitHub-Event") ?? "";
+  const delivery = request.headers.get("X-GitHub-Delivery") ?? crypto.randomUUID();
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(body));
+  } catch {
+    return problem(400, "invalid_request", "Body is not JSON");
+  }
+  const events = normalise(event, delivery, payload, new Date().toISOString());
+  return json({ events }, 202);
+}
 
 // GET /v1/inboxes/{name}/events?after=&wait=&limit=
 //

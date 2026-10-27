@@ -7,9 +7,7 @@
 //     node scripts/do-usage.mjs [--since 2026-10-26T18:00:00Z] [--until ...]
 //
 // It uses wrangler's login, or CLOUDFLARE_API_TOKEN if set (that token
-// needs "Account Analytics: Read"). The script discovers the dataset's
-// fields by introspection rather than hard-coding them, since Cloudflare's
-// docs don't list them all.
+// needs "Account Analytics: Read").
 
 import { execFileSync } from "node:child_process";
 import { parseArgs } from "node:util";
@@ -48,26 +46,14 @@ async function gql(query, variables = {}) {
   return body.data;
 }
 
-const unwrap = (t) => (t.ofType ? unwrap(t.ofType) : t);
-async function typeFields(name) {
-  const data = await gql(`query($n: String!) { __type(name: $n) { fields { name type { name kind ofType { name kind ofType { name kind ofType { name kind } } } } } } }`, { n: name });
-  return data.__type?.fields ?? [];
-}
-
-const accountFields = await typeFields("account");
-const datasetField = accountFields.find((f) => f.name === "durableObjectsPeriodicGroups");
-if (!datasetField) throw new Error("no durableObjectsPeriodicGroups dataset on this account type");
-const groupType = unwrap(datasetField.type).name;
-const groupFields = await typeFields(groupType);
-const sumType = unwrap(groupFields.find((f) => f.name === "sum").type).name;
-const dimType = unwrap(groupFields.find((f) => f.name === "dimensions").type).name;
-const sumFields = (await typeFields(sumType)).map((f) => f.name);
-const dimFields = (await typeFields(dimType)).map((f) => f.name);
-const timeDim = ["datetimeMinute", "datetimeFiveMinutes", "datetimeHour", "date"].find((d) => dimFields.includes(d));
-const extraDims = ["namespaceId", "objectId"].filter((d) => dimFields.includes(d));
-
-console.log(`dataset fields: sum { ${sumFields.join(", ")} }`);
-console.log(`dimensions: ${dimFields.join(", ")}\n`);
+// Field names from introspecting the dataset on 2026-10-27. Introspection
+// counts against the Analytics API's rate limit, so it isn't repeated.
+const timeDim = "datetimeMinute";
+const extraDims = ["objectId"];
+const sumFields = [
+  "activeTime", "cpuTime", "duration", "inboundWebsocketMsgCount", "outboundWebsocketMsgCount",
+  "rowsRead", "rowsWritten", "storageReadUnits", "storageWriteUnits", "subrequests",
+];
 
 const query = `query($account: String!, $since: Time!, $until: Time!) {
   viewer { accounts(filter: { accountTag: $account }) {
