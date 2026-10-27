@@ -1,10 +1,11 @@
 // Prototype Worker: one Account Durable Object with hibernated WebSockets
-// and the long-poll bridge described in DESIGN.md. Login, API keys,
-// tickets and RepoHub are left out; a single shared PROTO_TOKEN stands in
-// for authentication, and /debug stands in for RepoHub. GitHub webhooks
-// are verified and normalised but not yet routed anywhere.
+// and the long-poll bridge described in DESIGN.md, and RepoHub. Login, API
+// keys and tickets are left out; a single shared PROTO_TOKEN stands in for
+// authentication. GitHub webhooks are verified, normalised and sent to
+// RepoHub; subscriptions are made through /debug until /v1 has sign-in.
 
 import type { Account, Delivery } from "./account";
+import type { NewSubscription, PrBaseline } from "./repo-hub";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
 import {
@@ -20,6 +21,7 @@ import {
 } from "./protocol";
 
 export { Account } from "./account";
+export { RepoHub } from "./repo-hub";
 
 // Everything in the prototype belongs to one account.
 const ACCOUNT_NAME = "acct:proto";
@@ -53,6 +55,9 @@ export default {
     if (pathname === "/debug/stats" && request.method === "GET") {
       return json(await account.stats());
     }
+
+    const repoRoute = pathname.match(/^\/debug\/repos\/(\d+)(?:\/subscriptions(?:\/([^/]+))?)?$/);
+    if (repoRoute) return debugRepo(request, env, Number(repoRoute[1]), repoRoute[0].includes("/subscriptions"), repoRoute[2]);
 
     const m = pathname.match(/^\/(v1|debug)\/inboxes\/([^/]+)(\/[a-z]+)?$/);
     if (!m) return problem(404, "not_found", "No such endpoint");
@@ -113,9 +118,9 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-// POST /github/webhook: steps 1 and 3 of "Webhook handling in the Worker"
-// in DESIGN.md. Until RepoHub exists the events go nowhere; the response
-// lists them, which GitHub ignores and tests and tools read.
+// POST /github/webhook: steps 1, 3 and 4 of "Webhook handling in the
+// Worker" in DESIGN.md. The response lists the events and what RepoHub did
+// with them, which GitHub ignores and tests and tools read.
 async function webhook(request: Request, env: Env): Promise<Response> {
   const body = await request.arrayBuffer();
   // Parsing costs about 2.5 ms of CPU a megabyte, and the free plan allows
@@ -137,7 +142,36 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     return problem(400, "invalid_request", "Body is not JSON");
   }
   const events = normalise(event, delivery, payload, new Date().toISOString());
-  return json({ events }, 202);
+  // Deliveries that normalise to nothing never reach a Durable Object.
+  const repoId = events[0]?.repo?.id;
+  const ingest = repoId ? await env.REPO_HUB.get(env.REPO_HUB.idFromName(`repo:${repoId}`)).ingest(delivery, events) : null;
+  return json({ events, ingest }, 202);
+}
+
+// Stands in for the /v1 subscription endpoints until sign-in exists:
+//   GET    /debug/repos/{id}                     RepoHub's state
+//   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, ignore?, full_name?, baseline?}
+//   DELETE /debug/repos/{id}/subscriptions/{sub}
+async function debugRepo(request: Request, env: Env, repoId: number, subs: boolean, subId?: string): Promise<Response> {
+  const hub = env.REPO_HUB.get(env.REPO_HUB.idFromName(`repo:${repoId}`));
+  if (!subs && request.method === "GET") return json(await hub.stats());
+  if (subs && !subId && request.method === "POST") {
+    const body = await readJson<NewSubscription & { full_name?: string; private?: boolean; baseline?: PrBaseline }>(request);
+    if (!body || typeof body.inbox !== "string" || !INBOX_NAME.test(body.inbox)) {
+      return problem(400, "invalid_request", "Body needs account, inbox and pr");
+    }
+    const { full_name = `repo-${repoId}`, private: isPrivate, baseline, ...sub } = body;
+    const result = await hub.subscribe({ ...sub, pr: sub.pr ?? null }, { id: repoId, full_name, private: isPrivate }, baseline);
+    if (!result.ok) {
+      const { status, code, detail } = result;
+      return problem(status, code, detail, result.retry_after ? { retry_after: result.retry_after } : {});
+    }
+    return json(result.subscription, result.created ? 201 : 200);
+  }
+  if (subId && request.method === "DELETE") {
+    return (await hub.unsubscribe(subId)) ? new Response(null, { status: 204 }) : problem(404, "not_found", "No such subscription");
+  }
+  return problem(404, "not_found", "No such endpoint");
 }
 
 // GET /v1/inboxes/{name}/events?after=&wait=&limit=
