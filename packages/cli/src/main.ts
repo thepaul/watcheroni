@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
 import { parseArgs } from "node:util";
-import { matchesKind, type WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
+import { loadServer } from "./config.ts";
+import { Feed } from "./feed.ts";
 import { formatText, footer } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
 import { pollOnce } from "./poll.ts";
-import { UsageError, currentBranchPr, parseTarget, targetKey, type Target } from "./targets.ts";
+import { ServerClient, ServerError, ServerReader, Unreachable, subscribe } from "./server.ts";
+import { UsageError, currentBranchPr, parseTarget, targetKey } from "./targets.ts";
 
 // Exit codes (DESIGN.md, "The CLI").
 const EXIT = { events: 0, error: 1, timeout: 2, ended: 3, login: 4 } as const;
@@ -33,12 +35,14 @@ Options:
 wait exits 0 after printing events, 2 on timeout, 3 when every watched PR
 has ended, 4 when GitHub credentials are missing, 1 on other errors.
 
-This version polls GitHub directly with your gh login (or GH_TOKEN). The
-token is used only on this machine.
+With a server ($WATCHERONI_SERVER and $WATCHERONI_API_KEY, or
+~/.config/watcheroni), wait, stream and exec read the inbox on the server.
+Without one, or when it can't be reached, they poll GitHub from this
+machine with your gh login (or GH_TOKEN). That token is never sent to the
+server.
 `;
 
 const log = (msg: string) => process.stderr.write(`watcheroni: ${msg}\n`);
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export function parseDuration(s: string): number {
   const m = s.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)?$/);
@@ -96,6 +100,7 @@ async function main(argv: string[]): Promise<number> {
   if (verb === "exec" && !command.length) throw new UsageError("exec needs a command after --");
   if (opts.format !== "text" && opts.format !== "json") throw new UsageError("--format is text or json");
 
+  const config = loadServer();
   const inbox = Inbox.open(inboxName);
   const targets = args.map(parseTarget);
 
@@ -107,120 +112,137 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
+  // With a server: make sure the inbox exists, which also checks the key.
+  const client = config && new ServerClient(config);
+  let reachable = false;
+  if (client) {
+    try {
+      await client.ensureInbox(inboxName);
+      reachable = true;
+    } catch (e) {
+      if (!(e instanceof Unreachable)) throw e;
+      log(`${e.message}; polling GitHub from this machine instead`);
+    }
+  }
+
   if (!targets.length) {
     try {
       targets.push(await currentBranchPr());
     } catch (e) {
       // Fine if the inbox already watches something, e.g. after the
-      // branch's PR was merged.
-      if (!(e instanceof UsageError) || !inbox.watched().length) throw e;
+      // branch's PR was merged, or is a server inbox, which subscriptions
+      // made elsewhere may feed.
+      if (!(e instanceof UsageError || (client && e instanceof LoginNeeded))) throw e;
+      if (!inbox.watched().length && !client) throw e;
     }
   }
   for (const t of targets) {
-    if (inbox.watch(targetKey(t), t)) log(`watching ${targetKey(t)} in inbox ${inboxName}`);
+    const key = targetKey(t);
+    if (inbox.watched().some((w) => targetKey(w.target) === key)) continue;
+    const sub = client && reachable ? await subscribe(client, inboxName, t) : null;
+    inbox.watch(key, t, sub);
+    log(`watching ${key} in inbox ${inboxName}${client && !sub ? ", polling GitHub from this machine" : ""}`);
   }
 
-  switch (verb) {
-    case "watch":
-      // Set the starting point now, so events from here on are kept.
-      await pollOnce(inbox, log);
-      return 0;
-    case "wait":
-      return waitCommand(inbox, { kinds, interval, timeout: parseDuration(opts.timeout), settle: parseDuration(opts.settle), json: opts.format === "json" });
-    case "stream":
-      return streamCommand(inbox, { kinds, interval });
-    case "exec":
-      return execCommand(inbox, { kinds, interval, batch: opts.batch, settle: parseDuration(opts.settle), command });
+  if (verb === "watch") {
+    // Set the starting point now, so events from here on are kept.
+    await pollOnce(inbox, log, undefined, !reachable);
+    return 0;
+  }
+
+  let server: ServerReader | null = null;
+  if (client) {
+    server = new ServerReader(client, inboxName, { log });
+    const connected = await server.start();
+    if (!connected && reachable) log(`can't read inbox ${inboxName} on ${client.url}; polling GitHub from this machine meanwhile`);
+    if (!connected && verb === "wait" && !inbox.watched().length) {
+      await server.close();
+      throw new Unreachable(`can't reach ${client.url}, and inbox ${inboxName} watches no PR to poll from here instead`);
+    }
+  }
+  const feed = new Feed(inbox, server, { interval, log });
+  try {
+    switch (verb) {
+      case "wait":
+        return await waitCommand(feed, { kinds, interval, timeout: parseDuration(opts.timeout), settle: parseDuration(opts.settle), json: opts.format === "json", inbox: inboxName });
+      case "stream":
+        return await streamCommand(feed, { kinds, interval });
+      case "exec":
+        return await execCommand(feed, { kinds, interval, batch: opts.batch, settle: parseDuration(opts.settle), command });
+    }
+  } finally {
+    await server?.close();
   }
   return EXIT.error;
 }
 
-// Pending events that match, acknowledging the rest so they don't wait
-// for ever.
-function wanted(inbox: Inbox, kinds: string[]): WatchEvent[] {
-  const pending = inbox.pending();
-  const keep = pending.filter((e) => matchesKind(kinds, e.kind));
-  const skip = pending.filter((e) => !matchesKind(kinds, e.kind));
-  // Acknowledge up to the first wanted event only, so the order holds.
-  const firstKept = keep[0]?.seq ?? Infinity;
-  const skippable = skip.filter((e) => e.seq < firstKept).map((e) => e.seq);
-  if (skippable.length) inbox.ack(Math.max(...skippable));
-  if (!keep.length && skip.length) inbox.ack(Math.max(...skip.map((e) => e.seq)));
-  return keep;
-}
-
-const watching = (inbox: Inbox) => inbox.watched().map((w) => targetKey(w.target));
-
 async function waitCommand(
-  inbox: Inbox,
-  o: { kinds: string[]; interval: number; timeout: number; settle: number; json: boolean },
+  feed: Feed,
+  o: { kinds: string[]; interval: number; timeout: number; settle: number; json: boolean; inbox: string },
 ): Promise<number> {
   const deadline = Date.now() + o.timeout;
-  let first = true;
+  // A server inbox still being read with no PR known to be watched.
+  const reading = () => (feed.ended() ? undefined : o.inbox);
+  // Events left from before (a killed wait, say) come out first.
+  if (!feed.wanted(o.kinds).length) await feed.poll();
   for (;;) {
-    // Events left from before (a killed wait, say) come out first.
-    if (!first || !wanted(inbox, o.kinds).length) await pollOnce(inbox, log);
-    first = false;
-    let events = wanted(inbox, o.kinds);
-    if (events.length) {
+    let items = feed.wanted(o.kinds);
+    if (items.length) {
       // Wait a little for related events: a review's comments arrive
       // together, and so do checks.
-      if (o.settle > 0 && inbox.watched().length) {
-        await sleep(Math.min(o.settle, Math.max(deadline - Date.now(), 0)));
-        await pollOnce(inbox, log);
-        events = wanted(inbox, o.kinds);
+      if (o.settle > 0 && !feed.ended()) {
+        await feed.settle(Math.min(o.settle, Math.max(deadline - Date.now(), 0)));
+        items = feed.wanted(o.kinds);
       }
-      const still = watching(inbox);
-      process.stdout.write(o.json ? `${JSON.stringify({ events, watching: still })}\n` : `${formatText(events, still)}\n`);
-      inbox.ack(events[events.length - 1].seq);
-      return still.length ? EXIT.events : EXIT.ended;
+      const events = items.map((i) => i.event);
+      const still = feed.watching();
+      process.stdout.write(o.json ? `${JSON.stringify({ events, watching: still })}\n` : `${formatText(events, still, reading())}\n`);
+      feed.ack(items);
+      return feed.ended() ? EXIT.ended : EXIT.events;
     }
-    if (!inbox.watched().length) {
+    if (feed.ended()) {
       process.stdout.write(o.json ? `${JSON.stringify({ events: [], watching: [] })}\n` : `${footer([])}\n`);
       return EXIT.ended;
     }
     const left = deadline - Date.now();
     if (left <= 0) {
-      const still = watching(inbox);
+      const still = feed.watching();
       process.stdout.write(o.json
         ? `${JSON.stringify({ events: [], watching: still, timeout: true })}\n`
-        : `No new events. ${footer(still)}\n`);
+        : `No new events. ${footer(still, reading())}\n`);
       return EXIT.timeout;
     }
-    await sleep(Math.min(o.interval, left));
+    await feed.more(Math.min(o.interval, left));
   }
 }
 
-async function streamCommand(inbox: Inbox, o: { kinds: string[]; interval: number }): Promise<number> {
+async function streamCommand(feed: Feed, o: { kinds: string[]; interval: number }): Promise<number> {
   for (;;) {
-    for (const e of wanted(inbox, o.kinds)) {
-      process.stdout.write(`${JSON.stringify(e)}\n`);
-      inbox.ack(e.seq);
+    for (const item of feed.wanted(o.kinds)) {
+      process.stdout.write(`${JSON.stringify(item.event)}\n`);
+      feed.ack([item]);
     }
-    if (!inbox.watched().length) return EXIT.ended;
-    await sleep(o.interval);
-    await pollOnce(inbox, log);
+    if (feed.ended()) return EXIT.ended;
+    await feed.more(o.interval);
   }
 }
 
 async function execCommand(
-  inbox: Inbox,
+  feed: Feed,
   o: { kinds: string[]; interval: number; batch: boolean; settle: number; command: string[] },
 ): Promise<number> {
-  await pollOnce(inbox, log);
+  await feed.poll();
   for (;;) {
-    const events = wanted(inbox, o.kinds);
-    if (events.length && o.batch) {
-      if (o.settle > 0) {
-        await sleep(o.settle);
-        await pollOnce(inbox, log);
-      }
-      const batch = wanted(inbox, o.kinds);
-      const code = await run(o.command, JSON.stringify(batch), { WATCHERONI_COUNT: String(batch.length) });
-      if (code === 0) inbox.ack(batch[batch.length - 1].seq);
+    const items = feed.wanted(o.kinds);
+    if (items.length && o.batch) {
+      if (o.settle > 0) await feed.settle(o.settle);
+      const batch = feed.wanted(o.kinds);
+      const code = await run(o.command, JSON.stringify(batch.map((i) => i.event)), { WATCHERONI_COUNT: String(batch.length) });
+      if (code === 0) feed.ack(batch);
       else log(`command exited ${code}; the ${batch.length} event(s) will be offered again`);
     } else {
-      for (const e of events) {
+      for (const item of items) {
+        const e = item.event;
         const code = await run(o.command, JSON.stringify(e), {
           WATCHERONI_KIND: e.kind,
           WATCHERONI_REPO: e.repo?.full_name ?? "",
@@ -234,12 +256,11 @@ async function execCommand(
           log(`command exited ${code} for ${e.kind} (${e.id}); it will be offered again`);
           break;
         }
-        inbox.ack(e.seq);
+        feed.ack([item]);
       }
     }
-    if (!inbox.watched().length && !wanted(inbox, o.kinds).length) return EXIT.ended;
-    await sleep(o.interval);
-    await pollOnce(inbox, log);
+    if (feed.ended() && !feed.wanted(o.kinds).length) return EXIT.ended;
+    await feed.more(o.interval);
   }
 }
 
@@ -269,7 +290,7 @@ main(process.argv.slice(2)).then(
       log(e.message);
       process.exit(EXIT.login);
     }
-    if (e instanceof UsageError || e instanceof InboxBusy) log(e.message);
+    if (e instanceof UsageError || e instanceof InboxBusy || e instanceof Unreachable || e instanceof ServerError) log(e.message);
     else log(e instanceof Error ? e.stack ?? e.message : String(e));
     process.exit(EXIT.error);
   },
