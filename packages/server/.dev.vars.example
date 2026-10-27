@@ -1,2 +1,9 @@
-PROTO_TOKEN=change-me
+GITHUB_CLIENT_SECRET=change-me
 GITHUB_WEBHOOK_SECRET=change-me
+# HMAC key for WebSocket tickets, e.g. `openssl rand -base64 32`.
+TICKET_KEY=change-me
+# The previous TICKET_KEY while rotating; tickets live 60 seconds, so it
+# can be removed a minute after the new key is in place.
+TICKET_KEY_OLD=
+# Turns on the /debug routes (minting keys, injecting events, stats).
+DEBUG_TOKEN=change-me

@@ -11,7 +11,10 @@
 //
 // Usage:
 //   node scripts/probe.mjs --url https://watcheroni-proto.<you>.workers.dev \
-//     --token <PROTO_TOKEN> [--clients 3] [--idle 120]
+//     --debug-token <DEBUG_TOKEN> [--account 0] [--clients 3] [--idle 120]
+//
+// It mints an API key for --account through /debug (account 0 is never a
+// real GitHub user), and connects its WebSockets with tickets.
 //
 // Needs Node.js 22 or later (built-in fetch and WebSocket).
 
@@ -20,14 +23,15 @@ import { parseArgs } from "node:util";
 const { values: opts } = parseArgs({
   options: {
     url: { type: "string" },
-    token: { type: "string", default: process.env.PROTO_TOKEN },
+    "debug-token": { type: "string", default: process.env.DEBUG_TOKEN },
+    account: { type: "string", default: "0" },
     clients: { type: "string", default: "3" },
     idle: { type: "string", default: "120" },
     "ping-every": { type: "string", default: "30" },
   },
 });
-if (!opts.url || !opts.token) {
-  console.error("usage: probe.mjs --url <worker url> --token <PROTO_TOKEN> [--clients N] [--idle SECONDS]");
+if (!opts.url || !opts["debug-token"]) {
+  console.error("usage: probe.mjs --url <worker url> --debug-token <DEBUG_TOKEN> [--account ID] [--clients N] [--idle SECONDS]");
   process.exit(2);
 }
 const base = opts.url.replace(/\/$/, "");
@@ -40,12 +44,20 @@ if (idle + 30 > longPollWait) {
   process.exit(2);
 }
 
-const headers = { Authorization: `Bearer ${opts.token}`, "content-type": "application/json" };
-const api = async (method, path, body) => {
-  const res = await fetch(`${base}${path}`, { method, headers, body: body && JSON.stringify(body) });
+const call = async (auth, method, path, body) => {
+  const res = await fetch(`${base}${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${auth}`, "content-type": "application/json" },
+    body: body && JSON.stringify(body),
+  });
   if (!res.ok) throw new Error(`${method} ${path}: ${res.status} ${await res.text()}`);
   return res.json();
 };
+const debugBase = `/debug/accounts/${opts.account}`;
+const debug = (method, path, body) => call(opts["debug-token"], method, `${debugBase}${path}`, body);
+const { api_key: apiKey, key_id: keyId } = await debug("POST", "/keys", { label: "probe" });
+const api = (method, path, body) => call(apiKey, method, path, body);
+const headers = { Authorization: `Bearer ${apiKey}` };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 
@@ -53,11 +65,11 @@ const inbox = `probe-${Date.now()}`;
 await api("PUT", `/v1/inboxes/${inbox}`);
 log(`inbox ${inbox}`);
 
-// WebSocket clients.
-const wsUrl = `${base.replace(/^http/, "ws")}/v1/inboxes/${inbox}/ws?token=${encodeURIComponent(opts.token)}`;
+// WebSocket clients, each with its own ticket.
+const tickets = await Promise.all(Array.from({ length: clients }, () => api("POST", `/v1/inboxes/${inbox}/ticket`)));
 const sockets = await Promise.all(
-  Array.from({ length: clients }, (_, i) => new Promise((resolve, reject) => {
-    const ws = new WebSocket(wsUrl, "watcheroni.v1");
+  tickets.map(({ url }, i) => new Promise((resolve, reject) => {
+    const ws = new WebSocket(url, "watcheroni.v1");
     const state = { i, ws, events: [], pongs: 0, closed: null, receivedAt: null };
     ws.addEventListener("open", () => ws.send(JSON.stringify({ type: "hello" })));
     ws.addEventListener("message", (ev) => {
@@ -82,7 +94,7 @@ const poll = fetch(`${base}/v1/inboxes/${inbox}/events?wait=${longPollWait}`, { 
   .then(async (r) => ({ status: r.status, body: await r.json(), at: Date.now() }));
 await sleep(2000);
 
-const before = await api("GET", "/debug/stats");
+const before = await debug("GET", "/stats");
 const bridges = before.sockets.filter((s) => s.inbox === inbox && s.mode === "bridge").length;
 log(`instance before idle: ${before.instance} (${bridges} bridge socket, ${before.sockets.length} sockets in all)`);
 
@@ -92,14 +104,15 @@ await sleep(idle * 1000);
 const idleEnd = Date.now();
 
 const injectedAt = Date.now();
-await api("POST", `/debug/inboxes/${inbox}/events`, { kind: "probe.wake" });
+await debug("POST", `/inboxes/${inbox}/events`, { kind: "probe.wake" });
 log("event injected");
 
 const pollResult = await Promise.race([poll, sleep(15000).then(() => null)]);
 await sleep(2000);
 clearInterval(pinger);
-const after = await api("GET", "/debug/stats");
+const after = await debug("GET", "/stats");
 sockets.forEach((s) => s.ws.close(1000));
+await api("DELETE", `/v1/keys/${keyId}`).catch(() => {});
 
 const wakesDuringIdle = after.wakes.filter((w) => {
   const t = Date.parse(w.at);

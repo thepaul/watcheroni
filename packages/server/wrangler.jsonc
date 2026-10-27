@@ -9,7 +9,14 @@
   "durable_objects": {
     "bindings": [{ "name": "ACCOUNT", "class_name": "Account" }]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Account"] }]
-  // Secrets, not in this file: PROTO_TOKEN and GITHUB_WEBHOOK_SECRET
-  // (wrangler secret put, or .dev.vars for wrangler dev).
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Account"] }],
+  "vars": {
+    // The GitHub App's client ID (public). Empty until the App is
+    // registered; sign-in answers 503 until then.
+    "GITHUB_CLIENT_ID": ""
+  }
+  // Secrets, not in this file (wrangler secret put, or .dev.vars for
+  // wrangler dev): GITHUB_CLIENT_SECRET, GITHUB_WEBHOOK_SECRET, TICKET_KEY,
+  // and during rotation TICKET_KEY_OLD. DEBUG_TOKEN turns on the /debug
+  // routes; leave it unset in production.
 }

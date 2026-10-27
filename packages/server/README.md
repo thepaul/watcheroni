@@ -1,30 +1,38 @@
 # @watcheroni/server (prototype)
 
-The first roadmap step from [DESIGN.md](../../DESIGN.md): a Worker and one
-`Account` Durable Object with hibernated WebSockets and the long-poll
-bridge. Its purpose is to confirm that the object hibernates, and isn't
+The first roadmap step from [DESIGN.md](../../DESIGN.md): a Worker and
+`Account` Durable Objects (one per GitHub user) with hibernated
+WebSockets and the long-poll bridge. Its purpose is to confirm that the object hibernates, and isn't
 billed for waiting, on Cloudflare's free plan.
 
 What's here, compared with the full design:
 
-- **Implemented:** inboxes, numbered events with dedupe by `id`, `ack`,
-  `GET .../events?after=&wait=&limit=` long-polling through the Worker
-  bridge, the WebSocket protocol (`hello`, `ready`, `events`, `ack`,
-  `ping`/`pong` answered by the runtime), and the `watcheroni.v1`
-  subprotocol. `POST /github/webhook` checks GitHub's signature and
-  normalises the payload into events, but routes them nowhere yet (the
-  response lists them).
-- **Stand-ins:** one shared `PROTO_TOKEN` instead of login and API keys
-  (sent as `Authorization: Bearer`, or `?token=` on the WebSocket instead
-  of tickets); `POST /debug/inboxes/{name}/events` instead of webhooks and
-  RepoHub; `GET /debug/stats` to see what the object is doing.
-- **Not yet:** RepoHub, Installation, Control, GitHub, limits, `inbox.gap`.
+- **Implemented:** sign-in (`POST /v1/login` checks a GitHub App user
+  token with GitHub and issues an API key, of which only a SHA-256 hash is
+  stored in that user's `acct:<id>` object), `GET /v1/keys`,
+  `DELETE /v1/keys/{id|current}`, the `POST /v1/github/refresh` proxy,
+  WebSocket tickets (`TICKET_KEY`, `TICKET_KEY_OLD` for rotation) and the
+  per-account limit of 120 requests a minute. Inboxes, numbered events
+  with dedupe by `id`, `ack`, `GET .../events?after=&wait=&limit=`
+  long-polling through the Worker bridge, the WebSocket protocol (`hello`,
+  `ready`, `events`, `ack`, `ping`/`pong` answered by the runtime), and
+  the `watcheroni.v1` subprotocol. `POST /github/webhook` checks GitHub's
+  signature and normalises the payload into events, but routes them
+  nowhere yet (the response lists them).
+- **Stand-ins:** with `DEBUG_TOKEN` set, `/debug/accounts/{id}/...` mints
+  keys without GitHub, injects events instead of webhooks and RepoHub,
+  and shows what an object is doing (see "Worker routes" in DESIGN.md).
+- **Not yet:** RepoHub, Installation, Control, the per-IP limit on
+  `/v1/login` and `/v1/github/refresh`, revoking keys on the
+  `github_app_authorization` webhook (`Account.revokeAllKeys` is ready for
+  it), `inbox.gap`. No GitHub App is registered yet, so `GITHUB_CLIENT_ID`
+  is empty and login answers 503; the tests stub GitHub.
 
 ## Develop
 
 ```
 npm install           # from the repository root
-cp .dev.vars.example .dev.vars   # and set PROTO_TOKEN
+cp .dev.vars.example .dev.vars   # and set TICKET_KEY and DEBUG_TOKEN
 npm test              # Vitest inside workerd, including a forced eviction
 npm run dev           # wrangler dev on http://localhost:8787
 ```
@@ -35,13 +43,16 @@ npm run dev           # wrangler dev on http://localhost:8787
 
    ```
    npx wrangler login
-   npx wrangler secret put PROTO_TOKEN
+   npx wrangler secret put TICKET_KEY
+   npx wrangler secret put DEBUG_TOKEN
    npm run deploy
    ```
 
    Keep the token and URL in `.deploy.vars` (gitignored) as
-   `PROTO_TOKEN=...` and `URL=...`; the probe reads `PROTO_TOKEN` from the
+   `DEBUG_TOKEN=...` and `URL=...`; the probe reads `DEBUG_TOKEN` from the
    environment, so `set -a; . ./.deploy.vars; set +a` saves typing it.
+   (`PROTO_TOKEN` from earlier deploys is no longer used:
+   `npx wrangler secret delete PROTO_TOKEN`.)
 
 2. Run the probe against the deployed Worker. It opens WebSocket clients
    and a long-poll, leaves them idle, injects an event, and reports
@@ -50,7 +61,7 @@ npm run dev           # wrangler dev on http://localhost:8787
 
    ```
    npm run probe -- --url https://watcheroni-proto.<subdomain>.workers.dev \
-     --token <PROTO_TOKEN> --clients 3 --idle 180
+     --debug-token <DEBUG_TOKEN> --clients 3 --idle 180
    ```
 
    `PASS` means the object hibernated and every waiter was woken.

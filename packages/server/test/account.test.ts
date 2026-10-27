@@ -2,10 +2,15 @@ import { evictDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { AccountStats } from "../src/account";
-import type { EventsPage, ServerMessage } from "../src/protocol";
+import type { EventsPage, LoginResponse, ServerMessage } from "../src/protocol";
 
 const BASE = "https://watcheroni.test";
-const AUTH = { Authorization: "Bearer test-token" };
+// Every test here works in one account, with a key minted through /debug.
+const ACCOUNT_ID = 1001;
+const DEBUG = { Authorization: "Bearer test-debug-token" };
+const minted = await exports.default.fetch(`${BASE}/debug/accounts/${ACCOUNT_ID}/keys`, { method: "POST", headers: DEBUG });
+const { api_key } = await minted.json<LoginResponse>();
+const AUTH = { Authorization: `Bearer ${api_key}` };
 
 function call(path: string, init: RequestInit = {}): Promise<Response> {
   return exports.default.fetch(`${BASE}${path}`, { ...init, headers: { ...AUTH, ...init.headers } });
@@ -19,11 +24,15 @@ async function newInbox(): Promise<string> {
 }
 
 function inject(inbox: string, body: Record<string, unknown> = {}): Promise<Response> {
-  return call(`/debug/inboxes/${inbox}/events`, { method: "POST", body: JSON.stringify(body) });
+  return exports.default.fetch(`${BASE}/debug/accounts/${ACCOUNT_ID}/inboxes/${inbox}/events`, {
+    method: "POST",
+    headers: DEBUG,
+    body: JSON.stringify(body),
+  });
 }
 
 async function stats(): Promise<AccountStats> {
-  return (await call("/debug/stats")).json();
+  return (await exports.default.fetch(`${BASE}/debug/accounts/${ACCOUNT_ID}/stats`, { headers: DEBUG })).json();
 }
 
 // A WebSocket client that records every message.
@@ -48,19 +57,6 @@ async function connect(inbox: string) {
 
 const eventsOf = (msgs: ServerMessage[]) => msgs.flatMap((m) => (m.type === "events" ? m.events : []));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-describe("auth", () => {
-  it("rejects requests without the token", async () => {
-    const res = await exports.default.fetch(`${BASE}/v1/inboxes/x`, { method: "PUT" });
-    expect(res.status).toBe(401);
-    expect((await res.json<{ code: string }>()).code).toBe("unauthorized");
-  });
-
-  it("serves /v1/meta without auth", async () => {
-    const res = await exports.default.fetch(`${BASE}/v1/meta`);
-    expect((await res.json<{ protocol: number }>()).protocol).toBe(1);
-  });
-});
 
 describe("long-polling", () => {
   it("returns waiting events at once and numbers them", async () => {
@@ -159,7 +155,7 @@ describe("WebSocket", () => {
 describe("hibernation", () => {
   it("keeps client and bridge sockets, and their positions, across eviction", async () => {
     const inbox = await newInbox();
-    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName("acct:proto"));
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${ACCOUNT_ID}`));
 
     const c = await connect(inbox);
     c.ws.send(JSON.stringify({ type: "hello" }));

@@ -5,6 +5,7 @@ import pkg from "../package.json" with { type: "json" };
 import { formatText, footer } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
+import { LoginFailed, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
 import { UsageError, currentBranchPr, parseTarget, targetKey, type Target } from "./targets.ts";
 
@@ -20,6 +21,7 @@ Usage:
   watcheroni watch  [target...]
   watcheroni unwatch <target...>
   watcheroni ls
+  watcheroni login | logout   sign in to the server ($WATCHERONI_SERVER)
 
 Targets are owner/repo#123 or a pull request URL. With none, the open PR
 for the current git branch.
@@ -79,6 +81,9 @@ async function main(argv: string[]): Promise<number> {
   const inboxName = opts.inbox
     ?? process.env.WATCHERONI_INBOX
     ?? (process.env.CLAUDE_CODE_SESSION_ID ? `cc-${process.env.CLAUDE_CODE_SESSION_ID}` : "default");
+
+  if (verb === "login") return (await login(), 0);
+  if (verb === "logout") return (await logout(), 0);
 
   if (verb === "ls") {
     const { watched, pending } = Inbox.peek(inboxName);
@@ -269,7 +274,7 @@ main(process.argv.slice(2)).then(
       log(e.message);
       process.exit(EXIT.login);
     }
-    if (e instanceof UsageError || e instanceof InboxBusy) log(e.message);
+    if (e instanceof UsageError || e instanceof InboxBusy || e instanceof LoginFailed) log(e.message);
     else log(e instanceof Error ? e.stack ?? e.message : String(e));
     process.exit(EXIT.error);
   },

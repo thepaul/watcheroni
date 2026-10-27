@@ -46,7 +46,7 @@ describe("webhook signature", () => {
     expect((await post("pull_request", payload)).status).toBe(413);
   });
 
-  it("needs no PROTO_TOKEN", async () => {
+  it("needs no API key", async () => {
     expect((await post("pull_request", example("pull_request", "opened"))).status).toBe(202);
   });
 });

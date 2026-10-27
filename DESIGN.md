@@ -264,9 +264,13 @@ RPC methods:
 ```ts
 interface Account {
   // From the Worker.
-  authenticate(keyHash: Uint8Array): Promise<AuthResult>;
+  createKey(id: string, hash: ArrayBuffer, label: string | null, login: string): KeyInfo;  // at login
+  authenticate(keyHash: ArrayBuffer): Promise<AuthResult>;  // live key? takes one request token
+  listKeys(): KeyInfo[];
+  revokeKey(id: string): boolean;   // also closes that key's sockets with 4001
+  revokeAllKeys(): number;          // github_app_authorization "revoked"
   handle(req: ApiRequest): Promise<ApiResponse>;   // the inbox/subscription API
-  connect(req: Request): Promise<Response>;        // WebSocket upgrade
+  fetch(req: Request): Promise<Response>;          // WebSocket upgrade
 
   // From RepoHub.
   deliver(items: { inbox: string; sub: string; event: Event }[]):
@@ -287,9 +291,19 @@ Reading an inbox pushes the new `expires_at` to the RepoHubs of its
 subscriptions (`touch`), at most once an hour per subscription, so
 reading stays cheap.
 
+`authenticate` returns the key's ID and the account's request budget
+(the `RateLimit-*` headers), or why not (`unauthorized`, `rate_limited`
+with a retry time), so one call both authenticates and rate-limits.
+(The prototype calls separate inbox methods, such as `ensureInbox` and
+`readEvents`, instead of one `handle`.)
+
 **WebSockets.** Each client socket is accepted with
-`ctx.acceptWebSocket(ws, ["inbox:" + name])` and keeps its position in its
-attachment (`{inbox, keyId, pos}`, well under the 16 KB limit). On
+`ctx.acceptWebSocket(ws, ["inbox:" + name, "key:" + keyId])` and keeps its
+position in its attachment (`{inbox, keyId, pos}`, well under the 16 KB
+limit). The Worker passes the key ID, and for a ticket its nonce and
+expiry, on the internal upgrade request; the object checks the key is
+still live and records the nonce before accepting. Revoking a key closes
+the sockets tagged with it. On
 `deliver`, the object sends to `ctx.getWebSockets("inbox:" + name)`.
 `ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping",
 "pong"))` answers keepalives without waking the object. `hello` and `ack`
@@ -374,6 +388,15 @@ Other:
 
 A scheduled (cron) handler runs every 10 minutes for redelivery (below).
 
+Development only, and answering `404` unless the `DEBUG_TOKEN` secret is
+set and sent as `Authorization: Bearer`:
+
+| Method and path | Purpose |
+|---|---|
+| `POST /debug/accounts/{id}/keys` | Mint an API key without GitHub (account `0` is never a real user) |
+| `GET /debug/accounts/{id}/stats` | What the `Account` object is doing (wakes, sockets, inboxes) |
+| `POST /debug/accounts/{id}/inboxes/{name}/events` | Inject synthetic events, standing in for RepoHub |
+
 ### Webhook handling in the Worker
 
 1. Read the raw body; check `X-Hub-Signature-256` with HMAC-SHA256 (Web
@@ -436,7 +459,8 @@ server can be down without losing events.
 | `GITHUB_APP_PRIVATE_KEY` | secret | Signs App JWTs (RS256). Stored as PKCS#8 PEM, since Web Crypto can't import GitHub's PKCS#1; setup converts it. |
 | `GITHUB_CLIENT_SECRET` | secret | Checking user tokens (`POST /applications/{client_id}/token`) and the refresh proxy |
 | `GITHUB_WEBHOOK_SECRET` | secret | Webhook HMAC. `GITHUB_WEBHOOK_SECRET_OLD` during rotation. |
-| `TICKET_KEY` | secret | HMAC for WebSocket tickets. `TICKET_KEY_OLD` during rotation. |
+| `TICKET_KEY` | secret | HMAC for WebSocket tickets. `TICKET_KEY_OLD` during rotation; tickets live 60 seconds, so it can go a minute after the switch. |
+| `DEBUG_TOKEN` | secret | Development only: turns on the `/debug` routes. Unset in production. |
 | `STORAGE_KEY` | secret | AES-256-GCM key for installation tokens cached in storage |
 
 All are Worker secrets (`wrangler secret put`), never in the repo or in
@@ -467,7 +491,9 @@ Derived and cached:
   compares it with stored hashes and updates `last_used_at` at most once
   an hour.
 - WebSocket ticket: `wt1.<base64url payload>.<HMAC>`, where the payload
-  is `{acct, inbox, key, exp, nonce}` and lives 60 seconds. The Worker
+  is the JSON `{acct, inbox, key, exp, nonce}` (`exp` in Unix seconds,
+  60 seconds ahead) and the HMAC is SHA-256 over `wt1.<payload>`, in
+  base64url. The Worker
   checks the signature and expiry without any storage; `Account` enforces
   single use by remembering nonces until they expire.
 
