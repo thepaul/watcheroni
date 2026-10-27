@@ -1,0 +1,10 @@
+{
+  "name": "watcheroni",
+  "version": "0.0.0",
+  "description": "Keep watching your pull requests after you push: CI failures, reviews, comments and merge conflicts wake the session",
+  "author": {
+    "name": "Paul Cannon"
+  },
+  "license": "MIT",
+  "keywords": ["github", "pull-requests", "ci", "code-review"]
+}

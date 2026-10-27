@@ -156,7 +156,7 @@ function lock(file: string, name: string): void {
     }
     const pid = Number(readFileSync(file, "utf8"));
     if (pid && alive(pid)) {
-      throw new InboxBusy(`Inbox ${name} is in use by process ${pid}; use another with --inbox`);
+      throw new InboxBusy(`Inbox ${name} is in use by process ${pid}, another wait, stream or exec; stop it, or use another inbox with --inbox`);
     }
     unlinkSync(file);
   }

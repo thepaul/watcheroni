@@ -1,0 +1,14 @@
+{
+  "name": "watcheroni",
+  "description": "Plugins from the watcheroni repository",
+  "owner": {
+    "name": "Paul Cannon"
+  },
+  "plugins": [
+    {
+      "name": "watcheroni",
+      "source": "./plugin",
+      "description": "Keep watching your pull requests after you push: CI failures, reviews, comments and merge conflicts wake the session"
+    }
+  ]
+}
