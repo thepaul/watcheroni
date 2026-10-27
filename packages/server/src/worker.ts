@@ -1,11 +1,13 @@
-// Prototype Worker: one Account Durable Object with hibernated WebSockets
-// and the long-poll bridge described in DESIGN.md, and RepoHub. Login, API
-// keys and tickets are left out; a single shared PROTO_TOKEN stands in for
-// authentication. GitHub webhooks are verified, normalised and sent to
-// RepoHub; subscriptions are made through /debug until /v1 has sign-in.
+// Prototype Worker: Account Durable Objects with hibernated WebSockets and
+// the long-poll bridge described in DESIGN.md, behind real sign-in (login
+// with a GitHub user token, API keys, WebSocket tickets), and RepoHub.
+// GitHub webhooks are verified, normalised and sent to RepoHub;
+// subscriptions are made through /debug until /v1 has them.
 
-import type { Account, Delivery } from "./account";
+import type { Account, AuthResult, Delivery, RateState } from "./account";
+import { bearer, newApiKey, newKeyId, newTicketPayload, parseApiKey, secretsEqual, signTicket, verifyTicket } from "./auth";
 import type { NewSubscription, PrBaseline } from "./repo-hub";
+import { GITHUB_API_URL, GITHUB_WEB_URL, checkUserToken, refreshUserToken } from "./github";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
 import {
@@ -16,107 +18,283 @@ import {
   problem,
   type EventsPage,
   type DataValue,
+  type LoginRequest,
+  type LoginResponse,
+  type Meta,
+  type RefreshRequest,
   type ServerMessage,
+  type TicketResponse,
   type WatchEvent,
 } from "./protocol";
 
 export { Account } from "./account";
 export { RepoHub } from "./repo-hub";
 
-// Everything in the prototype belongs to one account.
-const ACCOUNT_NAME = "acct:proto";
-
 const MAX_WEBHOOK_BYTES = 2 * 1024 * 1024;
+const MAX_LABEL_LENGTH = 100;
+
+type AccountStub = DurableObjectStub<Account>;
+
+function accountStub(env: Env, id: number): AccountStub {
+  return env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const { pathname } = url;
+    const route = `${request.method} ${pathname}`;
 
     if (pathname === "/healthz") return new Response("ok");
-    if (pathname === "/v1/meta" && request.method === "GET") {
-      return json({
-        protocol: 1,
-        server: "watcheroni/0.0.0-proto",
-        features: ["ws", "longpoll"],
-        limits: { max_wait_seconds: MAX_WAIT_SECONDS },
-      });
+    if (route === "GET /v1/meta") return json(meta(env));
+    if (route === "POST /github/webhook") return webhook(request, env);
+    if (route === "POST /v1/login") return login(request, env);
+    if (route === "POST /v1/github/refresh") return refresh(request, env);
+    if (pathname.startsWith("/debug/")) return debug(request, url, env);
+
+    const inboxMatch = pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?$/);
+    const inbox = inboxMatch ? decodeURIComponent(inboxMatch[1]) : null;
+    if (inbox !== null && !INBOX_NAME.test(inbox)) return problem(400, "invalid_request", "Bad inbox name");
+
+    // A ticket stands in for the key on a WebSocket handshake, since
+    // browsers can't set headers on one.
+    const ticket = url.searchParams.get("ticket");
+    if (inbox !== null && inboxMatch![2] === "/ws" && ticket !== null && request.method === "GET") {
+      return connectWithTicket(request, env, inbox, ticket);
     }
 
-    if (pathname === "/github/webhook" && request.method === "POST") {
-      return webhook(request, env);
-    }
-
-    if (!(await authorized(request, url, env))) {
-      return problem(401, "unauthorized", "Missing or wrong token");
-    }
-    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(ACCOUNT_NAME));
-
-    if (pathname === "/debug/stats" && request.method === "GET") {
-      return json(await account.stats());
-    }
-
-    const repoRoute = pathname.match(/^\/debug\/repos\/(\d+)(?:\/subscriptions(?:\/([^/]+))?)?$/);
-    if (repoRoute) return debugRepo(request, env, Number(repoRoute[1]), repoRoute[0].includes("/subscriptions"), repoRoute[2]);
-
-    const m = pathname.match(/^\/(v1|debug)\/inboxes\/([^/]+)(\/[a-z]+)?$/);
-    if (!m) return problem(404, "not_found", "No such endpoint");
-    const [, area, rawName, rest = ""] = m;
-    const name = decodeURIComponent(rawName);
-    if (!INBOX_NAME.test(name)) return problem(400, "invalid_request", "Bad inbox name");
-    const route = `${request.method} /${area}/inboxes/{name}${rest}`;
-
-    switch (route) {
-      case "PUT /v1/inboxes/{name}":
-        return json(await account.ensureInbox(name));
-
-      case "GET /v1/inboxes/{name}/events":
-        return longPoll(account, name, url, request.signal);
-
-      case "POST /v1/inboxes/{name}/ack": {
-        const body = await readJson<{ seq?: unknown }>(request);
-        if (typeof body?.seq !== "number") return problem(400, "invalid_request", "Body must be {\"seq\": number}");
-        const inbox = await account.ack(name, body.seq);
-        return inbox ? json(inbox) : problem(404, "not_found", "No such inbox");
-      }
-
-      case "GET /v1/inboxes/{name}/ws": {
-        if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
-          return problem(426, "invalid_request", "Expected a WebSocket upgrade");
-        }
-        const target = new URL("https://account/ws");
-        target.searchParams.set("inbox", name);
-        target.searchParams.set("mode", "client");
-        return account.fetch(new Request(target, request));
-      }
-
-      // Stands in for RepoHub: inject synthetic events.
-      case "POST /debug/inboxes/{name}/events": {
-        const body = (await readJson<{ kind?: string; data?: { [key: string]: DataValue }; count?: number }>(request)) ?? {};
-        const count = Math.min(Math.max(body.count ?? 1, 1), 100);
-        const now = new Date().toISOString();
-        const items: Delivery[] = Array.from({ length: count }, () => ({
-          inbox: name,
-          event: {
-            v: 1,
-            id: `debug:${crypto.randomUUID()}`,
-            sub: null,
-            kind: body.kind ?? "debug.ping",
-            at: now,
-            received_at: now,
-            repo: null,
-            pr: null,
-            actor: null,
-            data: body.data ?? {},
-            links: {},
-          },
-        }));
-        return json(await account.deliver(items));
-      }
-    }
-    return problem(404, "not_found", "No such endpoint");
+    const parsed = await parseApiKey(bearer(request) ?? "");
+    if (!parsed) return problem(401, "unauthorized", "Missing or malformed API key");
+    const account = accountStub(env, parsed.accountId);
+    const auth = await account.authenticate(parsed.hash);
+    if (!auth.ok) return authFailure(auth);
+    const caller: Caller = { account, accountId: parsed.accountId, keyId: auth.keyId };
+    const res = await api(request, url, env, caller, inbox, inboxMatch?.[2] ?? "");
+    return withRateHeaders(res, auth.rate);
   },
 } satisfies ExportedHandler<Env>;
+
+interface Caller {
+  account: AccountStub;
+  accountId: number;
+  keyId: string;
+}
+
+// Everything under /v1 that needs an API key.
+async function api(
+  request: Request,
+  url: URL,
+  env: Env,
+  { account, accountId, keyId }: Caller,
+  inbox: string | null,
+  rest: string,
+): Promise<Response> {
+  const { pathname } = url;
+  if (pathname === "/v1/keys" && request.method === "GET") {
+    return json({ keys: await account.listKeys() });
+  }
+  const keyMatch = pathname.match(/^\/v1\/keys\/([^/]+)$/);
+  if (keyMatch && request.method === "DELETE") {
+    const id = keyMatch[1] === "current" ? keyId : decodeURIComponent(keyMatch[1]);
+    return (await account.revokeKey(id)) ? new Response(null, { status: 204 }) : problem(404, "not_found", "No such key");
+  }
+
+  if (inbox === null) return problem(404, "not_found", "No such endpoint");
+  const name = inbox;
+  switch (`${request.method} /v1/inboxes/{name}${rest}`) {
+    case "PUT /v1/inboxes/{name}":
+      return json(await account.ensureInbox(name));
+
+    case "GET /v1/inboxes/{name}/events":
+      return longPoll(account, name, url, request.signal);
+
+    case "POST /v1/inboxes/{name}/ack": {
+      const body = await readJson<{ seq?: unknown }>(request);
+      if (typeof body?.seq !== "number") return problem(400, "invalid_request", "Body must be {\"seq\": number}");
+      const result = await account.ack(name, body.seq);
+      return result ? json(result) : problem(404, "not_found", "No such inbox");
+    }
+
+    case "POST /v1/inboxes/{name}/ticket": {
+      if (!env.TICKET_KEY) return problem(503, "unavailable", "WebSocket tickets aren't configured on this server");
+      const ticket = await signTicket(newTicketPayload(accountId, name, keyId), env.TICKET_KEY);
+      const wsUrl = new URL(`/v1/inboxes/${encodeURIComponent(name)}/ws`, url);
+      wsUrl.protocol = url.protocol === "http:" ? "ws:" : "wss:";
+      wsUrl.searchParams.set("ticket", ticket);
+      return json({ ticket, url: wsUrl.toString() } satisfies TicketResponse);
+    }
+
+    // Clients that can set headers on the handshake may use the key directly.
+    case "GET /v1/inboxes/{name}/ws":
+      return connect(request, account, name, keyId);
+  }
+  return problem(404, "not_found", "No such endpoint");
+}
+
+function meta(env: Env): Meta {
+  return {
+    protocol: 1,
+    server: "watcheroni/0.0.0-proto",
+    features: ["ws", "longpoll"],
+    ...(env.GITHUB_CLIENT_ID
+      ? { github: { client_id: env.GITHUB_CLIENT_ID, web_url: GITHUB_WEB_URL, api_url: GITHUB_API_URL } }
+      : {}),
+    limits: { max_wait_seconds: MAX_WAIT_SECONDS },
+  };
+}
+
+// POST /v1/login: check the user's GitHub token once, issue an API key,
+// forget the token.
+async function login(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<Partial<LoginRequest>>(request);
+  if (typeof body?.github_token !== "string" || !body.github_token) {
+    return problem(400, "invalid_request", "Body must include github_token");
+  }
+  if (body.label !== undefined && typeof body.label !== "string") {
+    return problem(400, "invalid_request", "label must be a string");
+  }
+  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+    return problem(503, "unavailable", "Sign-in isn't configured on this server");
+  }
+  const check = await checkUserToken(env, body.github_token);
+  if (!check.ok) {
+    return check.reason === "invalid"
+      ? problem(401, "github_token_invalid", "GitHub didn't recognise this token as one issued to this server's App")
+      : withRetryAfter(problem(503, "unavailable", "Couldn't check the token with GitHub"), 30);
+  }
+  const { id, login } = check.user;
+  const { key, hash } = await newApiKey(id);
+  const keyId = newKeyId();
+  await accountStub(env, id).createKey(keyId, hash, body.label?.slice(0, MAX_LABEL_LENGTH) || null, login);
+  return json({ api_key: key, key_id: keyId, account: { id, login } } satisfies LoginResponse);
+}
+
+// POST /v1/github/refresh: the stateless refresh proxy.
+async function refresh(request: Request, env: Env): Promise<Response> {
+  const body = await readJson<Partial<RefreshRequest>>(request);
+  if (typeof body?.refresh_token !== "string" || !body.refresh_token) {
+    return problem(400, "invalid_request", "Body must include refresh_token");
+  }
+  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+    return problem(503, "unavailable", "Sign-in isn't configured on this server");
+  }
+  try {
+    return await refreshUserToken(env, body.refresh_token);
+  } catch {
+    return withRetryAfter(problem(503, "unavailable", "Couldn't reach GitHub"), 30);
+  }
+}
+
+async function connectWithTicket(request: Request, env: Env, inbox: string, ticket: string): Promise<Response> {
+  if (!isUpgrade(request)) return problem(426, "invalid_request", "Expected a WebSocket upgrade");
+  const payload = await verifyTicket(ticket, [env.TICKET_KEY, env.TICKET_KEY_OLD]);
+  if (!payload || payload.inbox !== inbox) return problem(401, "unauthorized", "Invalid or expired ticket");
+  return connect(request, accountStub(env, payload.acct), inbox, payload.key, payload);
+}
+
+function connect(
+  request: Request,
+  account: AccountStub,
+  inbox: string,
+  keyId: string,
+  ticket?: { nonce: string; exp: number },
+): Promise<Response> | Response {
+  if (!isUpgrade(request)) return problem(426, "invalid_request", "Expected a WebSocket upgrade");
+  const target = new URL("https://account/ws");
+  target.searchParams.set("inbox", inbox);
+  target.searchParams.set("mode", "client");
+  target.searchParams.set("key", keyId);
+  if (ticket) {
+    target.searchParams.set("nonce", ticket.nonce);
+    target.searchParams.set("exp", String(ticket.exp));
+  }
+  return account.fetch(new Request(target, request));
+}
+
+// /debug: development routes behind DEBUG_TOKEN, and off when it isn't set.
+// They stand in for login (minting a key without GitHub), for the /v1
+// subscription endpoints, and for RepoHub (injecting events), and show what
+// Account and RepoHub objects are doing.
+async function debug(request: Request, url: URL, env: Env): Promise<Response> {
+  const given = bearer(request);
+  if (!env.DEBUG_TOKEN || !given || !(await secretsEqual(given, env.DEBUG_TOKEN))) {
+    return problem(404, "not_found", "No such endpoint");
+  }
+  const repoRoute = url.pathname.match(/^\/debug\/repos\/(\d+)(?:\/subscriptions(?:\/([^/]+))?)?$/);
+  if (repoRoute) return debugRepo(request, env, Number(repoRoute[1]), repoRoute[0].includes("/subscriptions"), repoRoute[2]);
+
+  const m = url.pathname.match(/^\/debug\/accounts\/(\d{1,15})(\/.*)$/);
+  if (!m) return problem(404, "not_found", "No such endpoint");
+  const accountId = Number(m[1]);
+  const account = accountStub(env, accountId);
+  const rest = m[2];
+
+  if (rest === "/keys" && request.method === "POST") {
+    const body = (await readJson<{ label?: string; login?: string }>(request)) ?? {};
+    const { key, hash } = await newApiKey(accountId);
+    const keyId = newKeyId();
+    const login = body.login ?? `debug-${accountId}`;
+    await account.createKey(keyId, hash, body.label ?? "debug", login);
+    return json({ api_key: key, key_id: keyId, account: { id: accountId, login } } satisfies LoginResponse);
+  }
+  if (rest === "/stats" && request.method === "GET") {
+    return json(await account.stats());
+  }
+  const inject = rest.match(/^\/inboxes\/([^/]+)\/events$/);
+  if (inject && request.method === "POST") {
+    const name = decodeURIComponent(inject[1]);
+    if (!INBOX_NAME.test(name)) return problem(400, "invalid_request", "Bad inbox name");
+    const body = (await readJson<{ kind?: string; data?: { [key: string]: DataValue }; count?: number }>(request)) ?? {};
+    const count = Math.min(Math.max(body.count ?? 1, 1), 100);
+    const now = new Date().toISOString();
+    const items: Delivery[] = Array.from({ length: count }, () => ({
+      inbox: name,
+      event: {
+        v: 1,
+        id: `debug:${crypto.randomUUID()}`,
+        sub: null,
+        kind: body.kind ?? "debug.ping",
+        at: now,
+        received_at: now,
+        repo: null,
+        pr: null,
+        actor: null,
+        data: body.data ?? {},
+        links: {},
+      },
+    }));
+    return json(await account.deliver(items));
+  }
+  return problem(404, "not_found", "No such endpoint");
+}
+
+function authFailure(auth: Exclude<AuthResult, { ok: true }>): Response {
+  if (auth.reason === "rate_limited") {
+    const res = problem(429, "rate_limited", "Too many requests for this account");
+    return withRetryAfter(withRateHeaders(res, auth.rate), auth.retryAfter);
+  }
+  return problem(401, "unauthorized", "Unknown or revoked API key");
+}
+
+// RateLimit-* on every authenticated response except a WebSocket
+// handshake, whose headers can't be changed.
+function withRateHeaders(res: Response, rate: RateState): Response {
+  if (res.status === 101) return res;
+  res = new Response(res.body, res);
+  res.headers.set("RateLimit-Limit", String(rate.limit));
+  res.headers.set("RateLimit-Remaining", String(rate.remaining));
+  res.headers.set("RateLimit-Reset", String(rate.reset));
+  return res;
+}
+
+function withRetryAfter(res: Response, seconds: number): Response {
+  res.headers.set("Retry-After", String(seconds));
+  return res;
+}
+
+function isUpgrade(request: Request): boolean {
+  return request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+}
 
 // POST /github/webhook: steps 1, 3 and 4 of "Webhook handling in the
 // Worker" in DESIGN.md. The response lists the events and what RepoHub did
@@ -148,7 +326,7 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   return json({ events, ingest }, 202);
 }
 
-// Stands in for the /v1 subscription endpoints until sign-in exists:
+// Stands in for the /v1 subscription endpoints until they exist:
 //   GET    /debug/repos/{id}                     RepoHub's state
 //   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, ignore?, full_name?, baseline?}
 //   DELETE /debug/repos/{id}/subscriptions/{sub}
@@ -181,7 +359,7 @@ async function debugRepo(request: Request, env: Env, repoId: number, subs: boole
 // the Account object and waits on it. The object can hibernate meanwhile,
 // and a Worker is billed for CPU, not for time spent waiting.
 async function longPoll(
-  account: DurableObjectStub<Account>,
+  account: AccountStub,
   name: string,
   url: URL,
   signal: AbortSignal,
@@ -240,21 +418,6 @@ function firstEvents(ws: WebSocket, timeoutMs: number, signal: AbortSignal): Pro
     ws.addEventListener("close", () => done([]));
     ws.addEventListener("error", () => done([]));
   });
-}
-
-// The prototype's stand-in for API keys and tickets: a shared token in
-// the Authorization header, or ?token= for WebSocket clients that can't
-// set headers.
-async function authorized(request: Request, url: URL, env: Env): Promise<boolean> {
-  const header = request.headers.get("Authorization");
-  const given = header?.startsWith("Bearer ") ? header.slice(7) : url.searchParams.get("token");
-  if (!given || !env.PROTO_TOKEN) return false;
-  const [a, b] = await Promise.all([sha256(given), sha256(env.PROTO_TOKEN)]);
-  return crypto.subtle.timingSafeEqual(a, b);
-}
-
-async function sha256(s: string): Promise<ArrayBuffer> {
-  return crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
 }
 
 async function readJson<T>(request: Request): Promise<T | null> {

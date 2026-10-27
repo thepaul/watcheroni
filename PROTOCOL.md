@@ -67,7 +67,9 @@ No authentication. Returns everything a client needs to start:
 }
 ```
 
-Clients MUST ignore fields and features they don't recognise.
+Clients MUST ignore fields and features they don't recognise. A server
+with no GitHub App configured leaves out `github` and doesn't offer
+sign-in.
 
 ## Authentication
 
@@ -104,7 +106,9 @@ user is, once, and exchanges that for an API key.
    }
    ```
 
-   The key is shown only once.
+   The key is shown only once. `label` is optional (at most 100
+   characters are kept). A failure to reach GitHub is `503 unavailable`
+   with `Retry-After`.
 
 3. The client keeps the GitHub token and refresh token **locally**. It
    needs them again only to subscribe to private repositories (see
@@ -132,9 +136,10 @@ POST /v1/github/refresh
 {"refresh_token": "ghr_..."}
 ```
 
-The response is GitHub's own response body (`access_token`,
-`refresh_token`, `expires_in`, ...), passed through unchanged. No API key
-is needed, since the refresh token is the credential.
+The response is GitHub's own status and body (`access_token`,
+`refresh_token`, `expires_in`, ...), passed through unchanged; note that
+GitHub reports a bad or expired refresh token as `200` with an `error`
+field. No API key is needed, since the refresh token is the credential.
 
 ### Keys
 
@@ -142,6 +147,11 @@ is needed, since the refresh token is the credential.
 GET    /v1/keys              list keys (id, label, created_at, last_used_at)
 DELETE /v1/keys/{key_id}     revoke one; DELETE /v1/keys/current revokes the caller's
 ```
+
+Keys list oldest first (`{"keys": [...]}`); a revoked key is left out.
+Revoking answers `204`, or `404` if there was no such live key, and
+closes that key's open WebSockets with `4001`. `last_used_at` is
+approximate (updated at most once an hour).
 
 If the user revokes the App's authorization in GitHub's settings, the
 server revokes all of that account's keys.
@@ -344,7 +354,11 @@ costs nothing.) Connections silent for 120 seconds may be closed.
 After `ready`, the server sends everything after the client's position,
 then new events as they arrive.
 
-**Close codes:** `4001` key revoked or ticket invalid (don't retry
+A ticket that is malformed, expired, already used, for another inbox, or
+whose key has since been revoked is refused at the handshake with `401
+unauthorized`; don't retry it, get a new ticket.
+
+**Close codes:** `4001` key revoked (don't retry
 without signing in again); `4004` inbox deleted; `4029` too many
 connections for this account; `1012` server restarting (reconnect). For
 any other close, reconnect with backoff (1 s doubling to 60 s, with
@@ -525,8 +539,10 @@ Clients MUST handle any `code` they don't know by its HTTP status.
 
 Responses to authenticated requests carry
 `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers for
-the account's request budget. A `429` always carries `Retry-After`
-(seconds).
+the account's request budget (`RateLimit-Reset` is the seconds until the
+budget is full again). A WebSocket handshake's response doesn't carry
+them, and messages on an open WebSocket don't count against the budget.
+A `429` always carries `Retry-After` (seconds).
 
 Limits apply per account, per repository and per IP address (for the
 unauthenticated endpoints). The values are the server's choice and are

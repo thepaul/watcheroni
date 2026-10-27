@@ -16,7 +16,7 @@ const example = (event: string, action?: string): Example => {
 };
 
 const BASE = "https://watcheroni.test";
-const AUTH = { Authorization: "Bearer test-token" };
+const AUTH = { Authorization: "Bearer test-debug-token" };
 const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
 
