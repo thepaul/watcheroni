@@ -4,7 +4,9 @@ import type { WatchEvent } from "@watcheroni/protocol";
 // docs. Each line ends with the command that fetches the content, since
 // events carry pointers, not text.
 
-export function formatText(events: WatchEvent[], stillWatching: string[]): string {
+// `reading` names a server inbox that is still being read although no PR
+// is known to be watched (see Feed.ended).
+export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string): string {
   const groups = new Map<string, WatchEvent[]>();
   for (const e of events) {
     const key = e.repo ? (e.pr !== null ? `${e.repo.full_name}#${e.pr}` : e.repo.full_name) : "other";
@@ -16,11 +18,12 @@ export function formatText(events: WatchEvent[], stillWatching: string[]): strin
     lines.push(...describeAll(list));
     lines.push("");
   }
-  lines.push(footer(stillWatching));
+  lines.push(footer(stillWatching, reading));
   return lines.join("\n");
 }
 
-export function footer(stillWatching: string[]): string {
+export function footer(stillWatching: string[], reading?: string): string {
+  if (!stillWatching.length && reading) return `Still reading inbox ${reading}. Run \`watcheroni wait\` again to keep watching.`;
   if (!stillWatching.length) return "Nothing is left to watch: every watched PR has been merged or closed.";
   const what = stillWatching.length === 1 ? `${stillWatching[0]} is still open` : `Still watching ${stillWatching.join(", ")}`;
   return `${what}. Run \`watcheroni wait\` again to keep watching.`;
@@ -100,6 +103,8 @@ function describe(e: WatchEvent): [string, string | null] {
       return [`pr.merged as ${short(d.merge_sha)}`, null];
     case "watch.ended":
       return [`watch.ended: the PR was ${d.reason}`, null];
+    case "inbox.gap":
+      return [`inbox.gap: events after ${d.missed_after} were dropped before they were read; check the watched PRs on GitHub`, null];
     default:
       return [`${e.kind}${by(e)}`, e.links.api ? `gh api ${e.links.api.replace("https://api.github.com/", "")}` : null];
   }

@@ -1,10 +1,11 @@
-# watcheroni (CLI, local mode)
+# watcheroni (CLI)
 
-Roadmap step 2 from [DESIGN.md](../../DESIGN.md): the `watcheroni`
-command, polling GitHub directly. There's no server yet, so it uses your
-`gh` login (or `GH_TOKEN` / `GITHUB_TOKEN`), and the token stays on this
-machine. Its output, event kinds and exit codes are the ones the server
-version will have, so scripts and agents written against it keep working.
+The `watcheroni` command from [DESIGN.md](../../DESIGN.md). With a
+watcheroni server configured it reads an inbox on the server (server
+mode); without one it polls GitHub directly with your `gh` login (or
+`GH_TOKEN` / `GITHUB_TOKEN`), and the token stays on this machine (local
+mode). Output, event kinds and exit codes are the same in both, so
+scripts and agents work with either.
 
 ```
 watcheroni wait   [target...] [--timeout 1h] [--settle 20s] [--format text|json]
@@ -28,6 +29,57 @@ the current git branch, found through the checkout's GitHub remotes.
   `WATCHERONI_KIND`, `_REPO`, `_PR`, `_URL` and `_EVENT_ID` in its
   environment. An event is acknowledged only when the command exits 0.
   `--batch` runs it once per settled batch, with a JSON array on stdin.
+
+## Server mode
+
+Sign in, which runs GitHub's device flow and saves an API key in
+`~/.config/watcheroni/credentials.json` (mode 0600):
+
+```
+watcheroni login                      # https://watcheroni.dev
+WATCHERONI_SERVER=https://... watcheroni login
+```
+
+Once you're signed in to the default server, the CLI uses it. To use
+another, name it in `WATCHERONI_SERVER` or `~/.config/watcheroni/config.json`
+(`{"server": "https://..."}`). For CI, `WATCHERONI_API_KEY` stands in for
+the credentials file. The environment wins, and `WATCHERONI_SERVER=`
+(empty) forces local mode. `WATCHERONI_CONFIG_DIR` moves both files, and
+`WATCHERONI_CREDENTIALS` moves just the credentials. `watcheroni logout`
+revokes the key and forgets it.
+
+`wait`, `stream` and `exec` then:
+
+1. Create the inbox on the server (`PUT /v1/inboxes/{name}`), which also
+   checks the key. A rejected key exits 4.
+2. Read it over a WebSocket (subprotocol `watcheroni.v1`: `hello` with the
+   last seq received, `ready`, `events`, `ack`, and a `ping` every 30 s).
+   If no socket can be opened but HTTP works, they long-poll
+   `GET /v1/inboxes/{name}/events?after=&wait=300` instead. Lost
+   connections are retried with backoff (1 s doubling to 60 s, with
+   jitter); close code 4001 exits 4, 4004 exits 1, and 4029 switches to
+   long-polling. Events seen before are dropped by `id`.
+3. Acknowledge on the server as local mode does: `wait` once it has
+   printed, `stream` after each line, `exec` only after the command exits
+   0. A new process starts from the server's acknowledged position, so a
+   killed `wait` loses nothing.
+
+Targets: the prototype server has no subscriptions yet, so PRs named on
+the command line (or the current branch's PR) are still polled from this
+machine, as in local mode, and their events are merged with the server
+inbox's. `subscribe()` in `src/server.ts` is where server subscriptions
+go: a target it subscribes is left to the server, and one it can't (the
+App isn't installed, say) stays polled locally.
+
+Because an inbox may be fed by subscriptions made elsewhere, which can't
+be listed yet, `wait` with no PR watched here reads the inbox until
+`--timeout` instead of exiting 3. It exits 3 when the PRs it was watching
+have all ended.
+
+**Fallback.** If the server can't be reached, the CLI says so on stderr
+and polls the named PRs from this machine while it keeps trying to
+reconnect. A `wait` with nothing to poll locally exits 1 instead of
+waiting on a server that's down; `stream` and `exec` keep retrying.
 
 ## How local mode works
 
@@ -53,7 +105,7 @@ repository-wide targets.
 ## Develop
 
 ```
-npm test                 # Vitest, no network
+npm test                 # Vitest, no network; server mode runs against a fake server (test/fake-server.ts)
 npm run dev -- wait octo/widgets#123
 npm run build            # dist/watcheroni.mjs, one file, no dependencies
 ```

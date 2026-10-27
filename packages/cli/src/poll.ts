@@ -8,10 +8,12 @@ export type Fetch = typeof fetchSnapshot;
 
 // Polls every PR watched in the inbox once, saving any new events. A PR
 // seen for the first time sets the starting point and reports nothing,
-// unless it has already ended. Ended PRs stop being watched.
-export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: Fetch = fetchSnapshot): Promise<WatchEvent[]> {
+// unless it has already ended. Ended PRs stop being watched. PRs a server
+// subscription watches are left to the server, unless `all`.
+export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: Fetch = fetchSnapshot, all = true): Promise<WatchEvent[]> {
   const added: WatchEvent[] = [];
   for (const w of inbox.watched()) {
+    if (w.sub && !all) continue;
     const key = `${w.target.owner}/${w.target.name}#${w.target.number}`;
     let next: Snapshot;
     try {

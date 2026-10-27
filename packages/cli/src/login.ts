@@ -3,9 +3,10 @@
 // once for an API key, and keeps the GitHub tokens on this machine.
 
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import type { LoginResponse, Meta } from "@watcheroni/protocol";
+import { configDir, serverSetting } from "./config.ts";
 
 export const DEFAULT_SERVER = "https://watcheroni.dev";
 
@@ -41,12 +42,12 @@ const defaultDeps: LoginDeps = {
 };
 
 export function serverUrl(): string {
-  return (process.env.WATCHERONI_SERVER || DEFAULT_SERVER).replace(/\/$/, "");
+  return (serverSetting() || DEFAULT_SERVER).replace(/\/+$/, "");
 }
 
 export function credentialsPath(): string {
   if (process.env.WATCHERONI_CREDENTIALS) return process.env.WATCHERONI_CREDENTIALS;
-  return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "watcheroni", "credentials.json");
+  return join(configDir(), "credentials.json");
 }
 
 export function readCredentials(path = credentialsPath()): Credentials {

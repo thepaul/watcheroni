@@ -17,6 +17,9 @@ export interface Watched {
   addedAt: string;
   snapshot: Snapshot | null;
   memory: Memory | null;
+  // The server subscription watching it, if the server does; otherwise
+  // this machine polls GitHub for it.
+  sub?: string;
 }
 
 interface State {
@@ -80,9 +83,9 @@ export class Inbox {
     return Object.values(this.state.watched);
   }
 
-  watch(key: string, target: Target): boolean {
+  watch(key: string, target: Target, sub: string | null = null): boolean {
     if (this.state.watched[key]) return false;
-    this.state.watched[key] = { target, addedAt: new Date().toISOString(), snapshot: null, memory: null };
+    this.state.watched[key] = { target, addedAt: new Date().toISOString(), snapshot: null, memory: null, ...(sub ? { sub } : {}) };
     this.save();
     return true;
   }

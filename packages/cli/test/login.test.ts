@@ -1,8 +1,9 @@
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { type LoginDeps, LoginFailed, login, logout, readCredentials } from "../src/login.ts";
+import { loadServer } from "../src/config.ts";
+import { DEFAULT_SERVER, type LoginDeps, LoginFailed, login, logout, readCredentials } from "../src/login.ts";
 
 const SERVER = "https://watcheroni.test";
 const GITHUB = "https://github.test";
@@ -81,5 +82,23 @@ describe("logout", () => {
     expect(calls.at(-1)).toMatchObject({ url: `${SERVER}/v1/keys/current`, auth: "Bearer wk1_7_secret" });
     expect(JSON.parse(readFileSync(process.env.WATCHERONI_CREDENTIALS!, "utf8")).servers).toEqual({});
     expect(await logout(SERVER, deps)).toBe(false);
+  });
+});
+
+describe("choosing the server", () => {
+  it("uses the default server once signed in to it, and local mode before", () => {
+    const saved = { ...process.env };
+    try {
+      process.env.WATCHERONI_CONFIG_DIR = mkdtempSync(join(tmpdir(), "watcheroni-config-"));
+      delete process.env.WATCHERONI_SERVER;
+      delete process.env.WATCHERONI_API_KEY;
+      expect(loadServer()).toBeNull();
+      writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { [DEFAULT_SERVER]: { api_key: "wk1_7_secret" } } }));
+      expect(loadServer()).toEqual({ url: DEFAULT_SERVER, apiKey: "wk1_7_secret" });
+      process.env.WATCHERONI_SERVER = "";
+      expect(loadServer()).toBeNull();
+    } finally {
+      process.env = saved;
+    }
   });
 });
