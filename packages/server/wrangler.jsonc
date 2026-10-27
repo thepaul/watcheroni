@@ -7,9 +7,15 @@
   "compatibility_flags": ["enable_request_signal"],
   "observability": { "enabled": true },
   "durable_objects": {
-    "bindings": [{ "name": "ACCOUNT", "class_name": "Account" }]
+    "bindings": [
+      { "name": "ACCOUNT", "class_name": "Account" },
+      { "name": "REPO_HUB", "class_name": "RepoHub" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Account"] }]
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Account"] },
+    { "tag": "v2", "new_sqlite_classes": ["RepoHub"] }
+  ]
   // Secrets, not in this file: PROTO_TOKEN and GITHUB_WEBHOOK_SECRET
   // (wrangler secret put, or .dev.vars for wrangler dev).
 }

@@ -167,8 +167,9 @@ CREATE TABLE deliveries (guid TEXT PRIMARY KEY, at INTEGER); -- 3 days
 CREATE TABLE outbox (            -- events waiting to reach accounts
   id INTEGER PRIMARY KEY,
   account_id INTEGER NOT NULL,
-  payload TEXT NOT NULL,         -- JSON array of {inbox, sub, event}
+  payload TEXT NOT NULL,         -- JSON array of {inbox, event}; event.sub is set
   attempts INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL,   -- for giving up after a day
   next_at INTEGER NOT NULL
 );
 
@@ -221,6 +222,57 @@ retries, mergeability checks, expiring subscriptions, pruning
 `deliveries` and finished PRs' `checks`, and a daily check that the
 installation still exists. After each run it sets the alarm to the
 earliest due time, or clears it.
+
+#### As built in the prototype
+
+`packages/server/src/repo-hub.ts`, with the buckets in `src/limits.ts`
+(migration tag `v2`). Where it differs from the above:
+
+- **Not built yet:** the `checks`, `rollups` and `jobs` tables, so no
+  `checks.completed` or `merge.*`; `touch`, `verify` and `revokeAll`;
+  expiring subscriptions (`expires_at` is stored but not enforced); the
+  `base` and `author` filters for repository-wide subscriptions; the
+  subscribe-time GitHub checks (installation, private access), which
+  belong to the Worker once sign-in exists. The alarm covers only outbox
+  retries, the end of a throttle and pruning `deliveries`.
+- **`subscribe`** takes `{account, inbox, pr, kinds, ignore, ttl_seconds}`,
+  the repo, and an optional baseline (`{state, head_sha, base_ref,
+  draft}`). It returns `{ok: true, created, subscription}` or
+  `{ok: false, status, code, detail}` rather than throwing, since RPC
+  exceptions lose their fields. `unsubscribe` returns whether the
+  subscription existed. Kinds and ignored actors are sorted before
+  storing, so idempotence doesn't depend on their order.
+- **Until `/v1` has sign-in**, subscriptions are made through
+  `POST /debug/repos/{repo id}/subscriptions` (and `DELETE .../{sub}`,
+  `GET /debug/repos/{repo id}` for the object's state), behind
+  `PROTO_TOKEN`. RepoHub delivers to `acct:<account>`, the real naming,
+  so these events don't reach the prototype's single `acct:proto` inbox.
+- **The Worker skips RepoHub** when a delivery normalises to no events
+  (labels, edits, `check_run.created` and so on). Those cost no Durable
+  Object request and don't count against the repo's ingest limit or get
+  recorded for dedupe. The webhook response lists the events and what
+  `ingest` returned.
+- **Matching.** `check.completed` is dropped before matching. An event
+  with no PR but a `data.head_sha` (statuses, check runs on branches
+  without a PR) is copied once per watched PR whose `prs.head_sha`
+  matches, each copy with ID `<event id>.pr<N>`. `pr.opened`,
+  `pr.pushed`, `pr.base_changed` and the draft and state changes update
+  `prs`. "The first subscription" in an inbox is the earliest created
+  (SQLite `rowid` order). `ignore.self` compares the actor's ID with the
+  subscription's account ID, which is the GitHub user ID.
+- **Ending a watch.** On `pr.merged` or `pr.closed`, the PR's
+  subscriptions get the event and then `watch.ended` (ID
+  `<event id>.ended`, `data.reason` `merged` or `closed`), and are
+  deleted along with the PR's `prs` row. Repository-wide subscriptions see
+  the PR event but never end this way.
+- **Outbox.** The first 20 accounts' rows are leased for a minute and
+  delivered in parallel before `ingest` returns; the rest are due at once
+  and the alarm takes 20 per run, setting itself again straight away
+  while rows are due. A failure retries after 5 s, doubling to 10 minutes,
+  and is dropped (logged) once the row is a day old. `Account.deliver`
+  doesn't yet report unknown subscriptions, so RepoHub never deletes a
+  subscription on its say-so.
+- **Throttling** is described under "Limits → Per repository".
 
 ### Account
 
@@ -543,7 +595,7 @@ account.
 
 | Limit | Default | When exceeded |
 |---|---|---|
-| Webhook deliveries ingested | 600 an hour, bursts of 200 | The repo is throttled until the bucket refills: deliveries are dropped, subscribers get `repo.throttled` once, and `repo.unthrottled` (with a count of what was dropped) when it lifts |
+| Webhook deliveries ingested | 600 an hour, bursts of 200 | The repo is throttled until the bucket is back to 50 tokens (about 5 minutes): deliveries are dropped (but still recorded for dedupe), each inbox watching the repo gets `repo.throttled` once, and `repo.unthrottled` (with a count of what was dropped) when it lifts, from the alarm or the next delivery. Their IDs are `repo:<id>.throttled.<ms>` and `repo:<id>.unthrottled.<ms>`, the time the throttle began |
 | Subscriptions | 200 | `422 quota_exceeded` |
 | Repository-wide subscriptions | 20 | `422 quota_exceeded` |
 | Distinct accounts subscribed | 100 | `422 quota_exceeded` |
@@ -638,6 +690,7 @@ packages/
       webhook/            signature check, normalise.ts (payload → Fact[])
       github/             App JWT, installation tokens, REST/GraphQL calls
       objects/            repo-hub.ts, account.ts, installation.ts, control.ts
+                          (in the prototype, directly in src/)
       derive/             checks rollup, mergeability scheduling
       limits.ts           token buckets
     wrangler.jsonc
@@ -828,6 +881,9 @@ It runs on the deployer's own Cloudflare account, free plan included.
 3. **Server MVP:** webhook → RepoHub → Account → WebSocket for PR
    subscriptions, device-flow login, API keys. Develop with `wrangler dev`
    and `gh webhook forward` or smee relaying a test App's deliveries.
+   *RepoHub built:* ingest, PR, head-SHA and repo-wide matching, the
+   outbox, the end of a watch and the ingest limit, with subscriptions made
+   through `/debug` (see "As built in the prototype" under "RepoHub").
 4. **Derived events** (checks rollup, mergeability), limits, redelivery.
 5. **Publish:** the hosted App, `watcheroni` and `@watcheroni/protocol` on
    npm, the Claude Code plugin, `selfhost`.
