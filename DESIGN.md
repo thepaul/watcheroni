@@ -766,7 +766,12 @@ marketplace:
   the user.
 - **A SessionStart hook** that runs `watcheroni ls --inbox
   cc-$CLAUDE_CODE_SESSION_ID` and, if anything is watched, tells a
-  resumed session to restart its `wait`.
+  resumed session to restart its `wait`. It runs on `resume` (background
+  commands are gone) and `compact` (the instructions may be), and takes
+  the session ID from the hook's input.
+- **`bin/watcheroni`**, which the plugin puts on the Bash tool's PATH: it
+  runs `$WATCHERONI_CLI`, a global install, the clone's own build when
+  the plugin is installed from a local clone, or `npx watcheroni`.
 
 Because the cursor lives on the server, a `wait` killed by an app restart
 loses nothing; the next one gets everything since the last
@@ -816,11 +821,25 @@ It runs on the deployer's own Cloudflare account, free plan included.
    billed while idle), and measure Worker CPU for normalising large
    webhook payloads. Also confirm that a background Bash command in
    Claude Code survives for hours.
-   *Done on 2026-10-27, except the background Bash check:* the object
-   hibernated with three clients and a bridge attached, with no duration
-   billed for the idle minutes (see `packages/server/README.md`), and
-   webhook CPU is under 4 ms for any realistic payload (see "Webhook
-   CPU").
+   *Done on 2026-10-27:* the object hibernated with three clients and a
+   bridge attached, with no duration billed for the idle minutes (see
+   `packages/server/README.md`), and webhook CPU is under 4 ms for any
+   realistic payload (see "Webhook CPU"). Background Bash survives for
+   hours: in the Claude Code desktop app, one `watcheroni wait --timeout
+   6h` ran in the background for the full six hours (04:09 to 10:09 UTC)
+   and exited with its timeout, while beside it a `wait` loop driven by
+   the plugin's skill ran on three busy public PRs for the same six hours:
+   ten runs, four of them hour-long timeouts, each event arriving within
+   one poll of GitHub's timestamp (an approval at 08:11:51, reported in
+   the run that ended 08:12:25), and one PR's merge ending its watch.
+   Stopping a running `wait` released the inbox lock. What reads badly
+   to an agent: each reply in a review thread arrives as its own
+   "commented" `review.submitted` plus a `review_comment.created`, so
+   three replies make six lines; `thread.resolved` doesn't say which
+   thread; and the printed `gh api` commands return whole JSON objects
+   where a `--jq` filter for the body would do. A failed
+   `checks.completed` now prints `gh pr checks`, since its individual
+   `check.failed` events may predate the watch.
 2. **CLI in local mode only** (`wait`, `stream`, `exec` polling GitHub).
    Useful on its own; replaces Auto-Fix for one user straight away.
    *Built on 2026-10-27* in `packages/cli`, together with
