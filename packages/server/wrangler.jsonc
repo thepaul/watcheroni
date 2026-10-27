@@ -1,0 +1,15 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "watcheroni-proto",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-10-20",
+  // request.signal lets the long-poll bridge notice a client hanging up.
+  "compatibility_flags": ["enable_request_signal"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "ACCOUNT", "class_name": "Account" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Account"] }]
+  // Secret, not in this file: PROTO_TOKEN (wrangler secret put PROTO_TOKEN,
+  // or .dev.vars for wrangler dev).
+}
