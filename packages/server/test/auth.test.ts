@@ -133,6 +133,18 @@ describe("meta", () => {
     expect((await call("/", { method: "POST" })).status).toBe(401);
   });
 
+  it("has a page for GitHub to send people to after installing", async () => {
+    const res = await call("/github/setup?installation_id=1&setup_action=install");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/^text\/html/);
+    const html = await res.text();
+    expect(html).toContain("watcheroni is installed");
+    expect(html).toContain("npx watcheroni login");
+    const requested = await (await call("/github/setup?setup_action=request&installation_id=<script>")).text();
+    expect(requested).toContain("Installation requested");
+    expect(requested).not.toContain("<script>");
+  });
+
   it("publishes the client ID for the device flow", async () => {
     const meta = await (await call("/v1/meta")).json<Meta>();
     expect(meta.github?.client_id).toBe("Iv23test");
