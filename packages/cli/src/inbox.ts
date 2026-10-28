@@ -120,7 +120,7 @@ export class Inbox {
     const entry = Object.entries(this.state.watched).find(([, w]) => w.sub === sub);
     if (!entry) return;
     const [key, w] = entry;
-    if (kind === "watch.revoked" || kind === "watch.unverified") delete w.sub;
+    if (kind === "watch.revoked" || kind === "watch.unverified" || kind === "watch.expired") delete w.sub;
     else delete this.state.watched[key];
     this.save();
   }

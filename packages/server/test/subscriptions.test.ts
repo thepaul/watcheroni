@@ -1,5 +1,5 @@
 import examples from "@octokit/webhooks-examples/api.github.com/index.json";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { appJwt } from "../src/app";
@@ -160,7 +160,7 @@ async function webhook(event: string, payload: unknown, delivery = crypto.random
     body,
   });
   expect(res.status).toBe(202);
-  return res.json<{ installation?: { revoked: number; queued: number } | null; ingest?: unknown }>();
+  return res.json<{ installation?: { revoked: number; queued: number } | null; ingest?: unknown; revoked_keys?: number }>();
 }
 
 // ---- Tests -----------------------------------------------------------
@@ -443,6 +443,103 @@ describe("subscribing to a private repo", () => {
       expect(dump).not.toContain("ghu_mine");
       expect(dump).not.toContain(`ghs_${repo.installation}`);
     }
+  });
+});
+
+describe("keeping subscriptions alive", () => {
+  const hub = (repo: FakeRepo) => env.REPO_HUB.get(env.REPO_HUB.idFromName(`repo:${repo.id}`));
+  // Makes every subscription on the repo due, as if made long ago.
+  const age = (repo: FakeRepo, column: "expires_at" | "verified_until") =>
+    runInDurableObject(hub(repo), (_, state) => {
+      state.storage.sql.exec(`UPDATE subscriptions SET ${column} = 0, created_at = 0`);
+    });
+  const verify = (auth: Record<string, string>, id: string, headers: Record<string, string> = {}) =>
+    call(`/v1/inboxes/box/subscriptions/${id}/verify`, { method: "POST", headers: { ...auth, ...headers } });
+
+  it("ends an inbox's subscriptions with watch.expired once nobody has read it for the TTL", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const sub = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 })).json<SubscriptionInfo>();
+    await age(repo, "expires_at");
+    expect(await runDurableObjectAlarm(hub(repo))).toBe(true);
+    expect((await hubStats(repo.id)).subscriptions).toEqual([]);
+    expect(await list(user.auth)).toEqual([]);
+    const events = await inboxEvents(user.id);
+    expect(events.map((e) => [e.kind, e.sub, e.data.reason])).toEqual([["watch.expired", sub.id, "unread"]]);
+  });
+
+  it("keeps a subscription whose inbox was read, counting the TTL from the read", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const sub = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7, ttl_seconds: 3600 })).json<SubscriptionInfo>();
+    expect((await call("/v1/inboxes/box/events", { headers: user.auth })).status).toBe(200);
+    await age(repo, "expires_at");
+    expect(await runDurableObjectAlarm(hub(repo))).toBe(true);
+    const [kept] = (await hubStats(repo.id)).subscriptions;
+    expect(kept.id).toBe(sub.id);
+    expect(kept.expires_at - Date.now()).toBeGreaterThan(3600_000 - 60_000);
+    expect(Date.parse((await list(user.auth))[0].expires_at)).toBe(kept.expires_at);
+    expect((await inboxEvents(user.id)).map((e) => e.kind)).toEqual([]);
+  });
+
+  it("renews a private repo's verification, and ends it when access is lost or it lapses", async () => {
+    const user = await signedIn();
+    const repo = newRepo({ private: true, readers: [user.id] });
+    mockGitHub({ repos: [repo], users: { ghu_mine: { id: user.id, login: "me" } } });
+    const token = { "X-GitHub-Token": "ghu_mine" };
+    const first = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 }, token)).json<SubscriptionInfo>();
+
+    expect(await (await verify(user.auth, first.id)).json()).toMatchObject({ status: 401, code: "github_token_required" });
+    await runInDurableObject(hub(repo), (_, state) => {
+      state.storage.sql.exec("UPDATE subscriptions SET verified_until = ?", Date.now() + 1000);
+    });
+    const renewed = await verify(user.auth, first.id, token);
+    expect(renewed.status, await renewed.clone().text()).toBe(200);
+    const until = Date.parse((await renewed.json<SubscriptionInfo>()).verified_until!);
+    expect(until - Date.now()).toBeGreaterThan(7 * 24 * 3600_000 - 60_000);
+    expect((await hubStats(repo.id)).subscriptions[0].verified_until).toBe(until);
+    expect((await list(user.auth))[0].verified_until).toBe(new Date(until).toISOString());
+
+    // Removed from the repo: the next verification ends it at once.
+    repo.readers = [];
+    const denied = await verify(user.auth, first.id, token);
+    expect(denied.status).toBe(403);
+    expect(await list(user.auth)).toEqual([]);
+    expect((await hubStats(repo.id)).subscriptions).toEqual([]);
+
+    // Nobody verifies in time: the alarm ends it.
+    repo.readers = [user.id];
+    const second = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 }, token)).json<SubscriptionInfo>();
+    await age(repo, "verified_until");
+    expect(await runDurableObjectAlarm(hub(repo))).toBe(true);
+    expect(await list(user.auth)).toEqual([]);
+    const events = await inboxEvents(user.id);
+    expect(events.map((e) => [e.kind, e.sub, e.data.reason])).toEqual([
+      ["watch.unverified", first.id, "access_denied"],
+      ["watch.unverified", second.id, "not_verified"],
+    ]);
+  });
+
+  it("verifying a public repo's subscription changes nothing", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const sub = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 })).json<SubscriptionInfo>();
+    const res = await verify(user.auth, sub.id);
+    expect(res.status).toBe(200);
+    expect((await res.json<SubscriptionInfo>()).verified_until).toBeNull();
+    expect((await verify(user.auth, "sub_nope")).status).toBe(404);
+  });
+});
+
+describe("revoking the App's authorization", () => {
+  it("revokes every key the user has", async () => {
+    const user = await signedIn();
+    const res = await webhook("github_app_authorization", { action: "revoked", sender: { id: user.id, login: "me" } });
+    expect(res).toMatchObject({ revoked_keys: 1 });
+    expect((await call("/v1/keys", { headers: user.auth })).status).toBe(401);
   });
 });
 

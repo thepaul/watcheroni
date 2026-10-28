@@ -94,6 +94,9 @@ export class FakeServer {
   readonly githubTokens = new Set<string>();
   // Subscriptions made, with the X-GitHub-Token each request carried.
   readonly subscriptions: { id: string; inbox: string; repo: string; pr: number; githubToken: string | null }[] = [];
+  // Private subscriptions' verified_until, by ID, and the verify calls seen.
+  readonly verifiedUntil = new Map<string, string>();
+  readonly verified: { id: string; githubToken: string | null }[] = [];
   // What POST /v1/github/refresh answers, and the refresh tokens it saw.
   refreshAnswer: Record<string, unknown> = { error: "bad_refresh_token" };
   readonly refreshed: string[] = [];
@@ -208,10 +211,10 @@ export class FakeServer {
       return json(200, this.refreshAnswer);
     }
     if (!this.authorized(req)) return json(401, { status: 401, code: "unauthorized" });
-    const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?$/);
+    const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?(?:\/([^/]+)(\/[a-z]+))?$/);
     if (!m) return json(404, { status: 404, code: "not_found" });
     const name = decodeURIComponent(m[1]);
-    const route = `${req.method} ${m[2] ?? ""}`;
+    const route = `${req.method} ${m[2] ?? ""}${m[3] ? `/{id}${m[4]}` : ""}`;
     const inbox = this.inbox(name);
     if (route === "PUT ") return json(200, { name, head: inbox.head, acked: inbox.acked });
     if (route === "POST /subscriptions") {
@@ -226,6 +229,21 @@ export class FakeServer {
       const id = `sub_${this.subscriptions.length + 1}`;
       this.subscriptions.push({ id, inbox: name, repo: body.repo, pr: body.pr, githubToken });
       return json(201, { id, inbox: name, repo: { id: 1, full_name: body.repo, private: repo.private }, pr: body.pr });
+    }
+    if (route === "GET /subscriptions") {
+      const subscriptions = this.subscriptions.filter((s) => s.inbox === name).map((s) => ({
+        id: s.id, inbox: name, pr: s.pr,
+        repo: { id: 1, full_name: s.repo, private: !!this.repos.get(s.repo)?.private },
+        verified_until: this.verifiedUntil.get(s.id) ?? null,
+      }));
+      return json(200, { subscriptions });
+    }
+    if (route === "POST /subscriptions/{id}/verify") {
+      const githubToken = (req.headers["x-github-token"] as string | undefined) ?? null;
+      this.verified.push({ id: m[3], githubToken });
+      if (!githubToken || !this.githubTokens.has(githubToken)) return json(401, { status: 401, code: "github_token_invalid" });
+      this.verifiedUntil.set(m[3], new Date(Date.now() + 7 * 24 * 3600_000).toISOString());
+      return json(200, {});
     }
     if (route === "POST /ack") {
       const { seq } = await readBody<{ seq: number }>();

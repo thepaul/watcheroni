@@ -15,6 +15,7 @@ import {
   APP_SLUG,
   createSubscription,
   deleteSubscription,
+  verifySubscription,
   getSubscription,
   installationStub,
   listSubscriptions,
@@ -74,7 +75,7 @@ export default {
     if (route === "POST /v1/github/refresh") return refresh(request, env);
     if (pathname.startsWith("/debug/")) return debug(request, url, env);
 
-    const inboxMatch = pathname.match(/^\/v1\/inboxes\/([^/]+)(?:(\/[a-z]+)(?:\/([^/]+))?)?$/);
+    const inboxMatch = pathname.match(/^\/v1\/inboxes\/([^/]+)(?:(\/[a-z]+)(?:\/([^/]+)(\/[a-z]+)?)?)?$/);
     const inbox = inboxMatch ? decodeURIComponent(inboxMatch[1]) : null;
     const itemId = inboxMatch?.[3] ? decodeURIComponent(inboxMatch[3]) : null;
     if (inbox !== null && !INBOX_NAME.test(inbox)) return problem(400, "invalid_request", "Bad inbox name");
@@ -92,7 +93,7 @@ export default {
     const auth = await account.authenticate(parsed.hash);
     if (!auth.ok) return authFailure(auth);
     const caller: Caller = { account, accountId: parsed.accountId, keyId: auth.keyId };
-    const rest = (inboxMatch?.[2] ?? "") + (itemId === null ? "" : "/{id}");
+    const rest = (inboxMatch?.[2] ?? "") + (itemId === null ? "" : "/{id}") + (inboxMatch?.[4] ?? "");
     const res = await api(request, url, env, caller, inbox, rest, itemId);
     return withRateHeaders(res, auth.rate);
   },
@@ -138,6 +139,8 @@ async function api(
       return getSubscription(account, name, itemId!);
     case "DELETE /v1/inboxes/{name}/subscriptions/{id}":
       return deleteSubscription(env, account, name, itemId!);
+    case "POST /v1/inboxes/{name}/subscriptions/{id}/verify":
+      return verifySubscription(request, env, account, accountId, name, itemId!);
 
     case "GET /v1/inboxes/{name}/events":
       return longPoll(account, name, url, request.signal);
@@ -402,6 +405,13 @@ async function webhook(request: Request, env: Env): Promise<Response> {
     payload = JSON.parse(new TextDecoder().decode(body));
   } catch {
     return problem(400, "invalid_request", "Body is not JSON");
+  }
+  // The user revoked the App's authorization on GitHub: their GitHub
+  // tokens are dead, and so are their watcheroni keys.
+  if (event === "github_app_authorization") {
+    const user = (payload as { action?: string; sender?: { id?: number } }).sender?.id;
+    const revoked = payload.action === "revoked" && typeof user === "number" ? await accountStub(env, user).revokeAllKeys() : 0;
+    return json({ events: [], revoked_keys: revoked }, 202);
   }
   if (event === "installation" || event === "installation_repositories") {
     const fact = installationFact(payload);

@@ -103,6 +103,14 @@ function describe(e: WatchEvent): [string, string | null] {
       return [`pr.merged as ${short(d.merge_sha)}`, null];
     case "watch.ended":
       return [`watch.ended: the PR was ${d.reason}`, null];
+    case "watch.expired":
+      return ["watch.expired: the server stopped watching after a week with nobody reading the inbox; watching it from this machine now", null];
+    case "watch.unverified":
+      return [d.reason === "access_denied"
+        ? "watch.unverified: your GitHub login can no longer read this repo"
+        : "watch.unverified: the server's access check lapsed; run `watcheroni login`, then name the PR again", null];
+    case "watch.revoked":
+      return ["watch.revoked: the watcheroni App lost access to this repo", null];
     case "inbox.gap":
       return [`inbox.gap: events after ${d.missed_after} were dropped before they were read; check the watched PRs on GitHub`, null];
     default:

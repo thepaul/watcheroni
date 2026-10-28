@@ -148,6 +148,37 @@ export async function getSubscription(account: AccountStub, inbox: string, id: s
   return sub ? json(sub) : problem(404, "not_found", "No such subscription");
 }
 
+// POST /v1/inboxes/{name}/subscriptions/{id}/verify: a private repo's
+// subscription shows a fresh GitHub token before `verified_until`. If the
+// token works but can't read the repo any more, the user has lost access,
+// and the subscription ends at once with `watch.unverified`.
+export async function verifySubscription(
+  request: Request,
+  env: Env,
+  account: AccountStub,
+  accountId: number,
+  inbox: string,
+  id: string,
+): Promise<Response> {
+  const sub = await account.getSubscription(inbox, id);
+  if (!sub) return problem(404, "not_found", "No such subscription");
+  if (!sub.repo.private) return json(sub);
+  const denied = await checkPrivateAccess(request, env, accountId, sub.repo.full_name);
+  if (denied) {
+    if (denied.status === 403) await repoHubStub(env, sub.repo.id).endSubscription(id, "watch.unverified", "access_denied");
+    return denied;
+  }
+  const until = Date.now() + PRIVATE_VERIFY_SECONDS * 1000;
+  const updated = await repoHubStub(env, sub.repo.id).reverify(id, until);
+  if (!updated) {
+    // RepoHub ended it meanwhile (the PR merged, say); the index is stale.
+    await account.removeSubscription(inbox, id);
+    return problem(404, "not_found", "No such subscription");
+  }
+  await account.setVerified(id, until);
+  return json({ ...sub, verified_until: new Date(until).toISOString() });
+}
+
 export async function deleteSubscription(env: Env, account: AccountStub, inbox: string, id: string): Promise<Response> {
   const sub = await account.removeSubscription(inbox, id);
   if (!sub) return problem(404, "not_found", "No such subscription");

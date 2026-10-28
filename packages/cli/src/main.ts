@@ -8,7 +8,7 @@ import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
-import { ServerClient, ServerError, ServerReader, Unreachable, subscribe } from "./server.ts";
+import { RENEW_EVERY_MS, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "./server.ts";
 import { UsageError, currentBranchPr, parseTarget, targetKey } from "./targets.ts";
 
 // Exit codes (DESIGN.md, "The CLI").
@@ -160,7 +160,15 @@ async function main(argv: string[]): Promise<number> {
     log(`watching ${key} in inbox ${inboxName}${client && !sub ? ", polling GitHub from this machine" : ""}`);
   }
 
+  // Private repos' subscriptions need a fresh token now and then; long
+  // runs check again every few hours.
+  const renew = () => client ? renewSubscriptions(client, inboxName, { log, githubToken: () => githubTokenFor(client.url) }) : Promise.resolve();
+  if (reachable) await renew();
+  const renewTimer = client ? setInterval(() => void renew().catch((e: unknown) => log(`renewing subscriptions: ${(e as Error).message}`)), RENEW_EVERY_MS) : null;
+  renewTimer?.unref();
+
   if (verb === "watch") {
+    clearInterval(renewTimer ?? undefined);
     // Set the starting point now, so events from here on are kept.
     await pollOnce(inbox, log, undefined, !reachable);
     return 0;
@@ -187,6 +195,7 @@ async function main(argv: string[]): Promise<number> {
         return await execCommand(feed, { kinds, interval, batch: opts.batch, settle: parseDuration(opts.settle), command });
     }
   } finally {
+    clearInterval(renewTimer ?? undefined);
     await server?.close();
   }
   return EXIT.error;

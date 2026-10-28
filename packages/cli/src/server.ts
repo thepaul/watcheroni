@@ -1,4 +1,4 @@
-import type { EventsPage, ServerMessage, SubscriptionInfo, WatchEvent } from "@watcheroni/protocol";
+import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import type { ServerConfig } from "./config.ts";
 import { LoginNeeded } from "./github.ts";
@@ -146,6 +146,46 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
       return null;
     }
     throw e;
+  }
+}
+
+// How long before `verified_until` a private subscription is renewed, and
+// how often a long-running command checks.
+export const RENEW_BEFORE_MS = 2 * 24 * 3600_000;
+export const RENEW_EVERY_MS = 6 * 3600_000;
+
+// A private repo's subscription must show a fresh GitHub token before its
+// `verified_until` (PROTOCOL.md, "Private repositories stay verified"), or
+// the server ends it. Renews the inbox's subscriptions that are due soon.
+// Problems are logged, never thrown: the next check tries again.
+export async function renewSubscriptions(client: ServerClient, inbox: string, o: SubscribeOptions, now = Date.now()): Promise<void> {
+  let subs: SubscriptionInfo[];
+  try {
+    subs = (await client.request<SubscriptionsResponse>("GET", `/v1/inboxes/${inbox}/subscriptions`)).subscriptions;
+  } catch (e) {
+    if (e instanceof ServerError || e instanceof Unreachable || e instanceof LoginNeeded) return;
+    throw e;
+  }
+  const due = subs.filter((s) => s.repo.private && s.verified_until && Date.parse(s.verified_until) - now < RENEW_BEFORE_MS);
+  if (!due.length) return;
+  const token = await o.githubToken?.();
+  if (!token) {
+    o.log(`the server needs a fresh GitHub token to keep watching ${due.map((s) => s.repo.full_name).join(", ")}; run \`watcheroni login\``);
+    return;
+  }
+  for (const s of due) {
+    try {
+      await client.request("POST", `/v1/inboxes/${inbox}/subscriptions/${s.id}/verify`, { headers: { "X-GitHub-Token": token } });
+    } catch (e) {
+      if (e instanceof ServerError) {
+        o.log(e.code === "repo_access_denied"
+          ? `you can no longer read ${s.repo.full_name}, so the server has stopped watching it`
+          : `couldn't renew the server's watch on ${s.repo.full_name}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
+        continue;
+      }
+      if (e instanceof Unreachable || e instanceof LoginNeeded) return;
+      throw e;
+    }
   }
 }
 

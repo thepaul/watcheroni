@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import type { ActivityItem } from "./repo-hub";
 import {
   ACCOUNT_MAX_SUBSCRIPTIONS,
   ACCOUNT_REQUESTS_PER_MINUTE,
@@ -311,6 +312,28 @@ export class Account extends DurableObject<Env> {
     return row ? subscriptionInfo(row) : null;
   }
 
+  // RPC, from RepoHub when subscriptions reach `expires_at`: when each
+  // should now expire, counting from the last read of its inbox, or from
+  // now if a client is connected to it. A time not in the future means
+  // nobody has read the inbox for the whole TTL.
+  subscriptionActivity(items: ActivityItem[]): Record<string, number> {
+    const now = Date.now();
+    const out: Record<string, number> = {};
+    for (const item of items) {
+      const inbox = this.inbox(item.inbox);
+      const connected = this.ctx.getWebSockets(`inbox:${item.inbox}`).length > 0;
+      const since = connected ? now : Math.max(inbox?.last_read_at ?? 0, item.created_at);
+      out[item.id] = since + item.ttl_ms;
+      this.sql.exec("UPDATE subscriptions SET expires_at = ? WHERE id = ?", out[item.id], item.id);
+    }
+    return out;
+  }
+
+  // RPC, after POST .../verify.
+  setVerified(id: string, until: number): void {
+    this.sql.exec("UPDATE subscriptions SET verified_until = ? WHERE id = ?", until, id);
+  }
+
   // RPC: forgets a subscription, returning it so the Worker can tell its
   // RepoHub, or null if there was none.
   removeSubscription(inbox: string, id: string): SubscriptionInfo | null {
@@ -417,6 +440,7 @@ export class Account extends DurableObject<Env> {
         if (!inbox) return ws.close(4004, "inbox deleted");
         attachment.pos = typeof msg.after === "number" ? msg.after : inbox.acked;
         ws.serializeAttachment(attachment);
+        this.sql.exec("UPDATE inboxes SET last_read_at = ? WHERE name = ?", Date.now(), inbox.name);
         send(ws, { type: "ready", inbox: inbox.name, head: inbox.head, acked: inbox.acked });
         this.sendFrom(ws, attachment);
         return;

@@ -6,7 +6,7 @@ import { Feed } from "../src/feed.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
-import { ServerClient, ServerReader, subscribe } from "../src/server.ts";
+import { ServerClient, ServerReader, renewSubscriptions, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -252,6 +252,27 @@ describe("subscribing on the server", () => {
     expect(await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) })).toBeNull();
     expect(messages.at(-1)).toMatch(/didn't accept this machine's GitHub token/);
     expect(fake.subscriptions).toEqual([]);
+  });
+
+  it("renews private subscriptions due within two days, and only those", async () => {
+    fake.repos.set("octo/secret", { private: true });
+    fake.repos.set("octo/widgets", { private: false });
+    fake.githubTokens.add("ghu_old");
+    signIn({ expires_at: new Date(Date.now() + 3600_000).toISOString() });
+    const token = { log, githubToken: () => githubTokenFor(fake.url) };
+    const soon = await subscribe(client(), "box", priv, token);
+    const later = await subscribe(client(), "box", { ...priv, number: 8 }, token);
+    await subscribe(client(), "box", pub, token);
+    fake.verifiedUntil.set(soon!, new Date(Date.now() + 3600_000).toISOString());
+    fake.verifiedUntil.set(later!, new Date(Date.now() + 6 * 24 * 3600_000).toISOString());
+    await renewSubscriptions(client(), "box", token);
+    expect(fake.verified).toEqual([{ id: soon, githubToken: "ghu_old" }]);
+    expect(messages).toEqual([]);
+
+    // With no token to show, it says what to do.
+    fake.verifiedUntil.set(later!, new Date(Date.now() + 3600_000).toISOString());
+    await renewSubscriptions(client(), "box", { log });
+    expect(messages).toEqual(["the server needs a fresh GitHub token to keep watching octo/secret; run `watcheroni login`"]);
   });
 
   it("falls back to polling when the App isn't installed, saying where to install it", async () => {

@@ -229,12 +229,26 @@ earliest due time, or clears it.
 (migration tag `v2`). Where it differs from the above:
 
 - **Not built yet:** the `checks`, `rollups` and `jobs` tables, so no
-  `checks.completed` or `merge.*`; `touch` and `verify`; expiring
-  subscriptions and private ones that weren't re-verified (`expires_at`
-  and `verified_until` are stored but not enforced); the `base` and
-  `author` filters for repository-wide subscriptions (`/v1` answers 400
-  to them). The alarm covers only outbox retries, the end of a throttle
-  and pruning `deliveries`.
+  `checks.completed` or `merge.*`; the `base` and `author` filters for
+  repository-wide subscriptions (`/v1` answers 400 to them).
+- **Expiry is pulled, not pushed.** There's no `touch`: reading an inbox
+  only records `last_read_at` in Account (a WebSocket `hello` counts, and
+  so does having a socket open). When a subscription reaches
+  `expires_at`, RepoHub's alarm asks the Account
+  (`subscriptionActivity`) when each due subscription should now expire,
+  counting its TTL (`ttl_seconds`, a column since schema 2) from the last
+  read, or from now while a client is connected. Only one nobody has read
+  for the whole TTL ends, with `watch.expired`. So reads cost RepoHub
+  nothing, and an expiry check costs one Account call per account.
+- **Verification** is `reverify(subId, until)` from
+  `POST .../{id}/verify`, which checks the user's token as subscribing
+  does. A token that works but can no longer read the repo ends the
+  subscription at once (`endSubscription`, `watch.unverified` with reason
+  `access_denied`); one past `verified_until` ends from the alarm (reason
+  `not_verified`). The CLI renews private subscriptions due within two
+  days, when it starts and every six hours while it runs.
+- **The alarm** covers outbox retries, the end of a throttle, the next
+  `expires_at` or `verified_until`, and pruning `deliveries`.
 - **`subscribe`** takes `{account, inbox, pr, kinds, ignore, ttl_seconds,
   verified_until}`, the repo, and an optional baseline (`{state, head_sha,
   base_ref, draft, mergeable}`); subscribing again with a later
@@ -985,8 +999,12 @@ It runs on the deployer's own Cloudflare account, free plan included.
    refreshing it when expired) and polling locally whatever the server
    won't watch. Deployed to the test Worker and checked there; no repo has
    the App installed yet, so a live subscription has only been seen to
-   answer `app_not_installed`. Still to do for this step: `/verify` and
-   enforcing `verified_until` and `expires_at`.
+   answer `app_not_installed`. *Finished 2026-10-28:* `/verify` and the
+   CLI renewing private subscriptions, `watch.expired` for inboxes nobody
+   reads, `watch.unverified` when access lapses or is lost, and
+   `github_app_authorization` revoking the user's API keys. Subscribing
+   has been checked live on production with a private repo
+   (thepaul/shinycode-website); this last part so far on the test Worker.
 4. **Derived events** (checks rollup, mergeability), limits, redelivery.
 5. **Publish:** the hosted App, `watcheroni` and `@watcheroni/protocol` on
    npm, the Claude Code plugin, `selfhost`.

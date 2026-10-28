@@ -35,7 +35,9 @@ const PRUNE_EVERY_MS = 24 * 3600_000;
 // `check.completed` will feed the checks rollup.
 const INTERNAL_KINDS = new Set(["check.completed"]);
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
+// Retrying an expiry check whose Account couldn't be reached.
+const EXPIRY_RETRY_MS = 5 * 60_000;
 
 export interface Ignore {
   self: boolean;
@@ -52,6 +54,15 @@ export interface NewSubscription {
   ttl_seconds?: number;
   // Private repos: when access must next be re-checked (ms).
   verified_until?: number | null;
+}
+
+// What RepoHub tells an Account when checking whether a subscription has
+// gone unread for its whole TTL.
+export interface ActivityItem {
+  id: string;
+  inbox: string;
+  created_at: number;
+  ttl_ms: number;
 }
 
 export interface RepoInfo {
@@ -111,6 +122,9 @@ type SubRow = {
   created_at: number;
   expires_at: number;
   verified_until: number | null;
+  // How long it lives unread; null for rows from before schema 2, which
+  // all had the default.
+  ttl_seconds: number | null;
 };
 
 type PrRow = {
@@ -140,7 +154,13 @@ export class RepoHub extends DurableObject<Env> {
 
   private migrate(): void {
     this.sql.exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)");
-    if (Number(this.getMeta("schema_version") ?? 0) >= SCHEMA_VERSION) return;
+    const version = Number(this.getMeta("schema_version") ?? 0);
+    if (version >= SCHEMA_VERSION) return;
+    if (version === 1) {
+      this.sql.exec("ALTER TABLE subscriptions ADD COLUMN ttl_seconds INTEGER");
+      this.setMeta("schema_version", String(SCHEMA_VERSION));
+      return;
+    }
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS subscriptions (
         id TEXT PRIMARY KEY,
@@ -150,7 +170,8 @@ export class RepoHub extends DurableObject<Env> {
         spec TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         expires_at INTEGER NOT NULL,
-        verified_until INTEGER
+        verified_until INTEGER,
+        ttl_seconds INTEGER
       );
       CREATE INDEX IF NOT EXISTS subscriptions_pr ON subscriptions (pr);
       CREATE TABLE IF NOT EXISTS prs (
@@ -247,10 +268,11 @@ export class RepoHub extends DurableObject<Env> {
       created_at: now,
       expires_at: now + (sub.ttl_seconds ?? DEFAULT_TTL_SECONDS) * 1000,
       verified_until: sub.verified_until ?? null,
+      ttl_seconds: sub.ttl_seconds ?? null,
     };
     this.sql.exec(
-      "INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at, verified_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      row.id, row.account_id, row.inbox, row.pr, row.spec, row.created_at, row.expires_at, row.verified_until,
+      "INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at, verified_until, ttl_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      row.id, row.account_id, row.inbox, row.pr, row.spec, row.created_at, row.expires_at, row.verified_until, row.ttl_seconds,
     );
     if (sub.pr !== null) {
       this.sql.exec("INSERT OR IGNORE INTO prs (number) VALUES (?)", sub.pr);
@@ -262,7 +284,31 @@ export class RepoHub extends DurableObject<Env> {
         );
       }
     }
+    this.scheduleAlarm();
     return { ok: true, created: true, subscription: toSubscription(row) };
+  }
+
+  // RPC: a private repo's access was checked again (POST .../verify).
+  // Null if there's no such subscription.
+  reverify(subId: string, until: number): Subscription | null {
+    this.sql.exec("UPDATE subscriptions SET verified_until = MAX(COALESCE(verified_until, 0), ?) WHERE id = ?", until, subId);
+    const row = this.sql.exec<SubRow>("SELECT * FROM subscriptions WHERE id = ?", subId).toArray()[0];
+    this.scheduleAlarm();
+    return row ? toSubscription(row) : null;
+  }
+
+  // RPC: ends one subscription with a final `kind` event, e.g.
+  // `watch.unverified` when its user turns out to have lost access.
+  async endSubscription(subId: string, kind: string, reason: string): Promise<boolean> {
+    const row = this.sql.exec<SubRow>("SELECT * FROM subscriptions WHERE id = ?", subId).toArray()[0];
+    if (!row) return false;
+    const now = this.now();
+    const outgoing: Map<number, Delivery[]> = new Map();
+    this.endWith([row], kind, reason, kind, now, outgoing);
+    const ids = this.enqueue(outgoing, now);
+    await this.deliverRows(ids, now);
+    this.scheduleAlarm();
+    return true;
   }
 
   unsubscribe(subId: string): boolean {
@@ -278,36 +324,92 @@ export class RepoHub extends DurableObject<Env> {
   // (the webhook's delivery ID) makes the events' IDs stable across
   // retries. Returns how many subscriptions ended.
   async revokeAll(reason: string, eventBase: string): Promise<number> {
-    const subs = this.sql.exec<SubRow>("SELECT * FROM subscriptions ORDER BY rowid").toArray().map(toSubscription);
-    if (!subs.length) return 0;
+    const rows = this.sql.exec<SubRow>("SELECT * FROM subscriptions ORDER BY rowid").toArray();
+    if (!rows.length) return 0;
     const now = this.now();
-    const at = new Date(now).toISOString();
-    const repo = { id: Number(this.getMeta("repo_id")), full_name: this.getMeta("full_name") ?? "" };
     const outgoing: Map<number, Delivery[]> = new Map();
-    for (const sub of subs) {
-      push(outgoing, sub.account, {
-        inbox: sub.inbox,
-        event: {
-          v: 1,
-          id: `${eventBase}.revoked.${sub.id}`,
-          sub: sub.id,
-          kind: "watch.revoked",
-          at,
-          received_at: at,
-          repo,
-          pr: sub.pr,
-          actor: null,
-          data: { reason },
-          links: sub.pr === null ? {} : { html: `${GITHUB_WEB_URL}/${repo.full_name}/pull/${sub.pr}` },
-        },
-      });
-    }
-    this.sql.exec("DELETE FROM subscriptions");
+    this.endWith(rows, "watch.revoked", reason, `${eventBase}.revoked`, now, outgoing);
     this.sql.exec("DELETE FROM prs");
     const ids = this.enqueue(outgoing, now);
     await this.deliverRows(ids, now);
     this.scheduleAlarm();
-    return subs.length;
+    return rows.length;
+  }
+
+  // Queues a final `kind` event for each subscription and forgets them.
+  // Event IDs are `${idBase}.${sub id}`, stable across retries.
+  private endWith(rows: SubRow[], kind: string, reason: string, idBase: string, now: number, outgoing: Map<number, Delivery[]>): void {
+    const at = new Date(now).toISOString();
+    const repo = { id: Number(this.getMeta("repo_id")), full_name: this.getMeta("full_name") ?? "" };
+    for (const row of rows) {
+      push(outgoing, row.account_id, {
+        inbox: row.inbox,
+        event: {
+          v: 1,
+          id: `${idBase}.${row.id}`,
+          sub: row.id,
+          kind,
+          at,
+          received_at: at,
+          repo,
+          pr: row.pr,
+          actor: null,
+          data: { reason },
+          links: row.pr === null ? {} : { html: `${GITHUB_WEB_URL}/${repo.full_name}/pull/${row.pr}` },
+        },
+      });
+      this.sql.exec("DELETE FROM subscriptions WHERE id = ?", row.id);
+      if (row.pr !== null) this.forgetPrIfUnwatched(row.pr);
+    }
+  }
+
+  // Subscriptions past `verified_until` end with `watch.unverified`. Those
+  // past `expires_at` are checked with their Account first: reading the
+  // inbox (or being connected to it) since restarts the clock, and only
+  // an inbox nobody has read for the whole TTL ends with `watch.expired`.
+  private async expireDue(now: number, outgoing: Map<number, Delivery[]>): Promise<void> {
+    const due = this.sql
+      .exec<SubRow>("SELECT * FROM subscriptions WHERE expires_at <= ? OR verified_until <= ? ORDER BY rowid", now, now)
+      .toArray();
+    if (!due.length) return;
+    const unverified = due.filter((r) => r.verified_until !== null && r.verified_until <= now);
+    this.endWith(unverified, "watch.unverified", "not_verified", "unverified", now, outgoing);
+
+    const byAccount: Map<number, SubRow[]> = new Map();
+    for (const row of due) {
+      if (unverified.includes(row)) continue;
+      const list = byAccount.get(row.account_id);
+      if (list) list.push(row);
+      else byAccount.set(row.account_id, [row]);
+    }
+    for (const [account, rows] of [...byAccount].slice(0, DELIVER_BATCH)) {
+      let until: Record<string, number>;
+      try {
+        until = await this.subscriptionActivity(account, rows.map((r) => ({
+          id: r.id,
+          inbox: r.inbox,
+          created_at: r.created_at,
+          ttl_ms: (r.ttl_seconds ?? DEFAULT_TTL_SECONDS) * 1000,
+        })));
+      } catch (e) {
+        console.error(`expiry check for account ${account} failed`, e);
+        for (const r of rows) this.sql.exec("UPDATE subscriptions SET expires_at = ? WHERE id = ?", now + EXPIRY_RETRY_MS, r.id);
+        continue;
+      }
+      const expired: SubRow[] = [];
+      for (const r of rows) {
+        const next = until[r.id];
+        if (next !== undefined && next > now) this.sql.exec("UPDATE subscriptions SET expires_at = ? WHERE id = ?", next, r.id);
+        else expired.push(r);
+      }
+      this.endWith(expired, "watch.expired", "unread", "expired", now, outgoing);
+    }
+  }
+
+  // Separate so tests can stand in for the Account.
+  protected async subscriptionActivity(account: number, items: ActivityItem[]): Promise<Record<string, number>> {
+    const stub = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(`acct:${account}`));
+    return stub.subscriptionActivity(items);
   }
 
   stats(): RepoHubStats {
@@ -413,6 +515,7 @@ export class RepoHub extends DurableObject<Env> {
     const now = this.now();
     const outgoing: Map<number, Delivery[]> = new Map();
     this.endThrottleIfDue(now, outgoing);
+    await this.expireDue(now, outgoing);
     const fresh = this.enqueue(outgoing, now);
 
     const pruneAt = Number(this.getMeta("prune_at") ?? 0);
@@ -609,11 +712,12 @@ export class RepoHub extends DurableObject<Env> {
     await stub.deliver(items);
   }
 
-  // The single alarm covers outbox retries, the end of a throttle and
-  // pruning `deliveries`.
+  // The single alarm covers outbox retries, the end of a throttle,
+  // subscriptions' expiry and verification, and pruning `deliveries`.
   private scheduleAlarm(): void {
     const times = [
       this.sql.exec<{ t: number | null }>("SELECT MIN(next_at) AS t FROM outbox").one().t,
+      this.sql.exec<{ t: number | null }>("SELECT MIN(MIN(expires_at, COALESCE(verified_until, expires_at))) AS t FROM subscriptions").one().t,
       this.throttledUntil(),
       Number(this.getMeta("prune_at") ?? 0) || null,
     ].filter((t): t is number => t !== null);
