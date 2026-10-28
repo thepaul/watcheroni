@@ -1004,7 +1004,7 @@ It runs on the deployer's own Cloudflare account, free plan included.
    reads, `watch.unverified` when access lapses or is lost, and
    `github_app_authorization` revoking the user's API keys. Subscribing
    has been checked live on production with a private repo
-   (thepaul/shinycode-website); this last part so far on the test Worker.
+   (thepaul/shinycode-website); all of it is deployed there.
 4. **Derived events** (checks rollup, mergeability), limits, redelivery.
 5. **Publish:** the hosted App, `watcheroni` and `@watcheroni/protocol` on
    npm, the Claude Code plugin, `selfhost`.
