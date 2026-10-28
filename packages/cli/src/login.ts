@@ -2,6 +2,7 @@
 // runs GitHub's device flow itself, hands the user token to the server
 // once for an API key, and keeps the GitHub tokens on this machine.
 
+import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
@@ -32,6 +33,8 @@ export interface LoginDeps {
   sleep: (ms: number) => Promise<void>;
   print: (line: string) => void;
   now: () => number;
+  // Opens the URL in a browser; false if it didn't try.
+  openUrl: (url: string) => boolean;
 }
 
 const defaultDeps: LoginDeps = {
@@ -39,7 +42,28 @@ const defaultDeps: LoginDeps = {
   sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
   print: (line) => process.stderr.write(`${line}\n`),
   now: () => Date.now(),
+  openUrl,
 };
+
+// Only for someone at this machine's own screen: not when output goes to
+// a file or another program, not over SSH, and not when turned off.
+function openUrl(url: string): boolean {
+  if (!process.stderr.isTTY || process.env.SSH_CONNECTION || process.env.SSH_TTY || process.env.WATCHERONI_NO_BROWSER) return false;
+  const [cmd, ...args] =
+    process.platform === "darwin" ? ["open", url]
+    : process.platform === "win32" ? ["cmd", "/c", "start", "", url]
+    : process.env.DISPLAY || process.env.WAYLAND_DISPLAY ? ["xdg-open", url]
+    : [];
+  if (!cmd) return false;
+  try {
+    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    child.on("error", () => {});
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function serverUrl(): string {
   return (serverSetting() || DEFAULT_SERVER).replace(/\/+$/, "");
@@ -156,7 +180,17 @@ async function deviceFlow(webUrl: string, clientId: string, deps: LoginDeps): Pr
 
   const code = await post("/login/device/code", { client_id: clientId });
   if (typeof code.device_code !== "string") throw new LoginFailed(`GitHub didn't start the device flow: ${JSON.stringify(code)}`);
-  deps.print(`Open ${code.verification_uri} and enter the code ${code.user_code}`);
+  const uri = String(code.verification_uri);
+  deps.print(`Your one-time code: ${code.user_code}`);
+  deps.print(deps.openUrl(uri)
+    ? `Opening ${uri} in your browser; enter the code there. (If it doesn't open, go there yourself.)`
+    : `Open ${uri} and enter the code there.`);
+  deps.print("");
+  deps.print(`GitHub will ask whether watcheroni may "act on your behalf". That's its wording for`);
+  deps.print("every app sign-in. watcheroni can only read pull requests, reviews, checks, issues and");
+  deps.print("Actions runs, on repos it's installed on that you can see. It can't change anything,");
+  deps.print("and the server doesn't keep the token.");
+  deps.print("");
 
   let interval = Number(code.interval ?? 5) * 1000;
   const deadline = deps.now() + Number(code.expires_in ?? 900) * 1000;

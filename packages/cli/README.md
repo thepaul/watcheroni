@@ -33,7 +33,9 @@ the current git branch, found through the checkout's GitHub remotes.
 ## Server mode
 
 Sign in, which runs GitHub's device flow and saves an API key in
-`~/.config/watcheroni/credentials.json` (mode 0600):
+`~/.config/watcheroni/credentials.json` (mode 0600). It opens the browser
+at GitHub's code page when you're at this machine's own terminal; over
+SSH, or with `WATCHERONI_NO_BROWSER` set, it just prints the address:
 
 ```
 watcheroni login                      # https://watcheroni.dev

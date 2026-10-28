@@ -13,13 +13,16 @@ beforeEach(() => {
 });
 
 // A fake server and GitHub. `answers` are what the token endpoint says, in turn.
-function fake(answers: Record<string, unknown>[], loginStatus = 200) {
+function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = true) {
   const calls: { url: string; body: unknown; auth: string | null }[] = [];
+  const opened: string[] = [];
+  const printed: string[] = [];
   let clock = 0;
   const deps: LoginDeps = {
     now: () => clock,
     sleep: async (ms) => void (clock += ms),
-    print: () => {},
+    print: (line) => void printed.push(line),
+    openUrl: (url) => (opened.push(url), canOpen),
     fetch: async (input, init) => {
       const url = String(input);
       const body = init?.body ? JSON.parse(String(init.body)) : null;
@@ -41,10 +44,24 @@ function fake(answers: Record<string, unknown>[], loginStatus = 200) {
       throw new Error(`unexpected ${url}`);
     },
   };
-  return { deps, calls };
+  return { deps, calls, opened, printed };
 }
 
 describe("login", () => {
+  it("opens the browser at the device page, or says where to go", async () => {
+    const done = { access_token: "ghu_tok" };
+    const a = fake([done]);
+    await login(SERVER, a.deps);
+    expect(a.opened).toEqual([`${GITHUB}/login/device`]);
+    expect(a.printed.slice(0, 2)).toEqual([
+      "Your one-time code: ABCD-1234",
+      `Opening ${GITHUB}/login/device in your browser; enter the code there. (If it doesn't open, go there yourself.)`,
+    ]);
+    const b = fake([done], 200, false);
+    await login(SERVER, b.deps);
+    expect(b.printed[1]).toBe(`Open ${GITHUB}/login/device and enter the code there.`);
+  });
+
   it("runs the device flow, trades the token for a key, and keeps both locally", async () => {
     const { deps, calls } = fake([
       { error: "authorization_pending" },
