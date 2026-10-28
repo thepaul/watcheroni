@@ -31,6 +31,9 @@ export { Account } from "./account";
 export { RepoHub } from "./repo-hub";
 
 const MAX_WEBHOOK_BYTES = 2 * 1024 * 1024;
+// Where a browser visiting the server's root is sent, until there's a
+// page of its own. 302, not 301, so browsers don't remember it.
+const HOMEPAGE = "https://github.com/thepaul/watcheroni";
 const MAX_LABEL_LENGTH = 100;
 
 type AccountStub = DurableObjectStub<Account>;
@@ -46,6 +49,7 @@ export default {
     const route = `${request.method} ${pathname}`;
 
     if (pathname === "/healthz") return new Response("ok");
+    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return Response.redirect(HOMEPAGE, 302);
     if (route === "GET /v1/meta") return json(meta(env));
     if (route === "POST /github/webhook") return webhook(request, env);
     if (route === "POST /v1/login") return login(request, env);

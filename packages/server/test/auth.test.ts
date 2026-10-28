@@ -125,6 +125,14 @@ describe("login", () => {
 });
 
 describe("meta", () => {
+  it("sends browsers at the root to the project page", async () => {
+    // Not followed: here the follow-up would come back to this Worker.
+    const res = await call("/", { redirect: "manual" });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("Location")).toBe("https://github.com/thepaul/watcheroni");
+    expect((await call("/", { method: "POST" })).status).toBe(401);
+  });
+
   it("publishes the client ID for the device flow", async () => {
     const meta = await (await call("/v1/meta")).json<Meta>();
     expect(meta.github?.client_id).toBe("Iv23test");
