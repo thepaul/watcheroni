@@ -37,6 +37,20 @@ npm test              # Vitest inside workerd, including a forced eviction
 npm run dev           # wrangler dev on http://localhost:8787
 ```
 
+## Deploy
+
+There are two Workers, with separate Durable Objects and secrets:
+
+- **Test:** `watcheroni-proto` on `https://watcheroni-proto.shinycode.workers.dev`,
+  with the `/debug` routes on. `npm run deploy` and plain `wrangler`
+  commands go here.
+- **Production:** `watcheroni` on `https://watcheroni.dev`, the CLI's
+  default server, with no `DEBUG_TOKEN`. `npm run deploy:production`, and
+  `--env production` on `wrangler secret put` and the like.
+
+The GitHub App's webhook can point at only one of them; it points at
+production.
+
 ## Confirm hibernation on Cloudflare
 
 1. Sign in and deploy (the free plan is enough):

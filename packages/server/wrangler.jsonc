@@ -21,9 +21,32 @@
     // The GitHub App's client ID (public). Empty until the App is
     // registered; sign-in answers 503 until then.
     "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt"
-  }
+  },
   // Secrets, not in this file (wrangler secret put, or .dev.vars for
   // wrangler dev): GITHUB_CLIENT_SECRET, GITHUB_WEBHOOK_SECRET, TICKET_KEY,
   // and during rotation TICKET_KEY_OLD. DEBUG_TOKEN turns on the /debug
   // routes; leave it unset in production.
+
+  // The top level is the test server, watcheroni-proto on workers.dev, so
+  // a plain `wrangler deploy` can't touch production. Production is
+  // `--env production`: its own Worker, so its own Durable Objects and
+  // secrets, at https://watcheroni.dev. Bindings and vars aren't inherited
+  // by environments, hence the repetition.
+  "env": {
+    "production": {
+      "name": "watcheroni",
+      "workers_dev": false,
+      "routes": [{ "pattern": "watcheroni.dev", "custom_domain": true }],
+      "durable_objects": {
+        "bindings": [
+          { "name": "ACCOUNT", "class_name": "Account" },
+          { "name": "REPO_HUB", "class_name": "RepoHub" }
+        ]
+      },
+      "vars": {
+        "GITHUB_APP_ID": "5490181",
+        "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt"
+      }
+    }
+  }
 }
