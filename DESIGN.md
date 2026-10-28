@@ -242,11 +242,11 @@ earliest due time, or clears it.
   exceptions lose their fields. `unsubscribe` returns whether the
   subscription existed. Kinds and ignored actors are sorted before
   storing, so idempotence doesn't depend on their order.
-- **Until `/v1` has sign-in**, subscriptions are made through
-  `POST /debug/repos/{repo id}/subscriptions` (and `DELETE .../{sub}`,
-  `GET /debug/repos/{repo id}` for the object's state), behind
-  `PROTO_TOKEN`. RepoHub delivers to `acct:<account>`, the real naming,
-  so these events don't reach the prototype's single `acct:proto` inbox.
+- **Until `/v1` has subscription endpoints**, subscriptions are made
+  through `POST /debug/repos/{repo id}/subscriptions` (and
+  `DELETE .../{sub}`, `GET /debug/repos/{repo id}` for the object's
+  state), behind `DEBUG_TOKEN`. RepoHub delivers to `acct:<account>`, the
+  Account object that the account's API keys read from.
 - **The Worker skips RepoHub** when a delivery normalises to no events
   (labels, edits, `check_run.created` and so on). Those cost no Durable
   Object request and don't count against the repo's ingest limit or get

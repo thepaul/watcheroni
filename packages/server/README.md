@@ -112,7 +112,16 @@ the Worker for 182 s. The object was evicted during the 180-second idle,
 18 keepalive pings didn't wake it, no client socket dropped, and all four
 waiters received the injected event within 90 ms. PASS.
 
-Billing for that run, from `npm run usage` (activeTime in microseconds,
+With real sign-in (2026-10-27, after the RepoHub, sign-in and CLI
+server-mode merges): the same probe, now authenticating with an API key
+minted through `/debug` and WebSocket tickets, passed again, with all
+waiters woken within 97 ms. A signed `pull_request_review` webhook for a
+subscribed PR went through RepoHub to the inbox (`delivered: 1`), and
+`watcheroni wait` in server mode printed it and acknowledged it. GitHub
+accepted the App's device flow (`watcheroni login` got a code); finishing
+sign-in needs a person at github.com/login/device.
+
+Billing for the first run, from `npm run usage` (activeTime in microseconds,
 duration in GB-s):
 
 | Minute (UTC) | activeTime | cpuTime | duration | What happened |

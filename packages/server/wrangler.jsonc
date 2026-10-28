@@ -17,9 +17,10 @@
     { "tag": "v2", "new_sqlite_classes": ["RepoHub"] }
   ],
   "vars": {
+    "GITHUB_APP_ID": "5490181",
     // The GitHub App's client ID (public). Empty until the App is
     // registered; sign-in answers 503 until then.
-    "GITHUB_CLIENT_ID": ""
+    "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt"
   }
   // Secrets, not in this file (wrangler secret put, or .dev.vars for
   // wrangler dev): GITHUB_CLIENT_SECRET, GITHUB_WEBHOOK_SECRET, TICKET_KEY,
