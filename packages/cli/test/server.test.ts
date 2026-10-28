@@ -1,11 +1,12 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Feed } from "../src/feed.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
-import { ServerClient, ServerReader } from "../src/server.ts";
+import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
+import { ServerClient, ServerReader, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -182,6 +183,111 @@ describe("feed", () => {
     const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
     expect(feed.wanted(["check.*"]).map((i) => i.event.seq)).toEqual([2]);
     await until(() => fake.inbox("feed3").acked === 1);
+    inbox.close();
+  });
+});
+
+describe("subscribing on the server", () => {
+  const pub = { owner: "octo", name: "widgets", number: 7 };
+  const priv = { owner: "octo", name: "secret", number: 3 };
+  const client = () => new ServerClient({ url: fake.url, apiKey: fake.token });
+  const log = (m: string) => void messages.push(m);
+
+  // Credentials as `watcheroni login` leaves them, for this fake server.
+  function signIn(github: Partial<ServerCredentials["github"]>): string {
+    const path = join(mkdtempSync(join(tmpdir(), "watcheroni-cred-")), "credentials.json");
+    process.env.WATCHERONI_CREDENTIALS = path;
+    const entry: ServerCredentials = {
+      api_key: fake.token,
+      key_id: "key_1",
+      account: { id: 7, login: "octocat" },
+      github: { access_token: "ghu_old", refresh_token: "ghr_old", expires_at: null, refresh_token_expires_at: null, ...github },
+    };
+    writeFileSync(path, JSON.stringify({ servers: { [fake.url]: entry } }));
+    return path;
+  }
+  afterEach(() => {
+    delete process.env.WATCHERONI_CREDENTIALS;
+  });
+
+  it("subscribes a public repo's PR without sending a GitHub token", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    signIn({});
+    expect(await subscribe(client(), "box", pub, { log, githubToken: () => githubTokenFor(fake.url) })).toBe("sub_1");
+    expect(fake.subscriptions).toEqual([{ id: "sub_1", inbox: "box", repo: "octo/widgets", pr: 7, githubToken: null }]);
+    expect(messages).toEqual([]);
+  });
+
+  it("sends the saved GitHub token only when the repo turns out to be private", async () => {
+    fake.repos.set("octo/secret", { private: true });
+    fake.githubTokens.add("ghu_old");
+    signIn({ expires_at: new Date(Date.now() + 3600_000).toISOString() });
+    expect(await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) })).toBe("sub_1");
+    expect(fake.subscriptions.map((s) => s.githubToken)).toEqual(["ghu_old"]);
+    expect(fake.requests.filter((r) => r.includes("/subscriptions"))).toHaveLength(2);
+    expect(fake.refreshed).toEqual([]);
+  });
+
+  it("refreshes an expired GitHub token through the server first, and saves it", async () => {
+    fake.repos.set("octo/secret", { private: true });
+    fake.githubTokens.add("ghu_new");
+    fake.refreshAnswer = { access_token: "ghu_new", expires_in: 28800, refresh_token: "ghr_new", refresh_token_expires_in: 15897600 };
+    const path = signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    expect(await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) })).toBe("sub_1");
+    expect(fake.refreshed).toEqual(["ghr_old"]);
+    expect(fake.subscriptions.map((s) => s.githubToken)).toEqual(["ghu_new"]);
+    const saved = (JSON.parse(readFileSync(path, "utf8")) as Credentials).servers[fake.url].github;
+    expect(saved.access_token).toBe("ghu_new");
+    expect(saved.refresh_token).toBe("ghr_new");
+    expect(Date.parse(saved.expires_at!)).toBeGreaterThan(Date.now() + 7 * 3600_000);
+  });
+
+  it("falls back to polling when the token can't be refreshed or isn't accepted", async () => {
+    fake.repos.set("octo/secret", { private: true });
+    signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    expect(await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) })).toBeNull();
+    expect(messages.at(-1)).toMatch(/there's no GitHub token .* run `watcheroni login`/);
+
+    signIn({});
+    expect(await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) })).toBeNull();
+    expect(messages.at(-1)).toMatch(/didn't accept this machine's GitHub token/);
+    expect(fake.subscriptions).toEqual([]);
+  });
+
+  it("falls back to polling when the App isn't installed, saying where to install it", async () => {
+    expect(await subscribe(client(), "box", pub, { log })).toBeNull();
+    expect(messages).toEqual(["the watcheroni App isn't installed on octo/widgets; it can be installed from https://github.com/apps/watcheroni/installations/new"]);
+  });
+
+  it("falls back to polling when the server is down", async () => {
+    await fake.stop();
+    expect(await subscribe(client(), "box", pub, { log })).toBeNull();
+    expect(messages[0]).toMatch(/^couldn't subscribe to octo\/widgets#7/);
+  });
+
+  it("stops watching a PR when the server ends its subscription, or polls it when revoked", async () => {
+    const inbox = Inbox.open("ending");
+    inbox.watch(targetKey(pub), pub, "sub_a");
+    inbox.watch(targetKey(priv), priv, "sub_b");
+    const r = reader("ending");
+    await r.start();
+    const polled: string[] = [];
+    const feed = new Feed(inbox, r, {
+      interval: 60_000,
+      log: () => {},
+      fetch: async (t) => (polled.push(targetKey(t)), snap()),
+    });
+    fake.inject("ending", "watch.revoked", { reason: "uninstalled" }, "e1", "sub_b");
+    await until(() => r.pending().length === 1);
+    feed.wanted([]);
+    expect(inbox.watched().map((w) => [targetKey(w.target), w.sub ?? null])).toEqual([["octo/widgets#7", "sub_a"], ["octo/secret#3", null]]);
+    await feed.poll();
+    expect(polled).toEqual(["octo/secret#3"]);
+
+    fake.inject("ending", "watch.ended", { reason: "merged" }, "e2", "sub_a");
+    await until(() => r.pending().length === 2);
+    feed.wanted([]);
+    expect(inbox.watched().map((w) => targetKey(w.target))).toEqual(["octo/secret#3"]);
     inbox.close();
   });
 });

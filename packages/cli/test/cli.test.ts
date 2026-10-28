@@ -95,6 +95,29 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(2);
   });
 
+  it("subscribes its targets on the server, and stops watching when the server ends the watch", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    // The server's first subscription will be sub_1.
+    fake.inject("box", "pr.merged", {}, "e1", "sub_1");
+    fake.inject("box", "watch.ended", { reason: "merged" }, "e2", "sub_1");
+    const run = cli(["wait", "octo/widgets#7", "--settle", "0", "--format", "json"]);
+    // 3: everything watched has ended.
+    expect(await run.code, run.stderr()).toBe(3);
+    expect(fake.subscriptions).toEqual([{ id: "sub_1", inbox: "box", repo: "octo/widgets", pr: 7, githubToken: null }]);
+    expect(run.stderr()).toBe("watcheroni: watching octo/widgets#7 in inbox box\n");
+    const out = JSON.parse(run.stdout()) as { events: { kind: string }[]; watching: string[] };
+    expect(out.events.map((e) => e.kind)).toEqual(["pr.merged", "watch.ended"]);
+    expect(out.watching).toEqual([]);
+  });
+
+  it("polls a target from this machine when the App isn't installed on its repo", async () => {
+    const run = cli(["wait", "octo/widgets#7"], { GH_TOKEN: "x" });
+    await until(() => run.stderr().includes("polling GitHub"));
+    run.kill();
+    await run.code;
+    expect(run.stderr()).toMatch(/the watcheroni App isn't installed on octo\/widgets; it can be installed from https:\/\/github.com\/apps\/watcheroni\/installations\/new\nwatcheroni: watching octo\/widgets#7 in inbox box, polling GitHub from this machine/);
+  });
+
   it("times out with exit code 2", async () => {
     const run = cli(["wait", "--timeout", "1s"]);
     expect(await run.code).toBe(2);

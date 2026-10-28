@@ -1,21 +1,37 @@
 // Prototype Worker: Account Durable Objects with hibernated WebSockets and
 // the long-poll bridge described in DESIGN.md, behind real sign-in (login
 // with a GitHub user token, API keys, WebSocket tickets), and RepoHub.
-// GitHub webhooks are verified, normalised and sent to RepoHub;
-// subscriptions are made through /debug until /v1 has them.
+// GitHub webhooks are verified, normalised and sent to RepoHub, or to
+// Installation for installation events; /v1 subscriptions check access
+// with GitHub and subscribe RepoHub.
 
 import type { Account, AuthResult, Delivery, RateState } from "./account";
 import { bearer, newApiKey, newKeyId, newTicketPayload, parseApiKey, secretsEqual, signTicket, verifyTicket } from "./auth";
 import type { NewSubscription, PrBaseline } from "./repo-hub";
 import { GITHUB_API_URL, GITHUB_WEB_URL, checkUserToken, refreshUserToken } from "./github";
+import type { InstallationFact } from "./installation";
+import {
+  INSTALL_URL,
+  APP_SLUG,
+  createSubscription,
+  deleteSubscription,
+  getSubscription,
+  installationStub,
+  listSubscriptions,
+  repoHubStub,
+} from "./subscriptions";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
 import {
   INBOX_NAME,
   MAX_LIMIT,
+  MAX_TTL_SECONDS,
   MAX_WAIT_SECONDS,
+  PRIVATE_VERIFY_SECONDS,
   json,
   problem,
+  readJson,
+  withRetryAfter,
   type EventsPage,
   type DataValue,
   type LoginRequest,
@@ -29,6 +45,7 @@ import {
 
 export { Account } from "./account";
 export { RepoHub } from "./repo-hub";
+export { Installation } from "./installation";
 
 const MAX_WEBHOOK_BYTES = 2 * 1024 * 1024;
 // Where a browser visiting the server's root is sent, until there's a
@@ -56,14 +73,15 @@ export default {
     if (route === "POST /v1/github/refresh") return refresh(request, env);
     if (pathname.startsWith("/debug/")) return debug(request, url, env);
 
-    const inboxMatch = pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?$/);
+    const inboxMatch = pathname.match(/^\/v1\/inboxes\/([^/]+)(?:(\/[a-z]+)(?:\/([^/]+))?)?$/);
     const inbox = inboxMatch ? decodeURIComponent(inboxMatch[1]) : null;
+    const itemId = inboxMatch?.[3] ? decodeURIComponent(inboxMatch[3]) : null;
     if (inbox !== null && !INBOX_NAME.test(inbox)) return problem(400, "invalid_request", "Bad inbox name");
 
     // A ticket stands in for the key on a WebSocket handshake, since
     // browsers can't set headers on one.
     const ticket = url.searchParams.get("ticket");
-    if (inbox !== null && inboxMatch![2] === "/ws" && ticket !== null && request.method === "GET") {
+    if (inbox !== null && inboxMatch![2] === "/ws" && itemId === null && ticket !== null && request.method === "GET") {
       return connectWithTicket(request, env, inbox, ticket);
     }
 
@@ -73,7 +91,8 @@ export default {
     const auth = await account.authenticate(parsed.hash);
     if (!auth.ok) return authFailure(auth);
     const caller: Caller = { account, accountId: parsed.accountId, keyId: auth.keyId };
-    const res = await api(request, url, env, caller, inbox, inboxMatch?.[2] ?? "");
+    const rest = (inboxMatch?.[2] ?? "") + (itemId === null ? "" : "/{id}");
+    const res = await api(request, url, env, caller, inbox, rest, itemId);
     return withRateHeaders(res, auth.rate);
   },
 } satisfies ExportedHandler<Env>;
@@ -92,6 +111,7 @@ async function api(
   { account, accountId, keyId }: Caller,
   inbox: string | null,
   rest: string,
+  itemId: string | null,
 ): Promise<Response> {
   const { pathname } = url;
   if (pathname === "/v1/keys" && request.method === "GET") {
@@ -108,6 +128,15 @@ async function api(
   switch (`${request.method} /v1/inboxes/{name}${rest}`) {
     case "PUT /v1/inboxes/{name}":
       return json(await account.ensureInbox(name));
+
+    case "POST /v1/inboxes/{name}/subscriptions":
+      return createSubscription(request, env, account, accountId, name);
+    case "GET /v1/inboxes/{name}/subscriptions":
+      return listSubscriptions(account, name);
+    case "GET /v1/inboxes/{name}/subscriptions/{id}":
+      return getSubscription(account, name, itemId!);
+    case "DELETE /v1/inboxes/{name}/subscriptions/{id}":
+      return deleteSubscription(env, account, name, itemId!);
 
     case "GET /v1/inboxes/{name}/events":
       return longPoll(account, name, url, request.signal);
@@ -141,9 +170,17 @@ function meta(env: Env): Meta {
     server: "watcheroni/0.0.0-proto",
     features: ["ws", "longpoll"],
     ...(env.GITHUB_CLIENT_ID
-      ? { github: { client_id: env.GITHUB_CLIENT_ID, web_url: GITHUB_WEB_URL, api_url: GITHUB_API_URL } }
+      ? {
+          github: {
+            client_id: env.GITHUB_CLIENT_ID,
+            web_url: GITHUB_WEB_URL,
+            api_url: GITHUB_API_URL,
+            app_slug: APP_SLUG,
+            install_url: INSTALL_URL,
+          },
+        }
       : {}),
-    limits: { max_wait_seconds: MAX_WAIT_SECONDS },
+    limits: { max_wait_seconds: MAX_WAIT_SECONDS, max_ttl_seconds: MAX_TTL_SECONDS, private_verify_seconds: PRIVATE_VERIFY_SECONDS },
   };
 }
 
@@ -216,9 +253,10 @@ function connect(
 }
 
 // /debug: development routes behind DEBUG_TOKEN, and off when it isn't set.
-// They stand in for login (minting a key without GitHub), for the /v1
-// subscription endpoints, and for RepoHub (injecting events), and show what
-// Account and RepoHub objects are doing.
+// They stand in for login (minting a key without GitHub), for /v1
+// subscriptions without the GitHub checks, and for RepoHub (injecting
+// events), and show what Account, RepoHub and Installation objects are
+// doing.
 async function debug(request: Request, url: URL, env: Env): Promise<Response> {
   const given = bearer(request);
   if (!env.DEBUG_TOKEN || !given || !(await secretsEqual(given, env.DEBUG_TOKEN))) {
@@ -226,6 +264,8 @@ async function debug(request: Request, url: URL, env: Env): Promise<Response> {
   }
   const repoRoute = url.pathname.match(/^\/debug\/repos\/(\d+)(?:\/subscriptions(?:\/([^/]+))?)?$/);
   if (repoRoute) return debugRepo(request, env, Number(repoRoute[1]), repoRoute[0].includes("/subscriptions"), repoRoute[2]);
+  const instRoute = url.pathname.match(/^\/debug\/installations\/(\d+)$/);
+  if (instRoute && request.method === "GET") return json(await installationStub(env, Number(instRoute[1])).stats());
 
   const m = url.pathname.match(/^\/debug\/accounts\/(\d{1,15})(\/.*)$/);
   if (!m) return problem(404, "not_found", "No such endpoint");
@@ -291,11 +331,6 @@ function withRateHeaders(res: Response, rate: RateState): Response {
   return res;
 }
 
-function withRetryAfter(res: Response, seconds: number): Response {
-  res.headers.set("Retry-After", String(seconds));
-  return res;
-}
-
 function isUpgrade(request: Request): boolean {
   return request.headers.get("Upgrade")?.toLowerCase() === "websocket";
 }
@@ -323,19 +358,44 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   } catch {
     return problem(400, "invalid_request", "Body is not JSON");
   }
+  if (event === "installation" || event === "installation_repositories") {
+    const fact = installationFact(payload);
+    const installation = fact ? await installationStub(env, fact.id).onEvent(fact, delivery) : null;
+    return json({ events: [], installation }, 202);
+  }
   const events = normalise(event, delivery, payload, new Date().toISOString());
   // Deliveries that normalise to nothing never reach a Durable Object.
   const repoId = events[0]?.repo?.id;
-  const ingest = repoId ? await env.REPO_HUB.get(env.REPO_HUB.idFromName(`repo:${repoId}`)).ingest(delivery, events) : null;
+  const ingest = repoId ? await repoHubStub(env, repoId).ingest(delivery, events) : null;
   return json({ events, ingest }, 202);
 }
 
-// Stands in for the /v1 subscription endpoints until they exist:
+// The parts of an `installation` or `installation_repositories` payload
+// that Installation needs.
+function installationFact(payload: {
+  action?: string;
+  installation?: { id?: number; account?: { login?: string; type?: string }; repository_selection?: string };
+  repositories_removed?: { id?: number }[];
+}): InstallationFact | null {
+  const id = payload.installation?.id;
+  if (typeof id !== "number" || typeof payload.action !== "string") return null;
+  const account = payload.installation?.account;
+  return {
+    id,
+    action: payload.action,
+    account: account?.login ? { login: account.login, type: account.type ?? "" } : null,
+    repository_selection: payload.installation?.repository_selection ?? null,
+    repos_removed: (payload.repositories_removed ?? []).flatMap((r) => (typeof r.id === "number" ? [r.id] : [])),
+  };
+}
+
+// Subscriptions straight into RepoHub, with no GitHub checks, for tests
+// and for poking at a RepoHub:
 //   GET    /debug/repos/{id}                     RepoHub's state
 //   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, ignore?, full_name?, baseline?}
 //   DELETE /debug/repos/{id}/subscriptions/{sub}
 async function debugRepo(request: Request, env: Env, repoId: number, subs: boolean, subId?: string): Promise<Response> {
-  const hub = env.REPO_HUB.get(env.REPO_HUB.idFromName(`repo:${repoId}`));
+  const hub = repoHubStub(env, repoId);
   if (!subs && request.method === "GET") return json(await hub.stats());
   if (subs && !subId && request.method === "POST") {
     const body = await readJson<NewSubscription & { full_name?: string; private?: boolean; baseline?: PrBaseline }>(request);
@@ -422,14 +482,6 @@ function firstEvents(ws: WebSocket, timeoutMs: number, signal: AbortSignal): Pro
     ws.addEventListener("close", () => done([]));
     ws.addEventListener("error", () => done([]));
   });
-}
-
-async function readJson<T>(request: Request): Promise<T | null> {
-  try {
-    return (await request.json()) as T;
-  } catch {
-    return null;
-  }
 }
 
 function intParam(url: URL, key: string): number | null {

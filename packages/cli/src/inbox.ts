@@ -20,6 +20,8 @@ export interface Watched {
   // The server subscription watching it, if the server does; otherwise
   // this machine polls GitHub for it.
   sub?: string;
+  // When the server last declined to watch it.
+  subTriedAt?: string;
 }
 
 interface State {
@@ -95,6 +97,32 @@ export class Inbox {
     delete this.state.watched[key];
     this.save();
     return true;
+  }
+
+  // Records the server's subscription, or that it declined (null).
+  setSubscription(key: string, sub: string | null): void {
+    const w = this.state.watched[key];
+    if (!w) return;
+    if (sub) {
+      w.sub = sub;
+      delete w.subTriedAt;
+    } else {
+      w.subTriedAt = new Date().toISOString();
+    }
+    this.save();
+  }
+
+  // The server ended a subscription with a `watch.*` event. A PR that
+  // merged, closed or expired is no longer watched; one whose watch was
+  // revoked (the App uninstalled, say) or not re-verified is polled from
+  // here instead.
+  subscriptionEnded(sub: string, kind: string): void {
+    const entry = Object.entries(this.state.watched).find(([, w]) => w.sub === sub);
+    if (!entry) return;
+    const [key, w] = entry;
+    if (kind === "watch.revoked" || kind === "watch.unverified") delete w.sub;
+    else delete this.state.watched[key];
+    this.save();
   }
 
   update(key: string, snapshot: Snapshot, memory: Memory): void {

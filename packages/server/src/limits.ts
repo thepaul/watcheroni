@@ -24,11 +24,11 @@ export function level(sql: SqlStorage, name: string, spec: BucketSpec, now: numb
   return Math.min(spec.capacity, row.tokens + elapsed * spec.perSecond);
 }
 
-// Takes one token if there is one. Returns whether it did.
-export function take(sql: SqlStorage, name: string, spec: BucketSpec, now: number): boolean {
+// Takes `n` tokens if there are that many. Returns whether it did.
+export function take(sql: SqlStorage, name: string, spec: BucketSpec, now: number, n = 1): boolean {
   let tokens = level(sql, name, spec, now);
-  const ok = tokens >= 1;
-  if (ok) tokens -= 1;
+  const ok = tokens >= n;
+  if (ok) tokens -= n;
   sql.exec(
     "INSERT INTO buckets (name, tokens, updated_at) VALUES (?, ?, ?) ON CONFLICT (name) DO UPDATE SET tokens = excluded.tokens, updated_at = excluded.updated_at",
     name, tokens, now,

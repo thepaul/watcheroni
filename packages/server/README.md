@@ -17,22 +17,29 @@ What's here, compared with the full design:
   long-polling through the Worker bridge, the WebSocket protocol (`hello`,
   `ready`, `events`, `ack`, `ping`/`pong` answered by the runtime), and
   the `watcheroni.v1` subprotocol. `POST /github/webhook` checks GitHub's
-  signature and normalises the payload into events, but routes them
-  nowhere yet (the response lists them).
+  signature, normalises the payload into events and hands them to
+  RepoHub; `installation` and `installation_repositories` go to
+  Installation instead. `POST / GET / DELETE /v1/inboxes/{name}/subscriptions`
+  check the App's installation (and, for private repos, the user's own
+  token), take a PR baseline with the installation token and subscribe
+  RepoHub. The Installation object signs App JWTs and caches installation
+  tokens encrypted with `STORAGE_KEY`.
 - **Stand-ins:** with `DEBUG_TOKEN` set, `/debug/accounts/{id}/...` mints
-  keys without GitHub, injects events instead of webhooks and RepoHub,
-  and shows what an object is doing (see "Worker routes" in DESIGN.md).
-- **Not yet:** RepoHub, Installation, Control, the per-IP limit on
+  keys without GitHub and injects events instead of webhooks and RepoHub,
+  `/debug/repos/{id}/subscriptions` subscribes without the GitHub checks,
+  and `/debug/{accounts,repos,installations}/{id}` show what an object is
+  doing (see "Worker routes" in DESIGN.md).
+- **Not yet:** Control, derived events, re-verifying private
+  subscriptions (`/verify`), expiring subscriptions, the per-IP limit on
   `/v1/login` and `/v1/github/refresh`, revoking keys on the
   `github_app_authorization` webhook (`Account.revokeAllKeys` is ready for
-  it), `inbox.gap`. No GitHub App is registered yet, so `GITHUB_CLIENT_ID`
-  is empty and login answers 503; the tests stub GitHub.
+  it), `inbox.gap`. The tests stub GitHub.
 
 ## Develop
 
 ```
 npm install           # from the repository root
-cp .dev.vars.example .dev.vars   # and set TICKET_KEY and DEBUG_TOKEN
+cp .dev.vars.example .dev.vars   # and set the secrets it lists
 npm test              # Vitest inside workerd, including a forced eviction
 npm run dev           # wrangler dev on http://localhost:8787
 ```
@@ -50,6 +57,14 @@ There are two Workers, with separate Durable Objects and secrets:
 
 The GitHub App's webhook can point at only one of them; it points at
 production.
+
+Both need `STORAGE_KEY` (32 random bytes, base64) for the cached
+installation tokens; without it they're cached in memory only:
+
+```
+openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put STORAGE_KEY
+openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put STORAGE_KEY --env production
+```
 
 ## Confirm hibernation on Cloudflare
 

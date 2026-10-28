@@ -229,24 +229,31 @@ earliest due time, or clears it.
 (migration tag `v2`). Where it differs from the above:
 
 - **Not built yet:** the `checks`, `rollups` and `jobs` tables, so no
-  `checks.completed` or `merge.*`; `touch`, `verify` and `revokeAll`;
-  expiring subscriptions (`expires_at` is stored but not enforced); the
-  `base` and `author` filters for repository-wide subscriptions; the
-  subscribe-time GitHub checks (installation, private access), which
-  belong to the Worker once sign-in exists. The alarm covers only outbox
-  retries, the end of a throttle and pruning `deliveries`.
-- **`subscribe`** takes `{account, inbox, pr, kinds, ignore, ttl_seconds}`,
-  the repo, and an optional baseline (`{state, head_sha, base_ref,
-  draft}`). It returns `{ok: true, created, subscription}` or
+  `checks.completed` or `merge.*`; `touch` and `verify`; expiring
+  subscriptions and private ones that weren't re-verified (`expires_at`
+  and `verified_until` are stored but not enforced); the `base` and
+  `author` filters for repository-wide subscriptions (`/v1` answers 400
+  to them). The alarm covers only outbox retries, the end of a throttle
+  and pruning `deliveries`.
+- **`subscribe`** takes `{account, inbox, pr, kinds, ignore, ttl_seconds,
+  verified_until}`, the repo, and an optional baseline (`{state, head_sha,
+  base_ref, draft, mergeable}`); subscribing again with a later
+  `verified_until` moves it on. It returns `{ok: true, created, subscription}` or
   `{ok: false, status, code, detail}` rather than throwing, since RPC
   exceptions lose their fields. `unsubscribe` returns whether the
   subscription existed. Kinds and ignored actors are sorted before
   storing, so idempotence doesn't depend on their order.
-- **Until `/v1` has subscription endpoints**, subscriptions are made
-  through `POST /debug/repos/{repo id}/subscriptions` (and
-  `DELETE .../{sub}`, `GET /debug/repos/{repo id}` for the object's
-  state), behind `DEBUG_TOKEN`. RepoHub delivers to `acct:<account>`, the
-  Account object that the account's API keys read from.
+- **Subscriptions** come from `/v1` (see "As built" under
+  "Installation"), or straight from
+  `POST /debug/repos/{repo id}/subscriptions` (and `DELETE .../{sub}`,
+  `GET /debug/repos/{repo id}` for the object's state) behind
+  `DEBUG_TOKEN`, with no GitHub checks and no Account index row. RepoHub
+  delivers to `acct:<account>`, the Account object that the account's API
+  keys read from.
+- **`revokeAll(reason, eventBase)`** sends each subscription a
+  `watch.revoked` (ID `<eventBase>.revoked.<sub>`, the webhook's delivery
+  ID as the base, `data.reason` `uninstalled`, `suspended` or `removed`)
+  through the outbox, and deletes all subscriptions and `prs` rows.
 - **The Worker skips RepoHub** when a delivery normalises to no events
   (labels, edits, `check_run.created` and so on). Those cost no Durable
   Object request and don't count against the repo's ingest limit or get
@@ -400,6 +407,44 @@ payload doesn't list the repos (an "all repositories" installation being
 deleted), each RepoHub finds out at its next daily check, when minting a
 token fails.
 
+#### As built in the prototype
+
+`packages/server/src/installation.ts` (migration tag `v3`), with App JWTs
+and token minting in `src/app.ts` and the `/v1` subscription endpoints in
+`src/subscriptions.ts`. Where it differs from the above:
+
+- **`token(installationId, calls)`** takes `calls` from the API budget
+  first and returns `{ok: true, token}` or `{ok: false, reason}`
+  (`not_installed`, `rate_limited` with `retry_after`, `unavailable`),
+  since RPC exceptions lose their fields. The object can't read its own
+  name, so callers pass the ID. A 404 or 403 when minting marks the
+  installation deleted or suspended, ahead of its webhook. Without a
+  usable `STORAGE_KEY` the token is kept in memory only.
+- **Which repos to revoke.** GitHub's `deleted` and `suspend` payloads
+  don't always list the repos, so the object keeps its own `repos` table:
+  each repo that gets a `/v1` subscription through it (`addRepo`). On
+  `deleted` or `suspend` every one of them is revoked; on `removed`, those
+  in `repositories_removed`. Revocations wait in a `revocations` table and
+  go out 20 RepoHubs per invocation, the rest from the alarm, with retries
+  (5 s doubling to 10 minutes, 12 attempts). `created`, `unsuspend` and
+  `new_permissions_accepted` clear the deleted or suspended mark. No
+  daily check yet.
+- **Subscribing** (`POST /v1/inboxes/{name}/subscriptions`) runs in the
+  Worker: `GET /repos/{owner}/{repo}/installation` with an App JWT (404 is
+  `409 app_not_installed`, for missing repos too); an installation token,
+  spending 2 calls; `GET /repos/{owner}/{repo}` with it for the ID and
+  visibility; for a private repo the user-token checks under "Checking a
+  user's access", with `verified_until` 7 days on; the PR with the
+  installation token as the baseline (404 is `not_found`); the account's
+  quota (`Account.checkSubscription`: the inbox must exist, at most 200
+  subscriptions); `RepoHub.subscribe`; then `Account.saveSubscription`
+  and `Installation.addRepo`. Account keeps the index that `GET` and
+  `DELETE` read, and drops a row when a `watch.*` event for it is
+  delivered, so it follows RepoHub ending watches.
+- The install URL comes from `APP_SLUG` in `src/subscriptions.ts`, not a
+  `GITHUB_APP_SLUG` var. `GET /debug/installations/{id}` shows the
+  object's state.
+
 ### Control
 
 Holds the redelivery cursor for the cron job, a deny list of repos and
@@ -448,6 +493,8 @@ set and sent as `Authorization: Bearer`:
 | `POST /debug/accounts/{id}/keys` | Mint an API key without GitHub (account `0` is never a real user) |
 | `GET /debug/accounts/{id}/stats` | What the `Account` object is doing (wakes, sockets, inboxes) |
 | `POST /debug/accounts/{id}/inboxes/{name}/events` | Inject synthetic events, standing in for RepoHub |
+| `POST /debug/repos/{id}/subscriptions`, `DELETE .../{sub}` | Subscribe RepoHub directly, without the GitHub checks |
+| `GET /debug/repos/{id}`, `GET /debug/installations/{id}` | What a `RepoHub` or `Installation` object holds |
 
 ### Webhook handling in the Worker
 
@@ -927,8 +974,19 @@ It runs on the deployer's own Cloudflare account, free plan included.
    subscriptions, device-flow login, API keys. Develop with `wrangler dev`
    and `gh webhook forward` or smee relaying a test App's deliveries.
    *RepoHub built:* ingest, PR, head-SHA and repo-wide matching, the
-   outbox, the end of a watch and the ingest limit, with subscriptions made
-   through `/debug` (see "As built in the prototype" under "RepoHub").
+   outbox, the end of a watch and the ingest limit (see "As built in the
+   prototype" under "RepoHub").
+   *`/v1` subscriptions built on 2026-10-28:* the Installation object (App
+   JWTs, encrypted installation tokens, the API budget, `watch.revoked`
+   on uninstall, suspend or removed repos), `POST / GET / DELETE
+   /v1/inboxes/{name}/subscriptions` with the installation and
+   private-access checks and a PR baseline, and the CLI subscribing its
+   targets (sending the saved GitHub token only for private repos,
+   refreshing it when expired) and polling locally whatever the server
+   won't watch. Deployed to the test Worker and checked there; no repo has
+   the App installed yet, so a live subscription has only been seen to
+   answer `app_not_installed`. Still to do for this step: `/verify` and
+   enforcing `verified_until` and `expires_at`.
 4. **Derived events** (checks rollup, mergeability), limits, redelivery.
 5. **Publish:** the hosted App, `watcheroni` and `@watcheroni/protocol` on
    npm, the Claude Code plugin, `selfhost`.
