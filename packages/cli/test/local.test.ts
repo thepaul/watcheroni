@@ -133,6 +133,7 @@ describe("text output", () => {
       "- workflow.completed: \"CI\" failure",
       "  gh run view 500 -R octo/widgets --log-failed",
       "- checks.completed on 1111111: failure; failed: lint",
+      "  gh pr checks 7 -R octo/widgets",
       "",
       "octo/widgets#7 is still open. Run `watcheroni wait` again to keep watching.",
     ].join("\n"));

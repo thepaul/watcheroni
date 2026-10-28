@@ -85,7 +85,7 @@ function describe(e: WatchEvent): [string, string | null] {
     }
     case "checks.completed": {
       const failed = Array.isArray(d.failed) && d.failed.length ? `; failed: ${d.failed.join(", ")}` : "";
-      return [`checks.completed on ${short(d.head_sha)}: ${d.result}${failed}`, null];
+      return [`checks.completed on ${short(d.head_sha)}: ${d.result}${failed}`, failed ? `gh pr checks ${e.pr} -R ${e.repo?.full_name}` : null];
     }
     case "workflow.completed":
       return [`workflow.completed: "${d.workflow}" ${d.conclusion}`, d.conclusion === "success" ? null : `gh run view ${d.run_id} -R ${e.repo?.full_name} --log-failed`];
