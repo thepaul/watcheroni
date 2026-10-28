@@ -118,6 +118,18 @@ describe("wait against a server", () => {
     expect(run.stderr()).toMatch(/the watcheroni App isn't installed on octo\/widgets; it can be installed from https:\/\/github.com\/apps\/watcheroni\/installations\/new\nwatcheroni: watching octo\/widgets#7 in inbox box, polling GitHub from this machine/);
   });
 
+  it("offers a PR named again to the server at once, e.g. after the App is installed", async () => {
+    const first = cli(["wait", "octo/widgets#7"], { GH_TOKEN: "x" });
+    await until(() => first.stderr().includes("polling GitHub"));
+    first.kill();
+    await first.code;
+    expect(fake.subscriptions).toEqual([]);
+    fake.repos.set("octo/widgets", { private: false });
+    const second = cli(["wait", "octo/widgets#7", "--timeout", "1s"], { GH_TOKEN: "x" });
+    expect(await second.code, second.stderr()).toBe(2);
+    expect(fake.subscriptions.map((s) => s.repo)).toEqual(["octo/widgets"]);
+  });
+
   it("times out with exit code 2", async () => {
     const run = cli(["wait", "--timeout", "1s"]);
     expect(await run.code).toBe(2);

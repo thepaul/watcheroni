@@ -1,6 +1,6 @@
 import type { WatchEvent } from "@watcheroni/protocol";
 import { diff, initialMemory } from "./diff.ts";
-import { LoginNeeded } from "./github.ts";
+import { GitHubError, LoginNeeded } from "./github.ts";
 import type { Inbox } from "./inbox.ts";
 import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
 
@@ -20,6 +20,13 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       next = await fetch(w.target);
     } catch (e) {
       if (e instanceof LoginNeeded) throw e;
+      // Not a hiccup: the PR doesn't exist, or this machine's GitHub login
+      // can't see it. Asking again won't change that.
+      if (e instanceof GitHubError && e.status === 404) {
+        log(`${key}: no such pull request, or your GitHub login can't see it; no longer watching it`);
+        inbox.unwatch(key);
+        continue;
+      }
       log(`${key}: ${(e as Error).message}; trying again next time`);
       continue;
     }

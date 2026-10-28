@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { UnsequencedEvent } from "@watcheroni/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
 import { formatText } from "../src/format.ts";
+import { GitHubError } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
@@ -90,6 +91,17 @@ describe("polling", () => {
     inbox.watch(targetKey(target), target);
     const events = await pollOnce(inbox, () => {}, async () => snap({ state: "CLOSED" }));
     expect(events.map((e) => [e.kind, e.data.reason])).toEqual([["watch.ended", "closed"]]);
+    expect(inbox.watched()).toEqual([]);
+    inbox.close();
+  });
+
+  it("stops watching a PR that doesn't exist", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const messages: string[] = [];
+    const missing = async () => { throw new GitHubError("Could not resolve to a PullRequest with the number of 7.", 404); };
+    expect(await pollOnce(inbox, (m) => messages.push(m), missing)).toEqual([]);
+    expect(messages).toEqual(["octo/widgets#7: no such pull request, or your GitHub login can't see it; no longer watching it"]);
     expect(inbox.watched()).toEqual([]);
     inbox.close();
   });

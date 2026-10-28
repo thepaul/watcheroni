@@ -144,10 +144,12 @@ async function main(argv: string[]): Promise<number> {
   for (const t of targets) {
     const key = targetKey(t);
     const known = inbox.watched().find((w) => targetKey(w.target) === key);
-    // A PR polled from here so far is offered to the server again, at
-    // most hourly, in case the App has been installed since.
+    // A PR polled from here so far is offered to the server again, in
+    // case the App has been installed since: every time it's named on the
+    // command line, and at most hourly when it's the current branch's.
     const tried = known?.subTriedAt ? Date.parse(known.subTriedAt) : 0;
-    if (known && (known.sub || !reachable || Date.now() - tried < RESUBSCRIBE_MS)) continue;
+    const throttled = !args.length && Date.now() - tried < RESUBSCRIBE_MS;
+    if (known && (known.sub || !reachable || throttled)) continue;
     const sub = client && reachable ? await subscribe(client, inboxName, t, { log, githubToken: () => githubTokenFor(client.url) }) : null;
     if (known) {
       inbox.setSubscription(key, sub);
