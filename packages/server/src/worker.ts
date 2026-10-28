@@ -21,6 +21,7 @@ import {
   listSubscriptions,
   repoHubStub,
 } from "./subscriptions";
+import pkg from "../package.json";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
 import {
@@ -171,7 +172,7 @@ async function api(
 function meta(env: Env): Meta {
   return {
     protocol: 1,
-    server: "watcheroni/0.0.0-proto",
+    server: `watcheroni/${pkg.version}`,
     features: ["ws", "longpoll"],
     ...(env.GITHUB_CLIENT_ID
       ? {

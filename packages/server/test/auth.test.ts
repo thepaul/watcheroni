@@ -148,6 +148,7 @@ describe("meta", () => {
   it("publishes the client ID for the device flow", async () => {
     const meta = await (await call("/v1/meta")).json<Meta>();
     expect(meta.github?.client_id).toBe("Iv23test");
+    expect(meta.server).toMatch(/^watcheroni\/\d+\.\d+\.\d+$/);
   });
 });
 
