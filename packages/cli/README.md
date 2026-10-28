@@ -66,12 +66,24 @@ revokes the key and forgets it.
    0. A new process starts from the server's acknowledged position, so a
    killed `wait` loses nothing.
 
-Targets: the prototype server has no subscriptions yet, so PRs named on
-the command line (or the current branch's PR) are still polled from this
-machine, as in local mode, and their events are merged with the server
-inbox's. `subscribe()` in `src/server.ts` is where server subscriptions
-go: a target it subscribes is left to the server, and one it can't (the
-App isn't installed, say) stays polled locally.
+Targets: each PR named on the command line (or the current branch's PR)
+is subscribed on the server (`POST /v1/inboxes/{name}/subscriptions`),
+which then feeds the inbox from GitHub's webhooks, and this machine stops
+polling it. The request carries no GitHub token unless the server answers
+`github_token_required`, meaning the repo is private; then it's sent again
+with the GitHub token `watcheroni login` saved, renewed first through the
+server's refresh proxy if it has expired (and saved again). The server
+uses the token for one check and forgets it.
+
+A PR the server won't watch stays polled from this machine, as in local
+mode, with its events merged with the server inbox's: when the watcheroni
+App isn't installed on the repo (stderr says where to install it), when
+there's no usable GitHub token for a private repo (`WATCHERONI_API_KEY`
+alone has none), or when the server refuses for another reason. Such a PR
+is offered to the server again at most hourly. When the server ends a
+subscription, a `watch.ended` or `watch.expired` stops the watch here too;
+after a `watch.revoked` (the App uninstalled or the repo removed from it)
+the PR goes back to being polled from this machine.
 
 Because an inbox may be fed by subscriptions made elsewhere, which can't
 be listed yet, `wait` with no PR watched here reads the inbox until
@@ -79,8 +91,8 @@ be listed yet, `wait` with no PR watched here reads the inbox until
 have all ended.
 
 **Fallback.** If the server can't be reached, the CLI says so on stderr
-and polls the named PRs from this machine while it keeps trying to
-reconnect. A `wait` with nothing to poll locally exits 1 instead of
+and polls the named PRs from this machine, subscribed or not, while it
+keeps trying to reconnect. A `wait` with nothing to poll locally exits 1 instead of
 waiting on a server that's down; `stream` and `exec` keep retrying.
 
 ## How local mode works

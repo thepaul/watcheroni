@@ -9,12 +9,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "ACCOUNT", "class_name": "Account" },
-      { "name": "REPO_HUB", "class_name": "RepoHub" }
+      { "name": "REPO_HUB", "class_name": "RepoHub" },
+      { "name": "INSTALLATION", "class_name": "Installation" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Account"] },
-    { "tag": "v2", "new_sqlite_classes": ["RepoHub"] }
+    { "tag": "v2", "new_sqlite_classes": ["RepoHub"] },
+    { "tag": "v3", "new_sqlite_classes": ["Installation"] }
   ],
   "vars": {
     "GITHUB_APP_ID": "5490181",
@@ -23,8 +25,9 @@
     "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt"
   },
   // Secrets, not in this file (wrangler secret put, or .dev.vars for
-  // wrangler dev): GITHUB_CLIENT_SECRET, GITHUB_WEBHOOK_SECRET, TICKET_KEY,
-  // and during rotation TICKET_KEY_OLD. DEBUG_TOKEN turns on the /debug
+  // wrangler dev): GITHUB_APP_PRIVATE_KEY (PKCS#8 PEM), GITHUB_CLIENT_SECRET,
+  // GITHUB_WEBHOOK_SECRET, TICKET_KEY, STORAGE_KEY (32 bytes of base64, for
+  // the cached installation tokens), and during rotation TICKET_KEY_OLD. DEBUG_TOKEN turns on the /debug
   // routes; leave it unset in production.
 
   // The top level is the test server, watcheroni-proto on workers.dev, so
@@ -40,7 +43,8 @@
       "durable_objects": {
         "bindings": [
           { "name": "ACCOUNT", "class_name": "Account" },
-          { "name": "REPO_HUB", "class_name": "RepoHub" }
+          { "name": "REPO_HUB", "class_name": "RepoHub" },
+          { "name": "INSTALLATION", "class_name": "Installation" }
         ]
       },
       "vars": {

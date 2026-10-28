@@ -1,7 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Delivery } from "./account";
 import { BUCKETS_TABLE, msUntil, take, type BucketSpec } from "./limits";
-import { matchesKind, type UnsequencedEvent } from "./protocol";
+import { GITHUB_WEB_URL } from "./github";
+import { DEFAULT_TTL_SECONDS, matchesKind, type UnsequencedEvent } from "./protocol";
 
 // One per repository, named `repo:<repository.id>`. Knows who watches the
 // repo, matches each webhook's events against the subscriptions, and hands
@@ -29,7 +30,6 @@ const RETRY_MAX_MS = 10 * 60_000;
 const GIVE_UP_MS = 24 * 3600_000;
 const DELIVERIES_KEPT_MS = 3 * 24 * 3600_000;
 const PRUNE_EVERY_MS = 24 * 3600_000;
-const DEFAULT_TTL_SECONDS = 7 * 24 * 3600;
 
 // Kinds the normaliser produces for RepoHub's own use, never delivered.
 // `check.completed` will feed the checks rollup.
@@ -50,6 +50,8 @@ export interface NewSubscription {
   kinds?: string[];
   ignore?: Partial<Ignore>;
   ttl_seconds?: number;
+  // Private repos: when access must next be re-checked (ms).
+  verified_until?: number | null;
 }
 
 export interface RepoInfo {
@@ -64,6 +66,7 @@ export interface PrBaseline {
   head_sha: string | null;
   base_ref?: string | null;
   draft?: boolean;
+  mergeable?: "mergeable" | "conflicting" | "unknown";
 }
 
 export interface Subscription {
@@ -75,6 +78,7 @@ export interface Subscription {
   ignore: Ignore;
   created_at: number;
   expires_at: number;
+  verified_until: number | null;
 }
 
 export type SubscribeResult =
@@ -106,6 +110,7 @@ type SubRow = {
   spec: string;
   created_at: number;
   expires_at: number;
+  verified_until: number | null;
 };
 
 type PrRow = {
@@ -210,7 +215,14 @@ export class RepoHub extends DurableObject<Env> {
         sub.account, sub.inbox, sub.pr, spec,
       )
       .toArray()[0];
-    if (existing) return { ok: true, created: false, subscription: toSubscription(existing) };
+    if (existing) {
+      // A private repo's access was just checked again.
+      if (sub.verified_until && sub.verified_until > (existing.verified_until ?? 0)) {
+        this.sql.exec("UPDATE subscriptions SET verified_until = ? WHERE id = ?", sub.verified_until, existing.id);
+        existing.verified_until = sub.verified_until;
+      }
+      return { ok: true, created: false, subscription: toSubscription(existing) };
+    }
 
     const count = (where: string, ...args: SqlStorageValue[]) =>
       this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM subscriptions ${where}`, ...args).one().n;
@@ -234,17 +246,19 @@ export class RepoHub extends DurableObject<Env> {
       spec,
       created_at: now,
       expires_at: now + (sub.ttl_seconds ?? DEFAULT_TTL_SECONDS) * 1000,
+      verified_until: sub.verified_until ?? null,
     };
     this.sql.exec(
-      "INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      row.id, row.account_id, row.inbox, row.pr, row.spec, row.created_at, row.expires_at,
+      "INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at, verified_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      row.id, row.account_id, row.inbox, row.pr, row.spec, row.created_at, row.expires_at, row.verified_until,
     );
     if (sub.pr !== null) {
       this.sql.exec("INSERT OR IGNORE INTO prs (number) VALUES (?)", sub.pr);
       if (baseline) {
         this.sql.exec(
-          "UPDATE prs SET state = ?, draft = ?, head_sha = ?, base_ref = ? WHERE number = ?",
-          baseline.state, baseline.draft ? 1 : 0, baseline.head_sha, baseline.base_ref ?? null, sub.pr,
+          "UPDATE prs SET state = ?, draft = ?, head_sha = ?, base_ref = ?, mergeable = ?, mergeable_checked_at = ? WHERE number = ?",
+          baseline.state, baseline.draft ? 1 : 0, baseline.head_sha, baseline.base_ref ?? null,
+          baseline.mergeable ?? null, baseline.mergeable ? now : null, sub.pr,
         );
       }
     }
@@ -257,6 +271,43 @@ export class RepoHub extends DurableObject<Env> {
     this.sql.exec("DELETE FROM subscriptions WHERE id = ?", subId);
     if (row.pr !== null) this.forgetPrIfUnwatched(row.pr);
     return true;
+  }
+
+  // Ends every watch on the repo with `watch.revoked`: the App was
+  // uninstalled or suspended, or the repo removed from it. `eventBase`
+  // (the webhook's delivery ID) makes the events' IDs stable across
+  // retries. Returns how many subscriptions ended.
+  async revokeAll(reason: string, eventBase: string): Promise<number> {
+    const subs = this.sql.exec<SubRow>("SELECT * FROM subscriptions ORDER BY rowid").toArray().map(toSubscription);
+    if (!subs.length) return 0;
+    const now = this.now();
+    const at = new Date(now).toISOString();
+    const repo = { id: Number(this.getMeta("repo_id")), full_name: this.getMeta("full_name") ?? "" };
+    const outgoing: Map<number, Delivery[]> = new Map();
+    for (const sub of subs) {
+      push(outgoing, sub.account, {
+        inbox: sub.inbox,
+        event: {
+          v: 1,
+          id: `${eventBase}.revoked.${sub.id}`,
+          sub: sub.id,
+          kind: "watch.revoked",
+          at,
+          received_at: at,
+          repo,
+          pr: sub.pr,
+          actor: null,
+          data: { reason },
+          links: sub.pr === null ? {} : { html: `${GITHUB_WEB_URL}/${repo.full_name}/pull/${sub.pr}` },
+        },
+      });
+    }
+    this.sql.exec("DELETE FROM subscriptions");
+    this.sql.exec("DELETE FROM prs");
+    const ids = this.enqueue(outgoing, now);
+    await this.deliverRows(ids, now);
+    this.scheduleAlarm();
+    return subs.length;
   }
 
   stats(): RepoHubStats {
@@ -598,6 +649,7 @@ function toSubscription(row: SubRow): Subscription {
     ignore: spec.ignore,
     created_at: row.created_at,
     expires_at: row.expires_at,
+    verified_until: row.verified_until ?? null,
   };
 }
 

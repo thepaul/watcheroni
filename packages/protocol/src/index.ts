@@ -98,3 +98,36 @@ export interface TicketResponse {
 export const API_KEY = /^wk1_(\d{1,20})_([A-Za-z0-9_-]{43})$/;
 export const TICKET_TTL_SECONDS = 60;
 export const ACCOUNT_REQUESTS_PER_MINUTE = 120;
+
+// Subscriptions (PROTOCOL.md, "Subscriptions").
+export interface SubscriptionRequest {
+  repo: string;
+  pr?: number;
+  kinds?: string[];
+  ignore?: { self?: boolean; bots?: boolean; actors?: string[] };
+  ttl_seconds?: number;
+}
+
+export interface SubscriptionInfo {
+  id: string;
+  inbox: string;
+  repo: { id: number; full_name: string; private: boolean };
+  pr: number | null;
+  kinds: string[];
+  ignore: { self: boolean; bots: boolean; actors: string[] };
+  created_at: string;
+  expires_at: string;
+  verified_until: string | null;
+  state: "active";
+  // Only in the answer to creating one.
+  baseline?: { state: "open" | "closed" | "merged"; head_sha: string | null; mergeable: "mergeable" | "conflicting" | "unknown" };
+}
+
+export interface SubscriptionsResponse {
+  subscriptions: SubscriptionInfo[];
+}
+
+export const DEFAULT_TTL_SECONDS = 7 * 24 * 3600;
+export const MAX_TTL_SECONDS = 30 * 24 * 3600;
+export const PRIVATE_VERIFY_SECONDS = 7 * 24 * 3600;
+export const ACCOUNT_MAX_SUBSCRIPTIONS = 200;

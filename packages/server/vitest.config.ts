@@ -1,13 +1,25 @@
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
+
+// A throwaway App key for each run; tests check JWTs with the public half.
+const appKey = generateKeyPairSync("rsa", {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  publicKeyEncoding: { type: "spki", format: "pem" },
+});
 
 export default defineConfig({
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
-        // GitHub is never called for real: test/auth.test.ts stubs fetch.
+        // GitHub is never called for real: the tests stub fetch.
         bindings: {
+          GITHUB_APP_ID: "5490181",
+          GITHUB_APP_PRIVATE_KEY: appKey.privateKey,
+          TEST_APP_PUBLIC_KEY: appKey.publicKey,
+          STORAGE_KEY: randomBytes(32).toString("base64"),
           GITHUB_CLIENT_ID: "Iv23test",
           GITHUB_CLIENT_SECRET: "test-client-secret",
           GITHUB_WEBHOOK_SECRET: "test-secret",

@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  ACCOUNT_MAX_SUBSCRIPTIONS,
   ACCOUNT_REQUESTS_PER_MINUTE,
   INBOX_MAX_EVENTS,
   MAX_LIMIT,
@@ -8,6 +9,7 @@ import {
   type ClientMessage,
   type EventsPage,
   type ServerMessage,
+  type SubscriptionInfo,
   type UnsequencedEvent,
   type WatchEvent,
 } from "./protocol";
@@ -31,6 +33,21 @@ type InboxRow = {
   head: number;
   acked: number;
 };
+
+type SubscriptionRow = {
+  id: string;
+  inbox: string;
+  repo_id: number;
+  repo_name: string;
+  private: number;
+  pr: number | null;
+  spec: string;
+  created_at: number;
+  expires_at: number;
+  verified_until: number | null;
+};
+
+export type SubscriptionCheck = { ok: true } | { ok: false; status: number; code: string; detail: string };
 
 type KeyRow = {
   id: string;
@@ -122,6 +139,21 @@ export class Account extends DurableObject<Env> {
       CREATE INDEX IF NOT EXISTS keys_hash ON keys (hash);
       CREATE TABLE IF NOT EXISTS ticket_nonces (nonce TEXT PRIMARY KEY, exp INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS buckets (name TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_at INTEGER NOT NULL);
+      -- The account's index of its subscriptions; RepoHub holds the copy
+      -- that routes events.
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        id TEXT PRIMARY KEY,
+        inbox TEXT NOT NULL,
+        repo_id INTEGER NOT NULL,
+        repo_name TEXT NOT NULL,
+        private INTEGER NOT NULL,
+        pr INTEGER,
+        spec TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        verified_until INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS subscriptions_inbox ON subscriptions (inbox);
     `);
   }
 
@@ -239,6 +271,54 @@ export class Account extends DurableObject<Env> {
     return this.inbox(name);
   }
 
+  // RPC, before subscribing: does the inbox exist, and is there room for
+  // another subscription?
+  checkSubscription(inbox: string): SubscriptionCheck {
+    if (!this.inbox(inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
+    const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions").one().n;
+    if (n >= ACCOUNT_MAX_SUBSCRIPTIONS) {
+      return { ok: false, status: 422, code: "quota_exceeded", detail: `subscriptions on this account (at most ${ACCOUNT_MAX_SUBSCRIPTIONS})` };
+    }
+    return { ok: true };
+  }
+
+  // RPC, once RepoHub has the subscription.
+  saveSubscription(sub: SubscriptionInfo): void {
+    const { baseline: _, ...rest } = sub;
+    this.sql.exec(
+      `INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at, verified_until)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (id) DO UPDATE SET repo_name = excluded.repo_name, expires_at = excluded.expires_at, verified_until = excluded.verified_until`,
+      rest.id, rest.inbox, rest.repo.id, rest.repo.full_name, rest.repo.private ? 1 : 0, rest.pr,
+      JSON.stringify({ kinds: rest.kinds, ignore: rest.ignore }),
+      Date.parse(rest.created_at), Date.parse(rest.expires_at),
+      rest.verified_until === null ? null : Date.parse(rest.verified_until),
+    );
+  }
+
+  // RPC: an inbox's subscriptions, oldest first, or null if there's no
+  // such inbox.
+  listSubscriptions(inbox: string): SubscriptionInfo[] | null {
+    if (!this.inbox(inbox)) return null;
+    return this.sql
+      .exec<SubscriptionRow>("SELECT * FROM subscriptions WHERE inbox = ? ORDER BY created_at, id", inbox)
+      .toArray()
+      .map(subscriptionInfo);
+  }
+
+  getSubscription(inbox: string, id: string): SubscriptionInfo | null {
+    const row = this.sql.exec<SubscriptionRow>("SELECT * FROM subscriptions WHERE inbox = ? AND id = ?", inbox, id).toArray()[0];
+    return row ? subscriptionInfo(row) : null;
+  }
+
+  // RPC: forgets a subscription, returning it so the Worker can tell its
+  // RepoHub, or null if there was none.
+  removeSubscription(inbox: string, id: string): SubscriptionInfo | null {
+    const sub = this.getSubscription(inbox, id);
+    if (sub) this.sql.exec("DELETE FROM subscriptions WHERE id = ?", id);
+    return sub;
+  }
+
   // RPC: append events to inboxes and push them to waiting sockets. In the
   // full design RepoHub calls this; in the prototype /debug does.
   deliver(items: Delivery[]): { delivered: number; duplicates: number } {
@@ -262,6 +342,8 @@ export class Account extends DurableObject<Env> {
       this.sql.exec("DELETE FROM events WHERE inbox = ? AND seq <= ?", name, seq - INBOX_MAX_EVENTS);
       touched.add(name);
       delivered++;
+      // A `watch.*` event is the subscription's last.
+      if (event.sub && event.kind.startsWith("watch.")) this.sql.exec("DELETE FROM subscriptions WHERE id = ?", event.sub);
     }
     for (const name of touched) this.push(name);
     return { delivered, duplicates };
@@ -385,6 +467,22 @@ export class Account extends DurableObject<Env> {
       .toArray()
       .map((row) => JSON.parse(row.body) as WatchEvent);
   }
+}
+
+function subscriptionInfo(row: SubscriptionRow): SubscriptionInfo {
+  const spec = JSON.parse(row.spec) as Pick<SubscriptionInfo, "kinds" | "ignore">;
+  return {
+    id: row.id,
+    inbox: row.inbox,
+    repo: { id: row.repo_id, full_name: row.repo_name, private: row.private === 1 },
+    pr: row.pr,
+    kinds: spec.kinds,
+    ignore: spec.ignore,
+    created_at: new Date(row.created_at).toISOString(),
+    expires_at: new Date(row.expires_at).toISOString(),
+    verified_until: row.verified_until === null ? null : new Date(row.verified_until).toISOString(),
+    state: "active",
+  };
 }
 
 function keyInfo(row: KeyRow): KeyInfo {

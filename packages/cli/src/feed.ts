@@ -46,6 +46,9 @@ export class Feed {
     const items: Item[] = [];
     for (const source of this.server ? [this.server, this.inbox] : [this.inbox]) {
       const pending = source.pending();
+      if (source === this.server) {
+        for (const e of pending) if (e.sub && e.kind.startsWith("watch.")) this.inbox.subscriptionEnded(e.sub, e.kind);
+      }
       const keep = pending.filter((e) => matchesKind(kinds, e.kind));
       const skip = pending.filter((e) => !matchesKind(kinds, e.kind));
       // Acknowledge up to the first wanted event only, so the order holds.

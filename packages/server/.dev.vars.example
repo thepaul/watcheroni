@@ -7,3 +7,8 @@ TICKET_KEY=change-me
 TICKET_KEY_OLD=
 # Turns on the /debug routes (minting keys, injecting events, stats).
 DEBUG_TOKEN=change-me
+# The App's private key as PKCS#8 PEM (GitHub gives PKCS#1; convert with
+# `openssl pkcs8 -topk8 -nocrypt -in key.pem`).
+GITHUB_APP_PRIVATE_KEY=change-me
+# AES-256-GCM key for cached installation tokens: `openssl rand -base64 32`.
+STORAGE_KEY=change-me

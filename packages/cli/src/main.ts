@@ -6,7 +6,7 @@ import { Feed } from "./feed.ts";
 import { formatText, footer } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
-import { LoginFailed, login, logout } from "./login.ts";
+import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
 import { ServerClient, ServerError, ServerReader, Unreachable, subscribe } from "./server.ts";
 import { UsageError, currentBranchPr, parseTarget, targetKey } from "./targets.ts";
@@ -143,9 +143,18 @@ async function main(argv: string[]): Promise<number> {
   }
   for (const t of targets) {
     const key = targetKey(t);
-    if (inbox.watched().some((w) => targetKey(w.target) === key)) continue;
-    const sub = client && reachable ? await subscribe(client, inboxName, t) : null;
+    const known = inbox.watched().find((w) => targetKey(w.target) === key);
+    // A PR polled from here so far is offered to the server again, at
+    // most hourly, in case the App has been installed since.
+    const tried = known?.subTriedAt ? Date.parse(known.subTriedAt) : 0;
+    if (known && (known.sub || !reachable || Date.now() - tried < RESUBSCRIBE_MS)) continue;
+    const sub = client && reachable ? await subscribe(client, inboxName, t, { log, githubToken: () => githubTokenFor(client.url) }) : null;
+    if (known) {
+      inbox.setSubscription(key, sub);
+      continue;
+    }
     inbox.watch(key, t, sub);
+    if (client && reachable && !sub) inbox.setSubscription(key, null);
     log(`watching ${key} in inbox ${inboxName}${client && !sub ? ", polling GitHub from this machine" : ""}`);
   }
 
@@ -180,6 +189,8 @@ async function main(argv: string[]): Promise<number> {
   }
   return EXIT.error;
 }
+
+const RESUBSCRIBE_MS = 60 * 60_000;
 
 async function waitCommand(
   feed: Feed,

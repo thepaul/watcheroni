@@ -159,6 +159,50 @@ export async function logout(server = serverUrl(), deps: LoginDeps = defaultDeps
   return true;
 }
 
+// The GitHub token `watcheroni login` saved for the server, for
+// subscribing to private repos. An expired one is renewed through the
+// server's refresh proxy (PROTOCOL.md, "Refreshing the GitHub token") and
+// saved. Null if there's none, or it can't be renewed.
+export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetch" | "now"> = defaultDeps): Promise<string | null> {
+  const github = readCredentials().servers[server]?.github;
+  if (!github?.access_token) return null;
+  const now = deps.now();
+  const expiresAt = github.expires_at ? Date.parse(github.expires_at) : Infinity;
+  if (expiresAt - now > TOKEN_MARGIN_MS) return github.access_token;
+  const refreshExpiresAt = github.refresh_token_expires_at ? Date.parse(github.refresh_token_expires_at) : Infinity;
+  if (!github.refresh_token || refreshExpiresAt <= now) return null;
+  let token: Partial<TokenResponse> & { error?: string };
+  try {
+    const res = await deps.fetch(`${server}/v1/github/refresh`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ refresh_token: github.refresh_token }),
+    });
+    token = (await res.json()) as typeof token;
+  } catch {
+    return null;
+  }
+  if (typeof token.access_token !== "string") return null;
+  // Read again, in case another process changed the file meanwhile.
+  const creds = readCredentials();
+  const entry = creds.servers[server];
+  if (!entry) return token.access_token;
+  entry.github = {
+    access_token: token.access_token,
+    // GitHub rotates the refresh token on every use.
+    refresh_token: token.refresh_token ?? null,
+    expires_at: token.expires_in ? new Date(now + token.expires_in * 1000).toISOString() : null,
+    refresh_token_expires_at: token.refresh_token_expires_in
+      ? new Date(now + token.refresh_token_expires_in * 1000).toISOString()
+      : null,
+  };
+  writeCredentials(creds);
+  return token.access_token;
+}
+
+// A token is renewed when it has less than this left.
+const TOKEN_MARGIN_MS = 5 * 60_000;
+
 interface TokenResponse {
   access_token: string;
   refresh_token?: string;

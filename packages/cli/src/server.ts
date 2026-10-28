@@ -1,8 +1,8 @@
-import type { EventsPage, ServerMessage, WatchEvent } from "@watcheroni/protocol";
+import type { EventsPage, ServerMessage, SubscriptionInfo, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import type { ServerConfig } from "./config.ts";
 import { LoginNeeded } from "./github.ts";
-import type { Target } from "./targets.ts";
+import { targetKey, type Target } from "./targets.ts";
 
 // Server mode: reading an inbox on a watcheroni server (PROTOCOL.md,
 // "Reading events"), over a WebSocket, or by long-polling when a socket
@@ -15,12 +15,18 @@ export class Unreachable extends Error {}
 export class ServerError extends Error {
   readonly status: number;
   readonly code: string;
-  constructor(message: string, status: number, code: string) {
+  // The whole problem document, for fields such as `install_url`.
+  readonly problem: Record<string, unknown>;
+  constructor(message: string, status: number, code: string, problem: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
     this.code = code;
+    this.problem = problem;
   }
 }
+
+// 401s that are about the GitHub token sent with a request, not the API key.
+const GITHUB_TOKEN_CODES = new Set(["github_token_required", "github_token_invalid"]);
 
 const SUBPROTOCOL = "watcheroni.v1";
 const WAIT_SECONDS = 300;
@@ -34,7 +40,11 @@ export class ServerClient {
     this.apiKey = config.apiKey;
   }
 
-  async request<T>(method: string, path: string, o: { body?: unknown; signal?: AbortSignal; timeoutMs?: number } = {}): Promise<T> {
+  async request<T>(
+    method: string,
+    path: string,
+    o: { body?: unknown; headers?: Record<string, string>; signal?: AbortSignal; timeoutMs?: number } = {},
+  ): Promise<T> {
     const timeout = AbortSignal.timeout(o.timeoutMs ?? 30_000);
     let res: Response;
     try {
@@ -44,6 +54,7 @@ export class ServerClient {
           Authorization: `Bearer ${this.apiKey}`,
           "user-agent": `watcheroni-cli/${pkg.version}`,
           ...(o.body === undefined ? {} : { "content-type": "application/json" }),
+          ...o.headers,
         },
         body: o.body === undefined ? undefined : JSON.stringify(o.body),
         signal: o.signal ? AbortSignal.any([o.signal, timeout]) : timeout,
@@ -56,11 +67,11 @@ export class ServerClient {
     if (res.ok) return (await res.json()) as T;
     const problem = (await res.json().catch(() => ({}))) as { code?: string; title?: string; detail?: string };
     const code = problem.code ?? String(res.status);
-    if (res.status === 401) {
+    if (res.status === 401 && !GITHUB_TOKEN_CODES.has(code)) {
       throw new LoginNeeded(`${this.url} rejected the API key (${code}); check WATCHERONI_API_KEY`);
     }
     if (res.status >= 500 || res.status === 429) throw new Unreachable(`${this.url} answered ${res.status} (${code})`);
-    throw new ServerError(`${this.url}: ${method} ${path}: ${res.status} ${problem.detail ?? problem.title ?? code}`, res.status, code);
+    throw new ServerError(`${this.url}: ${method} ${path}: ${res.status} ${problem.detail ?? problem.title ?? code}`, res.status, code, problem);
   }
 
   ensureInbox(name: string): Promise<{ head: number; acked: number }> {
@@ -89,15 +100,53 @@ export class ServerClient {
   }
 }
 
-// The seam for server subscriptions. The full server takes
-// POST /v1/inboxes/{name}/subscriptions (PROTOCOL.md, "Subscriptions"),
-// sending the local GitHub token as X-GitHub-Token for private repos, and
-// returns the subscription's ID; `app_not_installed` and the like should
-// come back as null, so the target is polled from this machine instead.
-// The prototype server has no subscriptions yet, so every target is
-// polled from here for now.
-export async function subscribe(_client: ServerClient, _inbox: string, _target: Target): Promise<string | null> {
-  return null;
+export interface SubscribeOptions {
+  log: (msg: string) => void;
+  // The user's GitHub token for this server (from `watcheroni login`),
+  // refreshed if it has expired, or null if there isn't one.
+  githubToken?: () => Promise<string | null>;
+}
+
+// Subscribes the inbox to a PR on the server (PROTOCOL.md,
+// "Subscriptions") and returns the subscription's ID. Asks without a
+// GitHub token first; only a private repo needs one, and it's sent only
+// then. Returns null when the server won't watch it (the App isn't
+// installed, no access, unreachable), so the PR is polled from this
+// machine instead.
+export async function subscribe(client: ServerClient, inbox: string, target: Target, o: SubscribeOptions): Promise<string | null> {
+  const repo = `${target.owner}/${target.name}`;
+  const path = `/v1/inboxes/${inbox}/subscriptions`;
+  const body = { repo, pr: target.number };
+  try {
+    try {
+      return (await client.request<SubscriptionInfo>("POST", path, { body })).id;
+    } catch (e) {
+      if (!(e instanceof ServerError && e.code === "github_token_required")) throw e;
+      const token = await o.githubToken?.();
+      if (!token) {
+        o.log(`${repo} is private and there's no GitHub token for ${client.url} on this machine; run \`watcheroni login\` to have the server watch it`);
+        return null;
+      }
+      return (await client.request<SubscriptionInfo>("POST", path, { body, headers: { "X-GitHub-Token": token } })).id;
+    }
+  } catch (e) {
+    if (e instanceof ServerError) {
+      if (e.code === "app_not_installed") {
+        const url = typeof e.problem.install_url === "string" ? `; it can be installed from ${e.problem.install_url}` : "";
+        o.log(`the watcheroni App isn't installed on ${repo}${url}`);
+      } else if (e.code === "github_token_invalid") {
+        o.log(`${client.url} didn't accept this machine's GitHub token for ${repo}; run \`watcheroni login\` again`);
+      } else {
+        o.log(`${client.url} won't watch ${targetKey(target)}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
+      }
+      return null;
+    }
+    if (e instanceof Unreachable) {
+      o.log(`couldn't subscribe to ${targetKey(target)} (${e.message})`);
+      return null;
+    }
+    throw e;
+  }
 }
 
 export interface ReaderOptions {

@@ -188,14 +188,24 @@ describe("API keys", () => {
 describe("rate limit", () => {
   it("allows 120 requests a minute per account, then 429 with Retry-After", async () => {
     const { api_key } = await mintKey();
+    // The bucket refills 2 tokens a second while the loop runs, so on a
+    // busy machine a few more than 120 get through.
+    let ok = 0;
     let last!: Response;
-    for (let i = 0; i < 120; i++) {
-      last = await call("/v1/keys", { headers: bearer(api_key) });
-      expect(last.status).toBe(200);
+    let limited!: Response;
+    for (;;) {
+      const res = await call("/v1/keys", { headers: bearer(api_key) });
+      if (res.status !== 200) {
+        limited = res;
+        break;
+      }
+      last = res;
+      ok++;
     }
+    expect(ok).toBeGreaterThanOrEqual(120);
+    expect(ok).toBeLessThan(140);
     expect(last.headers.get("RateLimit-Limit")).toBe("120");
-    expect(last.headers.get("RateLimit-Remaining")).toBe("0");
-    const limited = await call("/v1/keys", { headers: bearer(api_key) });
+    expect(Number(last.headers.get("RateLimit-Remaining"))).toBeLessThanOrEqual(1);
     expect(limited.status).toBe(429);
     expect((await limited.json<{ code: string }>()).code).toBe("rate_limited");
     expect(Number(limited.headers.get("Retry-After"))).toBeGreaterThanOrEqual(1);

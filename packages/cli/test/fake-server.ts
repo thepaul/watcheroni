@@ -4,8 +4,8 @@ import type { AddressInfo, Socket } from "node:net";
 import type { ClientMessage, ServerMessage, WatchEvent } from "@watcheroni/protocol";
 
 // A small stand-in for a watcheroni server: inboxes, long-polling, ack,
-// and the WebSocket protocol, with WebSocket framing done by hand so the
-// tests need no WebSocket library.
+// subscriptions, the refresh proxy, and the WebSocket protocol, with
+// WebSocket framing done by hand so the tests need no WebSocket library.
 
 interface FakeInbox {
   head: number;
@@ -88,6 +88,15 @@ export class FakeServer {
   readonly messages: string[] = [];
   // Refuse WebSocket upgrades, as a proxy might.
   refuseSockets = false;
+  // Repos the App is installed on, and whether each is private.
+  readonly repos = new Map<string, { private: boolean }>();
+  // GitHub tokens accepted for private repos.
+  readonly githubTokens = new Set<string>();
+  // Subscriptions made, with the X-GitHub-Token each request carried.
+  readonly subscriptions: { id: string; inbox: string; repo: string; pr: number; githubToken: string | null }[] = [];
+  // What POST /v1/github/refresh answers, and the refresh tokens it saw.
+  refreshAnswer: Record<string, unknown> = { error: "bad_refresh_token" };
+  readonly refreshed: string[] = [];
   private http: Server | null = null;
   private waiting = new Set<() => void>();
   port = 0;
@@ -117,10 +126,10 @@ export class FakeServer {
     return inbox;
   }
 
-  inject(name: string, kind = "debug.ping", data: WatchEvent["data"] = {}, id = `fake:${Math.random()}`): WatchEvent {
+  inject(name: string, kind = "debug.ping", data: WatchEvent["data"] = {}, id = `fake:${Math.random()}`, sub: string | null = null): WatchEvent {
     const inbox = this.inbox(name);
     const event: WatchEvent = {
-      v: 1, seq: ++inbox.head, id, sub: null, kind, at: "t", received_at: "t",
+      v: 1, seq: ++inbox.head, id, sub, kind, at: "t", received_at: "t",
       repo: { id: 1, full_name: "octo/widgets" }, pr: 7, actor: null, data, links: {},
     };
     inbox.events.push(event);
@@ -189,6 +198,15 @@ export class FakeServer {
       res.writeHead(status, { "content-type": status < 400 ? "application/json" : "application/problem+json" });
       res.end(JSON.stringify(body));
     };
+    const readBody = async <T>() => {
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      return JSON.parse(Buffer.concat(chunks).toString()) as T;
+    };
+    if (req.method === "POST" && url.pathname === "/v1/github/refresh") {
+      this.refreshed.push((await readBody<{ refresh_token: string }>()).refresh_token);
+      return json(200, this.refreshAnswer);
+    }
     if (!this.authorized(req)) return json(401, { status: 401, code: "unauthorized" });
     const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?$/);
     if (!m) return json(404, { status: 404, code: "not_found" });
@@ -196,10 +214,21 @@ export class FakeServer {
     const route = `${req.method} ${m[2] ?? ""}`;
     const inbox = this.inbox(name);
     if (route === "PUT ") return json(200, { name, head: inbox.head, acked: inbox.acked });
+    if (route === "POST /subscriptions") {
+      const body = await readBody<{ repo: string; pr: number }>();
+      const repo = this.repos.get(body.repo);
+      if (!repo) {
+        return json(409, { status: 409, code: "app_not_installed", install_url: "https://github.com/apps/watcheroni/installations/new" });
+      }
+      const githubToken = (req.headers["x-github-token"] as string | undefined) ?? null;
+      if (repo.private && !githubToken) return json(401, { status: 401, code: "github_token_required" });
+      if (repo.private && !this.githubTokens.has(githubToken!)) return json(401, { status: 401, code: "github_token_invalid" });
+      const id = `sub_${this.subscriptions.length + 1}`;
+      this.subscriptions.push({ id, inbox: name, repo: body.repo, pr: body.pr, githubToken });
+      return json(201, { id, inbox: name, repo: { id: 1, full_name: body.repo, private: repo.private }, pr: body.pr });
+    }
     if (route === "POST /ack") {
-      const chunks: Buffer[] = [];
-      for await (const c of req) chunks.push(c as Buffer);
-      const { seq } = JSON.parse(Buffer.concat(chunks).toString()) as { seq: number };
+      const { seq } = await readBody<{ seq: number }>();
       inbox.acked = Math.max(inbox.acked, Math.min(seq, inbox.head));
       return json(200, { name, head: inbox.head, acked: inbox.acked });
     }
