@@ -1,7 +1,7 @@
 import examples from "@octokit/webhooks-examples/api.github.com/index.json";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Delivery } from "../src/account";
 import type { UnsequencedEvent, WatchEvent } from "../src/protocol";
 import { REPO_LIMITS, RepoHub, type IngestResult, type RepoHubStats, type Subscription } from "../src/repo-hub";
@@ -24,6 +24,19 @@ const SHA_B = "b".repeat(40);
 // with each other or with webhook.test.ts.
 let counter = 0;
 const fresh = () => 700_000_000 + Math.floor(Math.random() * 1_000_000) * 100 + counter++;
+
+// No test reaches the real GitHub. GitHub's examples carry installation
+// IDs, so an alarm (a mergeability check, say) would otherwise ask it for
+// a token and a GraphQL answer: slow, and an HTML error page on CI runners.
+// Tests that need GitHub mock fetch themselves.
+beforeEach(() => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    throw new Error(`no network in tests: ${new Request(input, init).url}`);
+  });
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 const hub = (repo: number) => env.REPO_HUB.get(env.REPO_HUB.idFromName(`repo:${repo}`));
 const stats = (repo: number): Promise<RepoHubStats> => hub(repo).stats();
@@ -125,7 +138,8 @@ describe("ingest from GitHub's examples", () => {
     for (const k of ["pr.opened", "pr.closed", "review.submitted", "review_comment.created", "comment.created", "workflow.completed", "issue.opened"]) {
       expect(seen).toContain(k);
     }
-  });
+    // Hundreds of webhooks: well over the default 5 s on a slow CI runner.
+  }, 30_000);
 });
 
 describe("matching", () => {
@@ -681,7 +695,16 @@ describe("checks.completed", () => {
     const pending = await runInDurableObject(hub(repo), (_: RepoHub, state) =>
       state.storage.sql.exec("UPDATE rollups SET settle_at = 1 WHERE settle_at IS NOT NULL").rowsWritten > 0,
     );
-    await runDurableObjectAlarm(hub(repo));
+    // workerd may already be running the alarm by itself (a push makes a
+    // mergeability check due at once), and then runDurableObjectAlarm finds
+    // none scheduled. Run it until no due rollup is left.
+    await vi.waitFor(async () => {
+      await runDurableObjectAlarm(hub(repo));
+      const left = await runInDurableObject(hub(repo), (_: RepoHub, state) =>
+        state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM rollups WHERE settle_at IS NOT NULL").one().n,
+      );
+      if (left) throw new Error(`${left} rollups not sent yet`);
+    });
     return pending;
   }
 
@@ -779,6 +802,28 @@ describe("checks.completed", () => {
       [SHA_A, "success"],
       [SHA_B, "failure"],
     ]);
+  });
+
+  it("gives each send its own ID while the clock stands still", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await watch(repo, acct, SHA_B);
+    // A Worker's clock only moves between I/O, so sends can share a
+    // millisecond: the IDs mustn't depend on it.
+    const frozen = Date.now();
+    await runInDurableObject(hub(repo), (instance: RepoHub) => {
+      (instance as unknown as { now: () => number }).now = () => frozen;
+    });
+    await hub(repo).ingest("b", [status(repo, "ci/lint", "failure", SHA_B)]);
+    expect(await settle(repo)).toBe(true);
+    await hub(repo).ingest("push", [fact(repo, "pr.pushed", 7, { before: SHA_B, after: SHA_A })]);
+    await hub(repo).ingest("a", [status(repo, "ci/lint", "success", SHA_A)]);
+    expect(await settle(repo)).toBe(true);
+    await hub(repo).ingest("back", [fact(repo, "pr.pushed", 7, { before: SHA_A, after: SHA_B })]);
+    expect(await settle(repo)).toBe(true);
+    const events = await inbox(acct, "i");
+    expect(events.map((e) => e.data.head_sha)).toEqual([SHA_B, SHA_A, SHA_B]);
+    expect(new Set(events.map((e) => e.id)).size).toBe(3);
   });
 
   it("keeps the newest of out-of-order facts", async () => {

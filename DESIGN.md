@@ -871,9 +871,12 @@ differs from the above:
   suite counts, as in the CLI's `statusCheckRollup`. A re-run of a job in
   a suite that has already completed can make the rollup finish before
   any jobs that wait on it are created; best-effort, as PROTOCOL.md says.
-- **IDs.** `checks.completed` is `repo:<id>.pr<N>.checks.<ms>`, and
-  `merge.conflict` and `merge.clean` are `repo:<id>.pr<N>.conflict.<ms>`
-  and `.clean.<ms>`, the time of the alarm that sent them. `actor` is null; `links` are the PR's.
+- **IDs.** `checks.completed` is `repo:<id>.pr<N>.checks.<n>`, and
+  `merge.conflict` and `merge.clean` are `repo:<id>.pr<N>.conflict.<n>`
+  and `.clean.<n>`, where `<n>` counts the repo's derived events (meta
+  `derived_seq`). Not the time: a Worker's clock stands still between
+  I/O, so two sends could share a millisecond, and inboxes drop repeated
+  IDs. `actor` is null; `links` are the PR's.
 - **No baseline for checks.** A subscription starts with no rollup, so if
   a check is re-run on a head whose checks finished before the watch
   began, the rollup covers only the checks seen since (the CLI would know

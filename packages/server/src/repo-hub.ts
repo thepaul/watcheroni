@@ -936,7 +936,7 @@ export class RepoHub extends DurableObject<Env> {
       const fingerprint = JSON.stringify(rollup);
       if (row.head_sha === row.current && row.fingerprint === fingerprint) continue;
       this.sql.exec("UPDATE rollups SET head_sha = ?, fingerprint = ? WHERE pr = ?", row.current, fingerprint, row.pr);
-      const event = this.derived("checks.completed", `repo:${repoId}.pr${row.pr}.checks.${now}`, row.pr, { head_sha: row.current, ...rollup }, now);
+      const event = this.derived("checks.completed", `repo:${repoId}.pr${row.pr}.checks`, row.pr, { head_sha: row.current, ...rollup }, now);
       this.match([event], out);
     }
   }
@@ -1068,7 +1068,7 @@ export class RepoHub extends DurableObject<Env> {
         if (conflicting === (was.mergeable === "conflicting")) continue;
         const kind = conflicting ? "merge.conflict" : "merge.clean";
         const repoId = this.getMeta("repo_id");
-        const event = this.derived(kind, `repo:${repoId}.pr${pr.number}.${kind.slice(6)}.${now}`, pr.number, {
+        const event = this.derived(kind, `repo:${repoId}.pr${pr.number}.${kind.slice(6)}`, pr.number, {
           head_sha: a.headRefOid, base_sha: a.baseRefOid,
         }, now);
         this.match([event], out);
@@ -1123,13 +1123,18 @@ export class RepoHub extends DurableObject<Env> {
     return answers;
   }
 
-  // An event RepoHub makes itself, about a watched PR.
-  private derived(kind: string, id: string, pr: number, data: UnsequencedEvent["data"], now: number): UnsequencedEvent {
+  // An event RepoHub makes itself, about a watched PR. Its ID ends in a
+  // number counted per repo, not the time: a Worker's clock stands still
+  // between I/O, so two sends could share a millisecond, and inboxes drop
+  // repeated IDs.
+  private derived(kind: string, idBase: string, pr: number, data: UnsequencedEvent["data"], now: number): UnsequencedEvent {
     const at = new Date(now).toISOString();
     const full = this.getMeta("full_name") ?? "";
+    const n = Number(this.getMeta("derived_seq") ?? 0) + 1;
+    this.setMeta("derived_seq", String(n));
     return {
       v: 1,
-      id,
+      id: `${idBase}.${n}`,
       sub: null,
       kind,
       at,
