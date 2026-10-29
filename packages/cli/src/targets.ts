@@ -11,9 +11,13 @@ export interface RepoTarget { owner: string; name: string; kinds: string[]; base
 export const targetKey = (t: Target) => `${t.owner}/${t.name}#${t.number}`;
 
 // `octo/widgets (pr.opened; base main; author paul)`: names the watch, and
-// tells apart watches on one repo with different filters.
-export const repoKey = (t: RepoTarget) =>
-  `${t.owner}/${t.name} (${[t.kinds.join(","), t.base && `base ${t.base}`, t.author && `author ${t.author}`].filter(Boolean).join("; ")})`;
+// tells apart watches on one repo with different filters. Kinds are sorted
+// and the login lowercased, as the server does, so the same subscription
+// always gets the same key.
+export const repoKey = (t: RepoTarget) => {
+  const kinds = [...new Set(t.kinds)].sort().join(",");
+  return `${t.owner}/${t.name} (${[kinds, t.base && `base ${t.base}`, t.author && `author ${t.author.toLowerCase()}`].filter(Boolean).join("; ")})`;
+};
 
 export const isPr = <T extends { owner: string; name: string }>(t: T | Target): t is Target => "number" in t;
 

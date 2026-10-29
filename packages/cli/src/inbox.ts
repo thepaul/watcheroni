@@ -145,21 +145,22 @@ export class Inbox {
   // The server ended a subscription with a `watch.*` event. A PR that
   // merged, closed or expired is no longer watched; one whose watch was
   // revoked (the App uninstalled, say) or not re-verified is polled from
-  // here instead.
-  subscriptionEnded(sub: string, kind: string): void {
+  // here instead. Returns "repo" when it was a repository-wide watch.
+  subscriptionEnded(sub: string, kind: string): "repo" | "pr" | null {
     // A repository-wide watch can't be polled from here, so it's simply over.
     const repo = Object.entries(this.state.repos ?? {}).find(([, r]) => r.sub === sub);
     if (repo) {
       delete this.state.repos![repo[0]];
       this.save();
-      return;
+      return "repo";
     }
     const entry = Object.entries(this.state.watched).find(([, w]) => w.sub === sub);
-    if (!entry) return;
+    if (!entry) return null;
     const [key, w] = entry;
     if (kind === "watch.revoked" || kind === "watch.unverified" || kind === "watch.expired") delete w.sub;
     else delete this.state.watched[key];
     this.save();
+    return "pr";
   }
 
   update(key: string, snapshot: Snapshot, memory: Memory): void {

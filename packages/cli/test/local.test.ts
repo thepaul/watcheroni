@@ -32,8 +32,9 @@ describe("targets", () => {
   it("takes whole repositories, named by their filters", () => {
     expect(parseTarget("octo/widgets")).toEqual({ owner: "octo", name: "widgets" });
     expect(parseTarget("https://github.com/octo/widgets/")).toEqual({ owner: "octo", name: "widgets" });
-    expect(repoKey({ owner: "octo", name: "widgets", kinds: ["pr.opened", "check.failed"], base: "main", author: "paul" }))
-      .toBe("octo/widgets (pr.opened,check.failed; base main; author paul)");
+    // Kinds sorted and deduplicated, the login lowercased, as the server keeps them.
+    expect(repoKey({ owner: "octo", name: "widgets", kinds: ["pr.opened", "check.failed", "pr.opened"], base: "main", author: "Paul" }))
+      .toBe("octo/widgets (check.failed,pr.opened; base main; author paul)");
     expect(repoKey({ owner: "octo", name: "widgets", kinds: ["pr.*"] })).toBe("octo/widgets (pr.*)");
   });
 

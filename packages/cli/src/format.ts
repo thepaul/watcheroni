@@ -9,7 +9,8 @@ const BODY = "--jq .body";
 
 // `reading` names a server inbox that is still being read although no PR
 // is known to be watched (see Feed.ended).
-export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string): string {
+// `repoEnded`: the server ended a whole-repository watch.
+export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string, repoEnded = false): string {
   const groups = new Map<string, WatchEvent[]>();
   for (const e of events) {
     const key = e.repo ? (e.pr !== null ? `${e.repo.full_name}#${e.pr}` : e.repo.full_name) : "other";
@@ -21,12 +22,13 @@ export function formatText(events: WatchEvent[], stillWatching: string[], readin
     lines.push(...describeAll(list));
     lines.push("");
   }
-  lines.push(footer(stillWatching, reading));
+  lines.push(footer(stillWatching, reading, repoEnded));
   return lines.join("\n");
 }
 
-export function footer(stillWatching: string[], reading?: string): string {
+export function footer(stillWatching: string[], reading?: string, repoEnded = false): string {
   if (!stillWatching.length && reading) return `Still reading inbox ${reading}. Run \`watcheroni wait\` again to keep watching.`;
+  if (!stillWatching.length && repoEnded) return "Nothing is left to watch: the server's watch on the repository has ended.";
   if (!stillWatching.length) return "Nothing is left to watch: every watched PR has been merged or closed.";
   // A single PR "is still open"; a whole repository is just watched.
   const what = stillWatching.length === 1 && stillWatching[0].includes("#") ? `${stillWatching[0]} is still open` : `Still watching ${stillWatching.join(", ")}`;

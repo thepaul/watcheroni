@@ -240,6 +240,7 @@ describe("watching a whole repository", () => {
     const run = cli(["wait", "octo/widgets", "--kinds", "pr.opened", "--settle", "0"]);
     expect(await run.code, run.stderr()).toBe(3);
     expect(run.stdout()).toMatch(/^octo\/widgets: 1 new event\n- watch.revoked/);
+    expect(run.stdout()).toMatch(/Nothing is left to watch: the server's watch on the repository has ended.\n$/);
     const ls = cli(["ls"]);
     await ls.code;
     expect(ls.stdout()).toBe("Inbox box is watching nothing.\n");
@@ -251,6 +252,12 @@ describe("watching a whole repository", () => {
     expect(await cli(["watch", "octo/widgets", "--kinds", "check.failed", "--author", "paul"]).code).toBe(0);
     const run = cli(["unwatch", "octo/widgets"]);
     expect(await run.code, run.stderr()).toBe(0);
+    expect(fake.deleted).toEqual(["sub_1", "sub_2"]);
+    // Without a server, it says the server's subscription is left.
+    expect(await cli(["watch", "octo/widgets", "--kinds", "pr.opened"]).code).toBe(0);
+    const offline = cli(["unwatch", "octo/widgets"], { WATCHERONI_SERVER: "" });
+    expect(await offline.code).toBe(0);
+    expect(offline.stderr()).toMatch(/stopped watching octo\/widgets \(pr.opened\) here, but with no server configured its subscription there wasn't ended/);
     expect(fake.deleted).toEqual(["sub_1", "sub_2"]);
     const ls = cli(["ls"]);
     await ls.code;

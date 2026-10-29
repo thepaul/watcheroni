@@ -31,6 +31,8 @@ export class Feed {
   private readonly o: FeedOptions;
   private readonly hadTargets: boolean;
   private nextPoll = 0;
+  // Whether the server ended a repository-wide watch, for the footer.
+  repoEnded = false;
 
   constructor(inbox: Inbox, server: ServerReader | null, o: FeedOptions) {
     this.inbox = inbox;
@@ -47,7 +49,9 @@ export class Feed {
     for (const source of this.server ? [this.server, this.inbox] : [this.inbox]) {
       const pending = source.pending();
       if (source === this.server) {
-        for (const e of pending) if (e.sub && e.kind.startsWith("watch.")) this.inbox.subscriptionEnded(e.sub, e.kind);
+        for (const e of pending) {
+          if (e.sub && e.kind.startsWith("watch.") && this.inbox.subscriptionEnded(e.sub, e.kind) === "repo") this.repoEnded = true;
+        }
       }
       const keep = pending.filter((e) => matchesKind(kinds, e.kind));
       const skip = pending.filter((e) => !matchesKind(kinds, e.kind));

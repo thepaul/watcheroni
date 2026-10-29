@@ -143,8 +143,14 @@ async function main(argv: string[]): Promise<number> {
     for (const t of repoTargets) {
       const gone = inbox.unwatchRepo(t.owner, t.name);
       if (!gone.length) log(`${t.owner}/${t.name} wasn't being watched as a whole in inbox ${inboxName}`);
+      if (!client) {
+        for (const r of gone) {
+          log(`stopped watching ${repoKey(r.target)} here, but with no server configured its subscription there wasn't ended; it ends after a week nobody reads inbox ${inboxName}`);
+        }
+        continue;
+      }
       for (const r of gone) {
-        await client?.request("DELETE", `/v1/inboxes/${inboxName}/subscriptions/${r.sub}`).catch((e: unknown) => {
+        await client.request("DELETE", `/v1/inboxes/${inboxName}/subscriptions/${r.sub}`).catch((e: unknown) => {
           if (!(e instanceof ServerError && e.status === 404)) log(`couldn't end the server's watch on ${repoKey(r.target)}: ${(e as Error).message}`);
         });
       }
@@ -269,12 +275,12 @@ async function waitCommand(
       }
       const events = items.map((i) => i.event);
       const still = feed.watching();
-      process.stdout.write(o.json ? `${JSON.stringify({ events, watching: still })}\n` : `${formatText(events, still, reading())}\n`);
+      process.stdout.write(o.json ? `${JSON.stringify({ events, watching: still })}\n` : `${formatText(events, still, reading(), feed.repoEnded)}\n`);
       feed.ack(items);
       return feed.ended() ? EXIT.ended : EXIT.events;
     }
     if (feed.ended()) {
-      process.stdout.write(o.json ? `${JSON.stringify({ events: [], watching: [] })}\n` : `${footer([])}\n`);
+      process.stdout.write(o.json ? `${JSON.stringify({ events: [], watching: [] })}\n` : `${footer([], undefined, feed.repoEnded)}\n`);
       return EXIT.ended;
     }
     const left = deadline - Date.now();
