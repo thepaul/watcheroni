@@ -62,9 +62,9 @@ describe("wait against a server", () => {
     expect(run.stdout()).toBe([
       "octo/widgets#7: 2 new events",
       "- review.submitted: approved",
-      "  gh api repos/octo/widgets/pulls/7/reviews/5",
+      "  gh api repos/octo/widgets/pulls/7/reviews/5 --jq '.state, .body'",
       "- comment.created",
-      "  gh api repos/octo/widgets/issues/comments/9",
+      "  gh api repos/octo/widgets/issues/comments/9 --jq .body",
       "",
       "Still reading inbox box. Run `watcheroni wait` again to keep watching.",
       "",
@@ -93,6 +93,30 @@ describe("wait against a server", () => {
     expect(await run.code).toBe(0);
     expect((JSON.parse(run.stdout()) as { events: { seq: number }[] }).events.map((e) => e.seq)).toEqual([2]);
     expect(fake.inbox("box").acked).toBe(2);
+  });
+
+  it("shows a reply once, but its review to a review.* filter", async () => {
+    const reply = () => {
+      fake.inject("box", "review.submitted", { review_id: 5, state: "commented", has_body: false });
+      fake.inject("box", "review_comment.created", { comment_id: 6, review_id: 5, path: "a.ts", line: 3, in_reply_to: 4 });
+    };
+    reply();
+    let run = cli(["wait", "--settle", "0"]);
+    expect(await run.code).toBe(0);
+    expect(run.stdout().split("\n").slice(0, 3)).toEqual([
+      "octo/widgets#7: 2 new events",
+      "- review_comment.created on a.ts:3 (a reply)",
+      "  gh api repos/octo/widgets/pulls/comments/6 --jq .body",
+    ]);
+    // Filtering on review.* leaves the reply out, so its review shows.
+    reply();
+    run = cli(["wait", "--settle", "0", "--kinds", "review.*"]);
+    expect(await run.code).toBe(0);
+    expect(run.stdout().split("\n").slice(0, 3)).toEqual([
+      "octo/widgets#7: 1 new event",
+      "- review.submitted: commented",
+      "  gh api repos/octo/widgets/pulls/7/reviews/5 --jq '.state, .body'",
+    ]);
   });
 
   it("subscribes its targets on the server, and stops watching when the server ends the watch", async () => {

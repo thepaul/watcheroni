@@ -461,16 +461,26 @@ changing the protocol version.
 
 | Kind | `data` |
 |---|---|
-| `review.submitted` | `review_id`, `state` (`approved`, `changes_requested`, `commented`) |
+| `review.submitted` | `review_id`, `state` (`approved`, `changes_requested`, `commented`), `has_body` |
 | `review.dismissed` | `review_id` |
 | `review_comment.created` | `comment_id`, `review_id`, `path`, `line`, `in_reply_to` |
-| `thread.resolved` | `thread_node_id` |
-| `thread.unresolved` | `thread_node_id` |
+| `thread.resolved` | `thread_node_id`, `path`, `line`, `comment_id` (the thread's first comment) |
+| `thread.unresolved` | `thread_node_id`, `path`, `line`, `comment_id` |
 | `comment.created` | `comment_id` |
 
 A review with several comments produces one `review.submitted` and one
 `review_comment.created` per comment. Clients that wake an agent SHOULD
 debounce, since these arrive together.
+
+GitHub makes every reply in a review thread a `commented` review with
+no text (`has_body: false`) holding the reply, so a reply arrives as a
+`review.submitted` and a `review_comment.created`. Both are sent, so a
+`review.*` filter still sees every review; clients that show events to
+people or agents MAY show only the replies when both are at hand.
+
+A review comment's or thread's `line` is its original line once the code
+under it has changed (`null` for a comment on the whole file). Fetch a
+thread's first comment to see what the thread is about.
 
 **Checks** (from `check_run`, `check_suite`, `status`, `workflow_run`):
 

@@ -1,11 +1,55 @@
-# watcheroni (CLI)
+# watcheroni
 
-The `watcheroni` command from [DESIGN.md](../../DESIGN.md). With a
-watcheroni server configured it reads an inbox on the server (server
-mode); without one it polls GitHub directly with your `gh` login (or
-`GH_TOKEN` / `GITHUB_TOKEN`), and the token stays on this machine (local
-mode). Output, event kinds and exit codes are the same in both, so
-scripts and agents work with either.
+Wait for, stream, or act on what happens to your GitHub pull requests:
+CI finishing or failing, reviews, comments, pushes, merges. It's built
+for scripts and coding agents that open a PR and then need to know when
+there's something to do about it, without polling GitHub in a loop.
+
+```
+$ npx watcheroni wait
+octo/widgets#123: 2 new events
+- check.failed: "test (ubuntu-latest)" (failure) on 4f9c2e1
+  gh run view 18342210911 -R octo/widgets --log-failed
+- review.submitted by mona: changes_requested
+  gh api repos/octo/widgets/pulls/123/reviews/3374120415 --jq '.state, .body'
+
+octo/widgets#123 is still open. Run `watcheroni wait` again to keep watching.
+```
+
+Requires Node.js 22 or later.
+
+## Getting started
+
+1. **Install the GitHub App** on the repositories you want to watch:
+   <https://github.com/apps/watcheroni/installations/new>. It asks for
+   read-only access to pull requests, checks and their metadata, and
+   sends their webhooks to the watcheroni server at
+   <https://watcheroni.dev>.
+2. **Sign in** from your machine. This runs GitHub's device flow (a code
+   to enter at github.com) and saves an API key for the server:
+
+   ```
+   npx watcheroni login
+   ```
+3. **Wait** for something to happen to the PR for your current branch
+   (or name one: `npx watcheroni wait octo/widgets#123`):
+
+   ```
+   npx watcheroni wait
+   ```
+
+   It exits once there's news, printing each event with the command that
+   fetches its details, so run it again to keep watching.
+
+To skip npx's registry check on every run, install it:
+`npm install -g watcheroni`.
+
+**No App, no server?** Everything also works without signing in: the CLI
+then polls GitHub itself every 2 minutes with your `gh` login (or
+`GH_TOKEN` / `GITHUB_TOKEN`), and that token never leaves your machine.
+See "Local mode" below.
+
+## Commands
 
 ```
 watcheroni wait   [target...] [--timeout 1h] [--settle 20s] [--format text|json]
@@ -116,7 +160,7 @@ and polls the named PRs from this machine, subscribed or not, while it
 keeps trying to reconnect. A `wait` with nothing to poll locally exits 1 instead of
 waiting on a server that's down; `stream` and `exec` keep retrying.
 
-## How local mode works
+## Local mode
 
 Each poll is one GraphQL query per PR (cost: 1 point of GitHub's 5,000 an
 hour). The CLI compares it with the last snapshot and turns the
@@ -137,7 +181,17 @@ that undo each other (a thread resolved and then unresolved within one
 interval), more than the last 100 reviews, threads or comments, and
 repository-wide targets.
 
+## More
+
+How it's built, and the API other clients can use:
+[DESIGN.md](https://github.com/thepaul/watcheroni/blob/main/DESIGN.md),
+[PROTOCOL.md](https://github.com/thepaul/watcheroni/blob/main/PROTOCOL.md)
+(and its types, [`@watcheroni/protocol`](https://www.npmjs.com/package/@watcheroni/protocol)).
+Issues: <https://github.com/thepaul/watcheroni/issues>. MIT licensed.
+
 ## Develop
+
+From a clone of the repository, in `packages/cli`:
 
 ```
 npm test                 # Vitest, no network; server mode runs against a fake server (test/fake-server.ts)

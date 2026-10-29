@@ -2,7 +2,10 @@ import type { WatchEvent } from "@watcheroni/protocol";
 
 // `wait`'s text output, written so an agent can act on it without reading
 // docs. Each line ends with the command that fetches the content, since
-// events carry pointers, not text.
+// events carry pointers, not text; its `--jq` keeps just the text an agent
+// needs.
+
+const BODY = "--jq .body";
 
 // `reading` names a server inbox that is still being read although no PR
 // is known to be watched (see Feed.ended).
@@ -47,10 +50,17 @@ function describeAll(events: WatchEvent[]): string[] {
       if (shownReviews.has(reviewId)) continue;
       shownReviews.add(reviewId);
       const comments = byReview.get(reviewId)!;
-      const where = comments.map((c) => (c.data.path ? `${c.data.path}${c.data.line ? `:${c.data.line}` : ""}` : "?"));
+      const where = comments.map((c) => location(c.data) || "?");
       lines.push(`- ${comments.length} review comments${by(e)} on ${where.join(", ")}`);
-      lines.push(`  gh api ${repoPath(e)}/pulls/${e.pr}/reviews/${reviewId}/comments`);
+      // The review's own comments endpoint leaves out the lines.
+      lines.push(`  gh api ${repoPath(e)}/pulls/${e.pr}/comments --paginate --jq '.[] | select(.pull_request_review_id == ${reviewId}) | "\\(.path)\\(.line // .original_line | if . then ":\\(.)" else "" end) \\(.body)"'`);
       continue;
+    }
+    // GitHub makes a reply in a thread a "commented" review with no text
+    // holding the reply. When the replies are here too, they say it all.
+    if (e.kind === "review.submitted" && reviewId !== null && e.data.state === "commented" && e.data.has_body === false) {
+      const comments = byReview.get(reviewId) ?? [];
+      if (comments.length && comments.every((c) => c.data.in_reply_to)) continue;
     }
     const [text, command] = describe(e);
     lines.push(`- ${text}`);
@@ -65,19 +75,22 @@ function describe(e: WatchEvent): [string, string | null] {
   const short = (sha: unknown) => (typeof sha === "string" ? sha.slice(0, 7) : "?");
   switch (e.kind) {
     case "review.submitted":
-      return [`review.submitted${by(e)}: ${d.state}`, `gh api ${repo}/pulls/${e.pr}/reviews/${d.review_id}`];
+      return [`review.submitted${by(e)}: ${d.state}`, `gh api ${repo}/pulls/${e.pr}/reviews/${d.review_id} --jq '.state, .body'`];
     case "review.dismissed":
       return [`review.dismissed: review ${d.review_id}`, null];
     case "review_comment.created": {
-      const where = d.path ? ` on ${d.path}${d.line ? `:${d.line}` : ""}` : "";
+      const where = d.path ? ` on ${location(d)}` : "";
       const reply = d.in_reply_to ? " (a reply)" : "";
-      return [`review_comment.created${by(e)}${where}${reply}`, `gh api ${repo}/pulls/comments/${d.comment_id}`];
+      return [`review_comment.created${by(e)}${where}${reply}`, `gh api ${repo}/pulls/comments/${d.comment_id} ${BODY}`];
     }
     case "comment.created":
-      return [`comment.created${by(e)}`, `gh api ${repo}/issues/comments/${d.comment_id}`];
+      return [`comment.created${by(e)}`, `gh api ${repo}/issues/comments/${d.comment_id} ${BODY}`];
     case "thread.resolved":
-    case "thread.unresolved":
-      return [e.kind, null];
+    case "thread.unresolved": {
+      // The command shows the thread's first comment.
+      const where = d.path ? ` on ${location(d)}` : "";
+      return [`${e.kind}${by(e)}${where}`, typeof d.comment_id === "number" ? `gh api ${repo}/pulls/comments/${d.comment_id} ${BODY}` : null];
+    }
     case "check.failed": {
       const command = typeof d.workflow_run_id === "number"
         ? `gh run view ${d.workflow_run_id} -R ${e.repo?.full_name} --log-failed`
@@ -120,6 +133,11 @@ function describe(e: WatchEvent): [string, string | null] {
     default:
       return [`${e.kind}${by(e)}`, e.links.api ? `gh api ${e.links.api.replace("https://api.github.com/", "")}` : null];
   }
+}
+
+// `a.ts:3`, or `a.ts` without a line, or "" without a path.
+function location(d: WatchEvent["data"]): string {
+  return d.path ? `${d.path}${d.line ? `:${d.line}` : ""}` : "";
 }
 
 function by(e: WatchEvent): string {
