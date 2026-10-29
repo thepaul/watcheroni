@@ -42,11 +42,12 @@ describe("parseJsonc", () => {
 });
 
 describe("selfhostConfig", () => {
-  const config = selfhostConfig(WRANGLER_JSONC, "watcheroni", VARS);
+  const config = selfhostConfig(WRANGLER_JSONC, "watcheroni", VARS, "acct-1");
 
   it("is production's shape under the deployer's name, on workers.dev, with their App", () => {
     expect(config.name).toBe("watcheroni");
     expect(config.workers_dev).toBe(true);
+    expect(config.account_id).toBe("acct-1");
     expect(config.routes).toBeUndefined();
     expect(config.env).toBeUndefined();
     expect(config.vars).toEqual(VARS);
@@ -60,7 +61,7 @@ describe("selfhostConfig", () => {
 
   it("round-trips the App's vars, and has none before the App exists", () => {
     expect(savedVars(config)).toEqual(VARS);
-    expect(savedVars(selfhostConfig(WRANGLER_JSONC, "w", NO_APP))).toBeNull();
+    expect(savedVars(selfhostConfig(WRANGLER_JSONC, "w", NO_APP, "acct-1"))).toBeNull();
     expect(savedVars(null)).toBeNull();
   });
 });

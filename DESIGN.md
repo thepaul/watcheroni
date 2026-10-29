@@ -1034,46 +1034,62 @@ It runs on the deployer's own Cloudflare account, free plan included.
 
 *As built:* the work is a script with the server,
 `packages/server/selfhost/selfhost.ts`, run by `npm run selfhost` at the
-root; the CLI's `watcheroni selfhost` finds it in the clone it's run in
-and runs it, and outside a clone says to clone. Not a CLI command proper,
-because it deploys the server's source with the server's own `wrangler`:
-it needs a clone whatever runs it, and putting it in the CLI would mean
-publishing `wrangler` or the server with a package that is otherwise one
-dependency-free file. In order, it:
+root through `selfhost/run.mjs`, which first checks for Node.js 22.18 or
+later (it runs the TypeScript directly). The CLI's `watcheroni selfhost`
+finds `run.mjs` in the clone it's run in and runs it, and outside a clone
+says to clone. Not a CLI command proper, because it deploys the server's
+source with the server's own `wrangler`: it needs a clone whatever runs
+it, and putting it in the CLI would mean publishing `wrangler` or the
+server with a package that is otherwise one dependency-free file. In
+order, it:
 
-1. checks `wrangler whoami`, and runs `wrangler login` if needed;
-2. refuses if a Worker of that name (`--name`, default `watcheroni`)
-   already exists on the account, so it can't deploy over a real server;
-3. deploys once with empty GitHub vars, to learn the Worker's workers.dev
+1. checks `wrangler whoami --json`, and runs `wrangler login` if needed;
+2. pins one Cloudflare account: the only one, or `CLOUDFLARE_ACCOUNT_ID`
+   when there are several. Every later wrangler call gets it, and so does
+   the configuration (`account_id`), so the check below and the deploys
+   can't land on different accounts;
+3. refuses if a Worker of that name (`--name`, default `watcheroni`)
+   already exists on the account, so it can't deploy over a real server.
+   Once that check passes it writes `.selfhost-app.json` (mode 0600,
+   gitignored) with the Worker's name and account; that file is the only
+   thing that lets a later run skip the check;
+4. deploys once with empty GitHub vars, to learn the Worker's workers.dev
    URL, which the App's URLs need;
-4. serves a page on `127.0.0.1` that posts the manifest to GitHub
-   (`--org` for an organization's App; private unless `--public`;
+5. serves a page on `127.0.0.1` (answering only requests whose `Host` is
+   `127.0.0.1:<port>`, against DNS rebinding) that posts the manifest to
+   GitHub (`--org` for an organization's App; private unless `--public`;
    named `watcheroni-<workers.dev subdomain>` unless `--app-name`), and
    exchanges the code GitHub redirects back with at
-   `POST /app-manifests/{code}/conversions`;
-5. sets the five secrets with `wrangler secret put`, values on stdin;
-6. deploys with `GITHUB_APP_ID`, `GITHUB_CLIENT_ID` and `GITHUB_APP_SLUG`;
-7. has the user tick "Enable Device Flow" on the App's settings page,
+   `POST /app-manifests/{code}/conversions`. The code works once, so if
+   the exchange fails it says to delete the App GitHub made and start
+   again. The App's details and generated keys go into
+   `.selfhost-app.json` straight away, since GitHub shows the key once;
+6. sets the five secrets with `wrangler secret put`, values on stdin;
+7. deploys with `GITHUB_APP_ID`, `GITHUB_CLIENT_ID` and `GITHUB_APP_SLUG`;
+8. has the user tick "Enable Device Flow" on the App's settings page,
    since a manifest can't, and checks it by starting a device flow until
    GitHub stops answering `device_flow_disabled`;
-8. checks `/v1/meta` reports the new client ID, and sets `server` in
-   `~/.config/watcheroni/config.json`.
+9. deletes `.selfhost-app.json`, checks `/v1/meta` reports the new client
+   ID, and sets `server` in `~/.config/watcheroni/config.json`.
+
+A run that stops part way carries on from `.selfhost-app.json` with its
+Worker, account and App. Later runs keep to the Worker and account the
+first one chose (from that file, or from the configuration once setup
+has finished): a different `--name` or `CLOUDFLARE_ACCOUNT_ID` is
+refused, as is a state file that doesn't name its Worker and account.
 
 The Worker's configuration is `packages/server/wrangler.selfhost.json`,
 gitignored, made from `wrangler.jsonc`'s production environment (its
-bindings and crons) under the deployer's name, on workers.dev, with
-their App's vars. It's remade on every run, so `npm run selfhost --
---update` after a pull picks up new bindings, migrations and crons and
-deploys. GitHub shows the private key once, so the App's details and
-generated keys are saved in `.selfhost-app.json` (mode 0600,
-gitignored) as soon as the App exists, and a run that stopped part way
-carries on with them; the file is deleted once setup finishes.
-`--dry-run` prints each command, the configuration and the manifest,
-and changes nothing. Its tests (`packages/server/selfhost/test`) run in
-Node with Cloudflare and GitHub stubbed, including the local callback
-server; a real run against a fresh Cloudflare account hasn't been done
-yet. A custom domain is by hand: add a route to the configuration and
-change the App's webhook and Setup URLs.
+bindings and crons) under the deployer's name and account, on
+workers.dev, with their App's vars. It's remade on every run, so `npm
+run selfhost -- --update` after a pull picks up new bindings, migrations
+and crons and deploys. `--dry-run` prints each command, the
+configuration and the manifest, and changes nothing. Its tests
+(`packages/server/selfhost/test`) run in Node with Cloudflare and GitHub
+stubbed, including the local callback server; a real run against a
+fresh Cloudflare account hasn't been done yet. A custom domain is by
+hand: add a route to the configuration and change the App's webhook and
+Setup URLs.
 
 ## Testing
 

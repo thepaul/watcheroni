@@ -88,6 +88,10 @@ CLI at the new server. Then install the App on your repositories (it
 prints the link), and `npx watcheroni login` and `npx watcheroni wait`.
 Anyone else using your server sets `WATCHERONI_SERVER` to its URL.
 
+It needs Node.js 22.18 or later. With several Cloudflare accounts, set
+`CLOUDFLARE_ACCOUNT_ID` to choose one; the account is written into the
+configuration, and later runs keep to it.
+
 It's a script here rather than part of the published CLI because it
 deploys this source with this package's wrangler, so it needs a clone
 anyway; `watcheroni selfhost` just runs it from the clone you're in.
@@ -97,10 +101,15 @@ made from `wrangler.jsonc`'s production settings with your name and
 App. After a `git pull`, redeploy with `npm run selfhost -- --update`,
 which remakes it. Other wrangler commands take `-c
 wrangler.selfhost.json`, e.g. `npx wrangler tail -c
-wrangler.selfhost.json`. If a run stops part way, run it again: the App
-it created is kept in `.selfhost-app.json` (mode 0600, gitignored, and
-deleted once setup finishes), so it carries on without making another.
-It won't deploy over a Worker that already exists on your account.
+wrangler.selfhost.json`. If a run stops part way, run it again: the
+Worker's name and account, and then the App it created, are kept in
+`.selfhost-app.json` (mode 0600, gitignored, and deleted once setup
+finishes), so it carries on with the same Worker and without making
+another App. It won't deploy over a Worker that already exists on your
+account unless that file says selfhost made it, and later runs refuse a
+different `--name`. If GitHub creates the App but the next step fails,
+the App's key can't be fetched again: delete the App (it says where)
+and run it again.
 
 ## Confirm hibernation on Cloudflare
 

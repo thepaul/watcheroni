@@ -69,7 +69,9 @@ No authentication. Returns everything a client needs to start:
 
 Clients MUST ignore fields and features they don't recognise. A server
 with no GitHub App configured leaves out `github` and doesn't offer
-sign-in.
+sign-in. `github.app_slug` and `github.install_url` are present only when
+the server knows its App's slug (each copy of the server, self-hosted
+ones included, has its own App); clients MUST cope without them.
 
 ## Authentication
 
@@ -216,7 +218,7 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
 The server checks, in order:
 
 1. The App is installed on the repo. If not: `409 app_not_installed`,
-   with `install_url`. Clients SHOULD fall back to polling GitHub
+   with `install_url` when the server knows its App's slug. Clients SHOULD fall back to polling GitHub
    themselves (see "Clients without the server" below).
 2. For a **private** repo: `X-GitHub-Token` is present, was issued to this
    App for the same GitHub user as the API key, and can read the repo.
@@ -537,7 +539,7 @@ Errors use `application/problem+json`
 | 401 | `github_token_invalid` | Token not issued to this App, expired, or for a different user. |
 | 403 | `repo_access_denied` | The user can't read the repo. |
 | 404 | `not_found` | No such repo, PR, inbox or subscription. |
-| 409 | `app_not_installed` | Includes `install_url`. |
+| 409 | `app_not_installed` | Includes `install_url` when the server knows its App's slug. |
 | 409 | `pr_not_open` | Subscribing to a merged or closed PR. |
 | 422 | `quota_exceeded` | Too many inboxes or subscriptions; `detail` says which. |
 | 429 | `rate_limited` | Includes `Retry-After`. |

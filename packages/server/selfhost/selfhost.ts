@@ -1,10 +1,9 @@
-#!/usr/bin/env node
-// `npm run selfhost` (or `watcheroni selfhost` in a clone): runs your own
-// watcheroni server on your own Cloudflare account, with your own GitHub
-// App. See "Self-hosting" in DESIGN.md and packages/server/README.md.
+// `npm run selfhost` (or `watcheroni selfhost` in a clone), through
+// run.mjs: runs your own watcheroni server on your own Cloudflare account,
+// with your own GitHub App. See "Self-hosting" in DESIGN.md and packages/server/README.md.
 //
-//   1. checks `wrangler login`;
-//   2. deploys the Worker once without an App, to learn its workers.dev URL;
+//   1. checks `wrangler login`, and pins one Cloudflare account;
+//   2. after checking no Worker of that name exists, deploys the Worker once without an App, to learn its workers.dev URL;
 //   3. creates the GitHub App with GitHub's manifest flow, for that URL;
 //   4. converts the App's key to PKCS#8, generates TICKET_KEY and
 //      STORAGE_KEY, and sets every secret with `wrangler secret put`;
@@ -14,9 +13,10 @@
 //
 // The Worker's configuration is wrangler.selfhost.json, made from
 // wrangler.jsonc (gitignored, so `git pull` never conflicts with it);
-// `npm run selfhost -- --update` remakes it and redeploys. An App created
-// by a run that didn't finish is kept in .selfhost-app.json (mode 0600,
-// gitignored), and the next run carries on with it.
+// `npm run selfhost -- --update` remakes it and redeploys. The Worker's
+// name and Cloudflare account, and then the App, are kept in
+// .selfhost-app.json (mode 0600, gitignored) until setup finishes, and
+// the next run carries on with them.
 
 import { spawn } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
@@ -34,6 +34,7 @@ import {
   createApp,
   deviceFlowEnabled,
   GITHUB_WEB_URL,
+  ManifestFailed,
 } from "./manifest.ts";
 import {
   NO_APP,
@@ -50,25 +51,40 @@ export const SERVER_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const CONFIG_FILE = "wrangler.selfhost.json";
 export const PENDING_FILE = ".selfhost-app.json";
 
+export const DEFAULT_NAME = "watcheroni";
+
 export interface Options {
-  name: string;
+  // The Worker's name; undefined if --name wasn't given.
+  name?: string;
   org?: string;
   appName?: string;
   public: boolean;
   update: boolean;
+  // CLOUDFLARE_ACCOUNT_ID, which picks the account when there are several.
+  accountId?: string;
 }
 
-// An App created by a run that didn't finish, with the keys made for it.
-interface Pending {
-  app: NewApp;
-  ticket_key: string;
-  storage_key: string;
+// .selfhost-app.json: written once the check that no Worker of this name
+// exists has passed, before the first deploy, so a later run knows the
+// Worker there is the one selfhost made. The App and its keys join it
+// once GitHub has made the App, since GitHub shows the key only once.
+interface State {
+  name: string;
+  account_id: string;
+  app?: NewApp;
+  ticket_key?: string;
+  storage_key?: string;
 }
 
 export interface Deps {
-  // Runs wrangler in packages/server. With `input`, it's the command's
-  // stdin; `interactive` hands it the terminal. The output is also shown.
-  wrangler: (args: string[], o?: { input?: string; interactive?: boolean }) => Promise<{ code: number; output: string }>;
+  // Runs wrangler in packages/server, on `accountId`'s account if given.
+  // With `input`, it's the command's stdin; `interactive` hands it the
+  // terminal; `quiet` doesn't show the output. `output` is stdout and
+  // stderr together, `stdout` just stdout.
+  wrangler: (
+    args: string[],
+    o?: { input?: string; interactive?: boolean; quiet?: boolean; accountId?: string },
+  ) => Promise<{ code: number; output: string; stdout?: string }>;
   createApp: (manifestFor: (redirectUrl: string) => AppManifest, org: string | undefined) => Promise<NewApp>;
   deviceFlowEnabled: (clientId: string) => Promise<boolean>;
   // Waits for the person to press Enter.
@@ -85,18 +101,74 @@ export interface Deps {
 
 export class SelfhostFailed extends Error {}
 
+interface Whoami {
+  loggedIn?: boolean;
+  accounts?: { id: string; name: string }[];
+}
+
+async function whoami(deps: Deps): Promise<Whoami> {
+  const { stdout } = await deps.wrangler(["whoami", "--json"], { quiet: true });
+  try {
+    return JSON.parse(stdout ?? "") as Whoami;
+  } catch {
+    return { loggedIn: false };
+  }
+}
+
+// The Cloudflare account everything happens on, so the check for an
+// existing Worker and the deploys can't land on different ones.
+function pickAccount(who: Whoami, wanted: string | undefined): string {
+  const accounts = who.accounts ?? [];
+  const list = accounts.map((a) => `${a.id} (${a.name})`).join(", ");
+  if (wanted) {
+    if (!accounts.some((a) => a.id === wanted)) throw new SelfhostFailed(`CLOUDFLARE_ACCOUNT_ID ${wanted} isn't one of your accounts: ${list}`);
+    return wanted;
+  }
+  if (accounts.length === 1) return accounts[0].id;
+  if (!accounts.length) throw new SelfhostFailed("wrangler doesn't list any Cloudflare accounts for this login");
+  throw new SelfhostFailed(`you have several Cloudflare accounts; set CLOUDFLARE_ACCOUNT_ID to one of: ${list}`);
+}
+
 export async function selfhost(o: Options, deps: Deps): Promise<string> {
-  const { print, wrangler } = deps;
+  const { print } = deps;
   const wranglerJsonc = deps.readFile("wrangler.jsonc");
   if (!wranglerJsonc) throw new SelfhostFailed("run this in packages/server of a watcheroni clone");
-  const existing = deps.readFile(CONFIG_FILE);
-  const saved = existing ? savedVars(JSON.parse(existing)) : null;
-  const pendingText = deps.readFile(PENDING_FILE);
-  const pending = pendingText ? (JSON.parse(pendingText) as Pending) : null;
-  const name = existing ? String((JSON.parse(existing) as { name?: string }).name ?? o.name) : o.name;
+  const configText = deps.readFile(CONFIG_FILE);
+  const config = configText ? (JSON.parse(configText) as { name?: string; account_id?: string }) : null;
+  const saved = config ? savedVars(config) : null;
+  const stateText = deps.readFile(PENDING_FILE);
+  const pending = stateText ? (JSON.parse(stateText) as State) : null;
+  if (pending && (!pending.name || !pending.account_id)) {
+    throw new SelfhostFailed(`${PENDING_FILE} doesn't say which Worker and account it's for; it isn't safe to carry on from it`);
+  }
+
+  // Which Worker. Once a run has chosen, later ones keep to it.
+  const name = pending?.name ?? config?.name ?? o.name ?? DEFAULT_NAME;
+  const chosenBy = pending ? PENDING_FILE : CONFIG_FILE;
+  if (pending && config && config.name !== pending.name) {
+    throw new SelfhostFailed(`${PENDING_FILE} is for the Worker ${pending.name} but ${CONFIG_FILE} is for ${config.name}; remove the one that's wrong`);
+  }
+  if ((pending || config) && o.name && o.name !== name) {
+    throw new SelfhostFailed(`${chosenBy} is for the Worker ${name}, not ${o.name}; leave out --name, or remove ${chosenBy} to start again`);
+  }
+
+  // 1. Cloudflare.
+  print("Checking you're signed in to Cloudflare (wrangler whoami)...");
+  let who = await whoami(deps);
+  if (!who.loggedIn) {
+    print("Signing in to Cloudflare (wrangler login)...");
+    await deps.wrangler(["login"], { interactive: true });
+    who = await whoami(deps);
+    if (!who.loggedIn) throw new SelfhostFailed("still not signed in to Cloudflare");
+  }
+  const accountId = pickAccount(who, o.accountId ?? pending?.account_id ?? config?.account_id);
+  for (const [file, id] of [[PENDING_FILE, pending?.account_id], [CONFIG_FILE, config?.account_id]]) {
+    if (id && id !== accountId) throw new SelfhostFailed(`${file} is for Cloudflare account ${id}, not ${accountId}`);
+  }
+  const wrangler: Deps["wrangler"] = (args, opts) => deps.wrangler(args, { ...opts, accountId });
 
   const writeConfig = (vars: WorkerVars) =>
-    deps.writeFile(CONFIG_FILE, `${JSON.stringify(selfhostConfig(wranglerJsonc, name, vars), null, 2)}\n`);
+    deps.writeFile(CONFIG_FILE, `${JSON.stringify(selfhostConfig(wranglerJsonc, name, vars, accountId), null, 2)}\n`);
   const deploy = async () => {
     const { code, output } = await wrangler(["deploy", "-c", CONFIG_FILE]);
     if (code !== 0) throw new SelfhostFailed(`wrangler deploy failed (exit ${code})`);
@@ -109,14 +181,6 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     }
     return url;
   };
-
-  // 1. Cloudflare.
-  print("Checking you're signed in to Cloudflare (wrangler whoami)...");
-  if (/not authenticated/i.test((await wrangler(["whoami"])).output)) {
-    print("Signing in to Cloudflare (wrangler login)...");
-    await wrangler(["login"], { interactive: true });
-    if (/not authenticated/i.test((await wrangler(["whoami"])).output)) throw new SelfhostFailed("still not signed in to Cloudflare");
-  }
 
   if (o.update) {
     if (!saved) throw new SelfhostFailed(`there's no finished setup to update (${CONFIG_FILE}); run selfhost without --update first`);
@@ -134,21 +198,29 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
   }
 
   // 2. A first deploy, without an App, for the URL. Never over a Worker
-  // that's already there: it might be someone's real server.
-  if (!existing && !pending) {
-    const { code, output } = await wrangler(["deployments", "list", "--name", name, "--json"]);
+  // that's already there, which might be someone's real server, unless
+  // the state file says this setup made it.
+  let state: State;
+  if (pending) {
+    state = pending;
+  } else {
+    const { code, output } = await wrangler(["deployments", "list", "--name", name, "--json"], { quiet: true });
     if (code === 0) {
-      throw new SelfhostFailed(`a Worker called ${name} already exists on this Cloudflare account; choose another with --name`);
+      throw new SelfhostFailed(
+        `a Worker called ${name} already exists on Cloudflare account ${accountId}; choose another with --name` +
+          (config ? ` and delete ${CONFIG_FILE}` : ""),
+      );
     }
     if (!/\b10007\b/.test(output)) throw new SelfhostFailed(`couldn't check whether a Worker called ${name} exists`);
+    state = { name, account_id: accountId };
+    deps.writeFile(PENDING_FILE, JSON.stringify(state, null, 2), true);
   }
   print(`Deploying the Worker ${name}, so it has a URL for the App...`);
-  writeConfig(pending ? appVars(pending.app) : NO_APP);
+  writeConfig(state.app ? appVars(state.app) : NO_APP);
   const url = await deploy();
 
   // 3. The GitHub App.
-  let state = pending;
-  if (state) {
+  if (state.app && state.ticket_key && state.storage_key) {
     print(`Carrying on with the GitHub App ${state.app.name} from the last run (${PENDING_FILE}).`);
   } else {
     const appName = o.appName ?? defaultAppName(url);
@@ -156,20 +228,20 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     print(`Creating the GitHub App. In the browser, check the name (${appName} unless you change it;`);
     print("App names are unique across GitHub) and click \"Create GitHub App\".");
     const app = await deps.createApp((redirectUrl) => ({ ...appManifest({ server: url, appName, public: o.public }), redirect_url: redirectUrl }), o.org);
-    state = { app, ticket_key: newKey(), storage_key: newKey() };
+    state = { ...state, app, ticket_key: newKey(), storage_key: newKey() };
     // Before anything else can fail: GitHub shows the key only once.
     deps.writeFile(PENDING_FILE, JSON.stringify(state, null, 2), true);
     print(`Created ${app.html_url}.`);
   }
-  const { app } = state;
+  const app = state.app!;
 
   // 4. Secrets. Values go to wrangler on stdin, never on a command line.
   const secrets: [string, string][] = [
     ["GITHUB_APP_PRIVATE_KEY", toPkcs8(app.pem)],
     ["GITHUB_CLIENT_SECRET", app.client_secret],
     ["GITHUB_WEBHOOK_SECRET", app.webhook_secret],
-    ["TICKET_KEY", state.ticket_key],
-    ["STORAGE_KEY", state.storage_key],
+    ["TICKET_KEY", state.ticket_key!],
+    ["STORAGE_KEY", state.storage_key!],
   ];
   for (const [secret, value] of secrets) {
     print(`Setting ${secret}...`);
@@ -240,7 +312,12 @@ export function dryRunDeps(real: Pick<Deps, "readFile" | "print">): Deps {
     readFile: real.readFile,
     print,
     wrangler: async (args, o) => {
-      print(`  [dry run] wrangler ${args.join(" ")}${o?.input !== undefined ? " < (the value, on stdin)" : ""}`);
+      const account = o?.accountId ? `CLOUDFLARE_ACCOUNT_ID=${o.accountId} ` : "";
+      print(`  [dry run] ${account}wrangler ${args.join(" ")}${o?.input !== undefined ? " < (the value, on stdin)" : ""}`);
+      if (args[0] === "whoami") {
+        const stdout = JSON.stringify({ loggedIn: true, accounts: [{ id: "your-account-id", name: "your account" }] });
+        return { code: 0, output: stdout, stdout };
+      }
       if (args[0] === "deployments") return { code: 1, output: "This Worker does not exist on your account. [code: 10007]" };
       if (args[0] === "deploy") return { code: 0, output: `https://${configName}.your-subdomain.workers.dev` };
       return { code: 0, output: "" };
@@ -257,7 +334,7 @@ export function dryRunDeps(real: Pick<Deps, "readFile" | "print">): Deps {
     pause: async () => {},
     writeFile: (name, text, secret) => {
       if (name === CONFIG_FILE) configName = (JSON.parse(text) as { name: string }).name;
-      if (secret) return print(`  [dry run] would save the new App's details in ${name} (mode 0600) until setup finishes`);
+      if (secret) return print(`  [dry run] would save the Worker's name and account${text.includes('"app"') ? ", and the new App's details," : ""} in ${name} (mode 0600) until setup finishes`);
       print(`  [dry run] would write ${name}:`);
       for (const line of text.trimEnd().split("\n")) print(`    ${line}`);
     },
@@ -284,18 +361,21 @@ function realDeps(): Deps {
       new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [wranglerBin, ...args], {
           cwd: SERVER_DIR,
+          env: o.accountId ? { ...process.env, CLOUDFLARE_ACCOUNT_ID: o.accountId } : process.env,
           stdio: o.interactive ? "inherit" : [o.input === undefined ? "inherit" : "pipe", "pipe", "pipe"],
         });
         let output = "";
-        const tee = (to: NodeJS.WriteStream) => (chunk: Buffer) => {
+        let stdout = "";
+        const tee = (to: NodeJS.WriteStream, isStdout: boolean) => (chunk: Buffer) => {
           output += chunk.toString();
-          to.write(chunk);
+          if (isStdout) stdout += chunk.toString();
+          if (!o.quiet) to.write(chunk);
         };
-        child.stdout?.on("data", tee(process.stdout));
-        child.stderr?.on("data", tee(process.stderr));
+        child.stdout?.on("data", tee(process.stdout, true));
+        child.stderr?.on("data", tee(process.stderr, false));
         child.stdin?.end(o.input);
         child.on("error", reject);
-        child.on("close", (code) => resolve({ code: code ?? 1, output }));
+        child.on("close", (code) => resolve({ code: code ?? 1, output, stdout }));
       }),
     createApp: (manifestFor, org) =>
       createApp(manifestFor, org, {
@@ -348,7 +428,8 @@ is enough), with your own GitHub App, and points the CLI at it.
 
 Options:
   --name NAME       the Worker's name (default watcheroni), which is also
-                    the first part of its workers.dev URL
+                    the first part of its workers.dev URL. Later runs keep
+                    to the name the first one chose.
   --org ORG         create the GitHub App for this organization, not your
                     own account
   --app-name NAME   the App's name on GitHub (default watcheroni-<your
@@ -357,13 +438,17 @@ Options:
   --update          after a git pull: remake wrangler.selfhost.json from
                     wrangler.jsonc and deploy
   --dry-run         say what it would do, changing nothing
+
+With several Cloudflare accounts, set CLOUDFLARE_ACCOUNT_ID to choose one.
+Needs Node.js 22.18 or later.
 `;
 
-async function main(argv: string[]): Promise<number> {
+// run.mjs runs this, after checking the Node.js version.
+export async function main(argv: string[]): Promise<number> {
   const { values } = parseArgs({
     args: argv,
     options: {
-      name: { type: "string", default: "watcheroni" },
+      name: { type: "string" },
       org: { type: "string" },
       "app-name": { type: "string" },
       public: { type: "boolean", default: false },
@@ -376,24 +461,30 @@ async function main(argv: string[]): Promise<number> {
     process.stdout.write(HELP);
     return 0;
   }
-  if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(values.name)) {
+  if (values.name !== undefined && !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(values.name)) {
     throw new SelfhostFailed("--name must be lower-case letters, digits and dashes");
   }
   const real = realDeps();
   const deps = values["dry-run"] ? dryRunDeps(real) : real;
   await selfhost(
-    { name: values.name, org: values.org, appName: values["app-name"], public: values.public, update: values.update },
+    {
+      name: values.name,
+      org: values.org,
+      appName: values["app-name"],
+      public: values.public,
+      update: values.update,
+      accountId: process.env.CLOUDFLARE_ACCOUNT_ID || undefined,
+    },
     deps,
   );
   return 0;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  main(process.argv.slice(2)).then(
-    (code) => process.exit(code),
-    (e: unknown) => {
-      console.error(`selfhost: ${e instanceof SelfhostFailed || e instanceof TypeError ? e.message : e instanceof Error ? (e.stack ?? e.message) : String(e)}`);
-      process.exit(1);
-    },
+// The errors that are explained by their message alone.
+export function expected(e: unknown): e is Error {
+  return (
+    e instanceof SelfhostFailed ||
+    e instanceof ManifestFailed ||
+    (e instanceof TypeError && String((e as { code?: unknown }).code).startsWith("ERR_PARSE_ARGS"))
   );
 }

@@ -1,3 +1,4 @@
+import { request } from "node:http";
 import { describe, expect, it } from "vitest";
 import { type NewApp, ManifestFailed, appManifest, appSettingsUrl, createApp, deviceFlowEnabled, newAppUrl } from "../manifest.ts";
 
@@ -93,13 +94,46 @@ describe("createApp", () => {
     expect(calls).toEqual([`POST ${API}/app-manifests/abc123/conversions`]);
   });
 
-  it("fails if GitHub won't convert the code", async () => {
+  it("fails if GitHub won't convert the code, saying to delete the App it made", async () => {
     const { page, result } = start(() => Response.json({ message: "Not Found" }, { status: 404 }));
     const { action, manifest } = await form(await page);
-    const failed = expect(result).rejects.toThrow(ManifestFailed);
+    const failed = expect(result).rejects.toThrow(
+      new ManifestFailed(
+        "GitHub answered 404 when asked for the new App's details. GitHub has probably created the App anyway, and its " +
+          `details can't be fetched again: delete it under ${WEB}/organizations/acme/settings/apps (Advanced, "Delete GitHub App"), ` +
+          "then run selfhost again",
+      ),
+    );
     const res = await fetch(`${manifest.redirect_url}?code=abc&state=${action.searchParams.get("state")}`);
     expect(res.status).toBe(502);
     await failed;
+  });
+
+  it("answers only requests addressed to 127.0.0.1, against DNS rebinding", async () => {
+    const { page, result, calls } = start(() => Response.json(APP, { status: 201 }));
+    const pageUrl = new URL(await page);
+    const get = (path: string, host: string) =>
+      new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = request({ host: "127.0.0.1", port: pageUrl.port, path, headers: { Host: host } }, (res) => {
+          let body = "";
+          res.on("data", (d) => (body += d));
+          res.on("end", () => resolve({ status: res.statusCode!, body }));
+        });
+        req.on("error", reject);
+        req.end();
+      });
+    for (const host of [`evil.example:${pageUrl.port}`, `localhost:${pageUrl.port}`, "127.0.0.1"]) {
+      const res = await get("/", host);
+      expect(res.status).toBe(421);
+      expect(res.body).not.toContain("state=");
+    }
+    expect((await get("/callback?code=abc&state=x", `evil.example:${pageUrl.port}`)).status).toBe(421);
+    expect(calls).toEqual([]);
+
+    // The real thing still works.
+    const { action, manifest } = await form(pageUrl.href);
+    await fetch(`${manifest.redirect_url}?code=abc&state=${action.searchParams.get("state")}`);
+    expect((await result).id).toBe(42);
   });
 });
 

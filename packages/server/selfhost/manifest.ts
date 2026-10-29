@@ -77,6 +77,11 @@ export function newAppUrl(org: string | undefined, webUrl = GITHUB_WEB_URL): str
   return org ? `${webUrl}/organizations/${encodeURIComponent(org)}/settings/apps/new` : `${webUrl}/settings/apps/new`;
 }
 
+// Where the person's (or organization's) Apps are listed.
+export function appsPageUrl(org: string | undefined, webUrl = GITHUB_WEB_URL): string {
+  return org ? `${webUrl}/organizations/${encodeURIComponent(org)}/settings/apps` : `${webUrl}/settings/apps`;
+}
+
 // The App's settings page, where device flow is turned on.
 export function appSettingsUrl(app: Pick<NewApp, "slug" | "owner">, webUrl = GITHUB_WEB_URL): string {
   return app.owner?.type === "Organization"
@@ -140,6 +145,10 @@ export function createApp(manifestFor: (redirectUrl: string) => AppManifest, org
       };
       const { port } = server.address() as AddressInfo;
       const redirectUrl = `http://127.0.0.1:${port}/callback`;
+      // Only the browser on this machine, by this address: a page that
+      // points its own hostname at 127.0.0.1 (DNS rebinding) mustn't be
+      // able to read the state off "/".
+      if (req.headers.host !== `127.0.0.1:${port}`) return send(421, donePage("Wrong address."));
 
       if (req.method === "GET" && url.pathname === "/") {
         const action = `${newAppUrl(org, webUrl)}?state=${state}`;
@@ -166,8 +175,15 @@ export function createApp(manifestFor: (redirectUrl: string) => AppManifest, org
         send(200, donePage(`Created the GitHub App ${app.name}. You can close this tab and go back to the terminal.`));
         resolve(app);
       } catch (e) {
-        send(502, donePage(`Something went wrong: ${(e as Error).message}. See the terminal.`));
-        reject(e instanceof ManifestFailed ? e : new ManifestFailed(`couldn't reach GitHub: ${(e as Error).message}`));
+        // GitHub has made the App, but the code works only once, so its
+        // key and secrets are out of reach: it has to go.
+        const why = e instanceof ManifestFailed ? e.message : `couldn't reach GitHub: ${(e as Error).message}`;
+        const failed = new ManifestFailed(
+          `${why}. GitHub has probably created the App anyway, and its details can't be fetched again: ` +
+            `delete it under ${appsPageUrl(org, webUrl)} (Advanced, "Delete GitHub App"), then run selfhost again`,
+        );
+        send(502, donePage(`${failed.message}.`));
+        reject(failed);
       } finally {
         server.close();
       }

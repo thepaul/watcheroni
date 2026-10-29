@@ -1,4 +1,4 @@
-// `watcheroni selfhost`: runs packages/server/selfhost/selfhost.ts from the
+// `watcheroni selfhost`: runs packages/server/selfhost/run.mjs from the
 // watcheroni clone this is run in. The work lives with the server, not in
 // this package: it deploys the server's source with the server's wrangler,
 // so it needs a clone anyway, and the published CLI stays one small file
@@ -9,7 +9,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { UsageError } from "./targets.ts";
 
-const SCRIPT = join("packages", "server", "selfhost", "selfhost.ts");
+const SCRIPT = join("packages", "server", "selfhost", "run.mjs");
 
 // The script in the clone containing `from`, or null.
 export function findSelfhost(from: string): string | null {

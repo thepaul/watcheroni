@@ -2,6 +2,7 @@ import { createPrivateKey, generateKeyPairSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { AppManifest, NewApp } from "../manifest.ts";
+import { NO_APP, selfhostConfig } from "../setup.ts";
 import { CONFIG_FILE, type Deps, type Options, PENDING_FILE, SelfhostFailed, defaultAppName, dryRunDeps, selfhost } from "../selfhost.ts";
 
 const WRANGLER_JSONC = readFileSync(new URL("../../wrangler.jsonc", import.meta.url), "utf8");
@@ -17,12 +18,21 @@ const APP: NewApp = {
   pem: PEM,
   html_url: "https://github.com/apps/watcheroni-acme",
 };
-const OPTIONS: Options = { name: "watcheroni", public: false, update: false };
+const OPTIONS: Options = { public: false, update: false };
+const ACCOUNT = "acct-1";
 
 // Cloudflare and GitHub stubbed, files in memory.
-function fake(o: { files?: Record<string, string>; loggedIn?: boolean; workerExists?: boolean; deviceFlowAfter?: number } = {}) {
+function fake(
+  o: {
+    files?: Record<string, string>;
+    loggedIn?: boolean;
+    workerExists?: boolean;
+    deviceFlowAfter?: number;
+    accounts?: { id: string; name: string }[];
+  } = {},
+) {
   const files: Record<string, string> = { "wrangler.jsonc": WRANGLER_JSONC, ...o.files };
-  const wrangler: { args: string[]; input?: string; config?: Record<string, unknown> }[] = [];
+  const wrangler: { args: string[]; input?: string; accountId?: string; config?: Record<string, unknown> }[] = [];
   const manifests: AppManifest[] = [];
   const printed: string[] = [];
   let loggedIn = o.loggedIn ?? true;
@@ -31,10 +41,12 @@ function fake(o: { files?: Record<string, string>; loggedIn?: boolean; workerExi
   let cliServer: string | null = null;
   const deps: Deps = {
     wrangler: async (args, opts) => {
-      wrangler.push({ args, input: opts?.input, config: args[0] === "deploy" ? JSON.parse(files[CONFIG_FILE]) : undefined });
+      wrangler.push({ args, input: opts?.input, accountId: opts?.accountId, config: args[0] === "deploy" ? JSON.parse(files[CONFIG_FILE]) : undefined });
       switch (args[0]) {
-        case "whoami":
-          return { code: 0, output: loggedIn ? "You are logged in" : "You are not authenticated. Please run `wrangler login`." };
+        case "whoami": {
+          const stdout = JSON.stringify(loggedIn ? { loggedIn, accounts: o.accounts ?? [{ id: ACCOUNT, name: "Mine" }] } : { loggedIn });
+          return { code: loggedIn ? 0 : 1, output: stdout, stdout };
+        }
         case "login":
           loggedIn = true;
           return { code: 0, output: "" };
@@ -67,9 +79,9 @@ describe("selfhost", () => {
     expect(await selfhost(OPTIONS, f.deps)).toBe(URL_);
 
     expect(f.wrangler.map((c) => c.args.slice(0, 3).join(" "))).toEqual([
-      "whoami",
+      "whoami --json",
       "login",
-      "whoami",
+      "whoami --json",
       "deployments list --name",
       `deploy -c ${CONFIG_FILE}`,
       "secret put GITHUB_APP_PRIVATE_KEY",
@@ -83,6 +95,9 @@ describe("selfhost", () => {
     expect(first.config!.vars).toEqual({ GITHUB_APP_ID: "", GITHUB_CLIENT_ID: "", GITHUB_APP_SLUG: "" });
     expect(last.config!.vars).toEqual({ GITHUB_APP_ID: "42", GITHUB_CLIENT_ID: "Iv23mine", GITHUB_APP_SLUG: "watcheroni-acme" });
     expect(last.config!.name).toBe("watcheroni");
+    // Everything after signing in is pinned to the one account.
+    expect(first.config!.account_id).toBe(ACCOUNT);
+    expect(f.wrangler.slice(3).every((c) => c.accountId === ACCOUNT)).toBe(true);
 
     // The App points at the URL the first deploy gave.
     expect(f.manifests[0].hook_attributes.url).toBe(`${URL_}/github/webhook`);
@@ -141,7 +156,7 @@ describe("selfhost", () => {
     await expect(selfhost(OPTIONS, fake({ files: { [CONFIG_FILE]: config } }).deps)).rejects.toThrow(/already set up/);
 
     const update = fake({ files: { [CONFIG_FILE]: config } });
-    await selfhost({ ...OPTIONS, name: "ignored", update: true }, update.deps);
+    await selfhost({ ...OPTIONS, update: true }, update.deps);
     expect(update.wrangler.map((c) => c.args[0])).toEqual(["whoami", "deploy"]);
     expect(update.wrangler[1].config).toMatchObject({ name: "watcheroni", vars: { GITHUB_APP_SLUG: "watcheroni-acme" } });
 
@@ -153,11 +168,75 @@ describe("selfhost", () => {
     const deps = dryRunDeps({ readFile: (name) => (name === "wrangler.jsonc" ? WRANGLER_JSONC : null), print: (l) => void printed.push(l) });
     await selfhost(OPTIONS, deps);
     const out = printed.join("\n");
-    expect(out).toContain("[dry run] wrangler deploy -c wrangler.selfhost.json");
-    expect(out).toContain("[dry run] wrangler secret put GITHUB_APP_PRIVATE_KEY -c wrangler.selfhost.json < (the value, on stdin)");
+    expect(out).toContain("[dry run] CLOUDFLARE_ACCOUNT_ID=your-account-id wrangler deploy -c wrangler.selfhost.json");
+    expect(out).toContain(
+      "[dry run] CLOUDFLARE_ACCOUNT_ID=your-account-id wrangler secret put GITHUB_APP_PRIVATE_KEY -c wrangler.selfhost.json < (the value, on stdin)",
+    );
     expect(out).toContain('"url": "https://watcheroni.your-subdomain.workers.dev/github/webhook"');
     expect(out).toContain('[dry run] would set "server": "https://watcheroni.your-subdomain.workers.dev"');
     expect(out).not.toContain("PRIVATE KEY-----");
+  });
+});
+
+describe("selfhost keeps to one Worker on one account", () => {
+  const state = (o: object = {}) => JSON.stringify({ name: "mine", account_id: ACCOUNT, ...o });
+
+  it("resume file present, config missing, default name: carries on with the recorded Worker", async () => {
+    const f = fake({ files: { [PENDING_FILE]: state() } });
+    await selfhost(OPTIONS, f.deps);
+    const deploys = f.wrangler.filter((c) => c.args[0] === "deploy");
+    expect(deploys.map((c) => c.config!.name)).toEqual(["mine", "mine"]);
+    // The resume file says this setup made the Worker, so no check; and
+    // nothing touched a Worker called watcheroni.
+    expect(f.wrangler.some((c) => c.args.includes("watcheroni"))).toBe(false);
+    expect(f.files[PENDING_FILE]).toBeUndefined();
+  });
+
+  it("refuses a --name that differs from the resume file or the configuration", async () => {
+    await expect(selfhost({ ...OPTIONS, name: "watcheroni" }, fake({ files: { [PENDING_FILE]: state() } }).deps)).rejects.toThrow(
+      /is for the Worker mine, not watcheroni/,
+    );
+    const config = JSON.stringify(selfhostConfig(WRANGLER_JSONC, "mine", { GITHUB_APP_ID: "1", GITHUB_CLIENT_ID: "c", GITHUB_APP_SLUG: "s" }, ACCOUNT));
+    for (const update of [true, false]) {
+      const f = fake({ files: { [CONFIG_FILE]: config } });
+      await expect(selfhost({ ...OPTIONS, name: "other", update }, f.deps)).rejects.toThrow(/is for the Worker mine, not other/);
+      expect(f.wrangler).toEqual([]);
+    }
+    // And a resume file and configuration that disagree.
+    const f = fake({ files: { [CONFIG_FILE]: config, [PENDING_FILE]: state({ name: "theirs" }) } });
+    await expect(selfhost(OPTIONS, f.deps)).rejects.toThrow(/remove the one that's wrong/);
+  });
+
+  it("refuses a resume file that doesn't name its Worker and account", async () => {
+    const f = fake({ files: { [PENDING_FILE]: JSON.stringify({ app: APP, ticket_key: "t", storage_key: "s" }) } });
+    await expect(selfhost(OPTIONS, f.deps)).rejects.toThrow(/isn't safe/);
+    expect(f.wrangler).toEqual([]);
+  });
+
+  it("runs the check for a configuration without a resume file", async () => {
+    const config = JSON.stringify(selfhostConfig(WRANGLER_JSONC, "watcheroni", NO_APP, ACCOUNT));
+    const f = fake({ files: { [CONFIG_FILE]: config }, workerExists: true });
+    await expect(selfhost(OPTIONS, f.deps)).rejects.toThrow(/already exists/);
+    expect(f.wrangler.some((c) => c.args[0] === "deploy")).toBe(false);
+  });
+
+  it("needs CLOUDFLARE_ACCOUNT_ID with several accounts, and keeps to the recorded one", async () => {
+    const accounts = [{ id: "a1", name: "One" }, { id: "a2", name: "Two" }];
+    await expect(selfhost(OPTIONS, fake({ accounts }).deps)).rejects.toThrow(/set CLOUDFLARE_ACCOUNT_ID to one of: a1 \(One\), a2 \(Two\)/);
+    await expect(selfhost({ ...OPTIONS, accountId: "a3" }, fake({ accounts }).deps)).rejects.toThrow(/isn't one of your accounts/);
+
+    const chosen = fake({ accounts });
+    await selfhost({ ...OPTIONS, accountId: "a2" }, chosen.deps);
+    expect(chosen.wrangler.filter((c) => c.args[0] !== "whoami").every((c) => c.accountId === "a2")).toBe(true);
+
+    // The resume file's account is used when none is named, and a
+    // different one is refused.
+    const resumed = fake({ accounts, files: { [PENDING_FILE]: state({ account_id: "a1" }) } });
+    await selfhost(OPTIONS, resumed.deps);
+    expect(resumed.wrangler.find((c) => c.args[0] === "deploy")!.accountId).toBe("a1");
+    await expect(selfhost({ ...OPTIONS, accountId: "a2" }, fake({ accounts, files: { [PENDING_FILE]: state({ account_id: "a1" }) } }).deps)).rejects.toThrow(
+      /is for Cloudflare account a1, not a2/,
+    );
   });
 });
 

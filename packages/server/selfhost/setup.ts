@@ -56,10 +56,18 @@ type Config = Record<string, unknown> & { env?: Record<string, Record<string, un
 // later come along. It's the production environment (the real server's
 // bindings and crons) over the top level, under the deployer's own name,
 // on workers.dev instead of watcheroni.dev, with their App's vars.
-export function selfhostConfig(wranglerJsonc: string, name: string, vars: WorkerVars): Config {
+// It names the Cloudflare account too, so wrangler can't pick another.
+export function selfhostConfig(wranglerJsonc: string, name: string, vars: WorkerVars, accountId: string): Config {
   const { env, ...base } = parseJsonc(wranglerJsonc) as Config;
   const production = env?.production ?? {};
-  const config: Config = { ...base, ...production, name, workers_dev: true, vars: { ...(production.vars as object), ...vars } };
+  const config: Config = {
+    ...base,
+    ...production,
+    name,
+    account_id: accountId,
+    workers_dev: true,
+    vars: { ...(production.vars as object), ...vars },
+  };
   delete config.routes;
   delete config.route;
   return config;
