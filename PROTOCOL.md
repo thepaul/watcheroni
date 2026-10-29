@@ -204,7 +204,15 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
 - `repo`: `owner/name`. Required.
 - `pr`: a pull request number. Leave it out for a **repository-wide**
   subscription, which then MUST name at least one kind and MAY narrow with
-  `"base": "main"` (PRs targeting that branch) or `"author": "paul"`.
+  `"base": "main"` (PRs targeting that branch) or `"author": "paul"` (PRs
+  opened by that GitHub login, compared without case), or both. Servers
+  that take them list the `repo_scope` feature.
+- With `base` or `author`, only events about a PR match: not issues, and
+  not checks or statuses on a commit that's no open PR's head. The server
+  judges a PR by what it knows of it, so a PR whose base changes matches
+  (or stops matching) from its `pr.base_changed` on. When subscribing, it
+  learns the repo's open PRs (the 100 most recently updated; others from
+  their next pull request, review or comment event).
 - `kinds`: event kinds or globs (`review.*`). Leaving it out means every
   kind for PR subscriptions.
 - `ignore.self`: drop events caused by the account's own GitHub user.
@@ -227,8 +235,10 @@ The server checks, in order:
 A PR subscription also fetches the PR's current state, so the server has a
 baseline for derived events (checks, merge conflicts).
 
-Creating is idempotent: the same inbox, repo, PR and filter returns the
-existing subscription with `200` instead of `201`.
+Creating is idempotent: the same inbox, repo, PR and filter (`kinds`,
+`ignore`, `base`, `author`) returns the existing subscription with `200`
+instead of `201`. The response repeats `base` and `author` when they were
+given (`author` lowercased).
 
 ```json
 {

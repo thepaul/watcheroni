@@ -229,8 +229,26 @@ earliest due time, or clears it.
 (migration tag `v2`). Where it differs from the above:
 
 - **Not built yet:** the `checks`, `rollups` and `jobs` tables, so no
-  `checks.completed` or `merge.*`; the `base` and `author` filters for
-  repository-wide subscriptions (`/v1` answers 400 to them).
+  `checks.completed` or `merge.*`.
+- **`base` and `author`** (repository-wide only) are kept in `spec`, so
+  they count for idempotence; `author` is lowercased. They match against
+  `prs`, which gained an `author` column (schema 3). While any
+  repo-wide subscription has one, `prs` holds every open PR RepoHub has
+  heard of, not only watched ones (up to 1,000): the Worker lists the
+  repo's open PRs when subscribing (one more installation API call, the
+  100 most recently updated, passed to `subscribe` as `openPrs`), and
+  `pr.opened`, `pr.reopened` and an internal `pr.seen` fact add rows.
+  The normaliser emits `pr.seen` (`head_sha`, `base`, `author`, `state`)
+  after the other events of any payload that describes the PR
+  (`pull_request*`, and `issue_comment` on a PR, which gives only the
+  author); it only fills gaps, since the head and base move with
+  `pr.pushed` and `pr.base_changed`, and it never makes a delivery that
+  would otherwise be skipped reach RepoHub. Closed and merged PRs are
+  dropped as before, and when the last filtering subscription goes, so
+  are rows no PR subscription needs. A filtered subscription gets an
+  event only if its PR is known and matches, so never issue events or
+  statuses on a commit that's no known PR's head. While rows are kept,
+  head-SHA matching (below) also gives such statuses those PRs.
 - **Expiry is pulled, not pushed.** There's no `touch`: reading an inbox
   only records `last_read_at` in Account (a WebSocket `hello` counts, and
   so does having a socket open). When a subscription reaches
@@ -829,7 +847,8 @@ watcheroni config [get | set] <key> [value]
 ```
 
 - **Targets** are `owner/repo#123`, PR URLs, `owner/repo` (repo-wide, needs
-  `--kinds`), or nothing, meaning the current branch's PR (found through
+  `--kinds`, may narrow with `--base` and `--author`; server mode only,
+  and `wait` never exits 3 while one is watched), or nothing, meaning the current branch's PR (found through
   the git remote and the GitHub API).
 - **`wait`, `stream` and `exec` subscribe as needed**: they make sure the
   targets are watched in the current inbox, then read it. Most users never
@@ -1011,6 +1030,11 @@ It runs on the deployer's own Cloudflare account, free plan included.
 6. Repo-wide subscriptions; recipes for `exec` (desktop notifications,
    ntfy, Slack incoming webhooks) before any built-in notification
    support.
+   *Repo-wide subscriptions built:* `base` and `author` on the server
+   (see "As built" under "RepoHub"), and `owner/repo` targets in the CLI
+   with `--kinds`, `--base` and `--author`, in server mode only. A
+   repo-wide watch is remembered in the local inbox (`ls`, `unwatch`) and
+   keeps `wait` from exiting 3.
 
 ## Open questions
 
