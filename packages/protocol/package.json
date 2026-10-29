@@ -1,13 +1,34 @@
 {
   "name": "@watcheroni/protocol",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Types and constants for the watcheroni protocol (PROTOCOL.md)",
+  "private": true,
   "license": "MIT",
+  "author": "paul cannon",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thepaul/watcheroni.git",
+    "directory": "packages/protocol"
+  },
+  "homepage": "https://github.com/thepaul/watcheroni/blob/main/PROTOCOL.md",
+  "bugs": "https://github.com/thepaul/watcheroni/issues",
+  "keywords": [
+    "watcheroni",
+    "github",
+    "pull-request",
+    "webhooks",
+    "protocol",
+    "types"
+  ],
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "exports": {
     ".": "./src/index.ts"
   },
   "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && node scripts/package-dist.mjs",
     "typecheck": "tsc --noEmit"
   }
 }
