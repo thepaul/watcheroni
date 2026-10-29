@@ -2,7 +2,7 @@ import { matchesKind, type WatchEvent } from "@watcheroni/protocol";
 import type { Inbox } from "./inbox.ts";
 import { pollOnce, type Fetch } from "./poll.ts";
 import type { ServerReader } from "./server.ts";
-import { targetKey } from "./targets.ts";
+import { repoKey, targetKey } from "./targets.ts";
 
 // Where `wait`, `stream` and `exec` get events: the local inbox, filled by
 // polling GitHub for the targets watched from this machine, and the
@@ -31,12 +31,14 @@ export class Feed {
   private readonly o: FeedOptions;
   private readonly hadTargets: boolean;
   private nextPoll = 0;
+  // Whether the server ended a repository-wide watch, for the footer.
+  repoEnded = false;
 
   constructor(inbox: Inbox, server: ServerReader | null, o: FeedOptions) {
     this.inbox = inbox;
     this.server = server;
     this.o = o;
-    this.hadTargets = inbox.watched().length > 0;
+    this.hadTargets = inbox.watched().length + inbox.repoWatches().length > 0;
   }
 
   // Pending events that match, acknowledging the rest so they don't wait
@@ -47,7 +49,9 @@ export class Feed {
     for (const source of this.server ? [this.server, this.inbox] : [this.inbox]) {
       const pending = source.pending();
       if (source === this.server) {
-        for (const e of pending) if (e.sub && e.kind.startsWith("watch.")) this.inbox.subscriptionEnded(e.sub, e.kind);
+        for (const e of pending) {
+          if (e.sub && e.kind.startsWith("watch.") && this.inbox.subscriptionEnded(e.sub, e.kind) === "repo") this.repoEnded = true;
+        }
       }
       const keep = pending.filter((e) => matchesKind(kinds, e.kind));
       const skip = pending.filter((e) => !matchesKind(kinds, e.kind));
@@ -94,15 +98,16 @@ export class Feed {
   }
 
   watching(): string[] {
-    return this.inbox.watched().map((w) => targetKey(w.target));
+    return [...this.inbox.watched().map((w) => targetKey(w.target)), ...this.inbox.repoWatches().map((r) => repoKey(r.target))];
   }
 
   // Whether everything watched has ended. Without a server, that's when
   // no PR is left. A server inbox may also be fed by subscriptions made
   // elsewhere, which can't be listed yet, so it ends only when this
-  // command was watching PRs and they have all ended.
+  // command was watching PRs and they have all ended. A repository-wide
+  // watch has no end of its own.
   ended(): boolean {
-    if (this.inbox.watched().length) return false;
+    if (this.inbox.watched().length || this.inbox.repoWatches().length) return false;
     return this.server ? this.hadTargets : true;
   }
 

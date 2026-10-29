@@ -4,7 +4,7 @@ import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { Delivery } from "../src/account";
 import type { UnsequencedEvent, WatchEvent } from "../src/protocol";
-import { REPO_LIMITS, type IngestResult, type RepoHub, type RepoHubStats, type Subscription } from "../src/repo-hub";
+import { REPO_LIMITS, RepoHub, type IngestResult, type RepoHubStats, type Subscription } from "../src/repo-hub";
 import { sign } from "../src/webhook/signature";
 
 type Example = { action?: string; [key: string]: unknown };
@@ -207,6 +207,199 @@ describe("matching", () => {
   });
 });
 
+describe("repo-wide base and author filters", () => {
+  // A pull_request webhook for PR `n` against `base`, opened by `author`.
+  function prEvent(action: string, n: number, base: string, author: string): Example {
+    const payload = example("pull_request", action);
+    Object.assign(payload, { number: n });
+    const pr = payload.pull_request as { number: number; base: { ref: string }; user: { login: string }; state: string };
+    Object.assign(pr, { number: n, state: action === "closed" ? "closed" : "open" });
+    pr.base.ref = base;
+    pr.user.login = author;
+    return payload;
+  }
+
+  it("match PRs by the branch they target and who opened them", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    const toMain = await subscribe(repo, { account: acct, inbox: "main", pr: null, kinds: ["pr.*", "review.*"], base: "main" });
+    const byAlice = await subscribe(repo, { account: acct, inbox: "alice", pr: null, kinds: ["pr.*", "review.*", "issue.*"], author: "Alice" });
+    await subscribe(repo, { account: acct, inbox: "both", pr: null, kinds: ["pr.opened"], base: "main", author: "bob" });
+    await subscribe(repo, { account: acct, inbox: "all", pr: null, kinds: ["pr.opened", "review.*"] });
+    // Logins are compared without case.
+    expect(byAlice.author).toBe("alice");
+
+    await webhook("pull_request", prEvent("opened", 11, "main", "alice"), repo);
+    await webhook("pull_request", prEvent("opened", 12, "dev", "alice"), repo);
+    await webhook("pull_request", prEvent("opened", 13, "main", "bob"), repo);
+    await hub(repo).ingest("d1", [
+      fact(repo, "review.submitted", 12, { review_id: 1, state: "approved" }),
+      // A PR nobody here has heard of matches no filter.
+      fact(repo, "review.submitted", 99, { review_id: 2, state: "approved" }),
+      fact(repo, "issue.opened", null, { issue: 5 }),
+    ]);
+
+    const got = async (name: string) => (await inbox(acct, name)).map((e) => [e.kind, e.pr]);
+    expect(await got("main")).toEqual([["pr.opened", 11], ["pr.opened", 13]]);
+    expect((await inbox(acct, "main"))[0].sub).toBe(toMain.id);
+    expect(await got("alice")).toEqual([["pr.opened", 11], ["pr.opened", 12], ["review.submitted", 12]]);
+    expect(await got("both")).toEqual([["pr.opened", 13]]);
+    expect(await got("all")).toEqual([["pr.opened", 11], ["pr.opened", 12], ["pr.opened", 13], ["review.submitted", 12], ["review.submitted", 99]]);
+    // pr.seen stays inside RepoHub.
+    expect((await inbox(acct, "all")).some((e) => e.kind === "pr.seen")).toBe(false);
+    expect((await stats(repo)).prs.map((p) => [p.number, p.base_ref, p.author])).toEqual([
+      [11, "main", "alice"], [12, "dev", "alice"], [13, "main", "bob"],
+    ]);
+  });
+
+  it("follow a PR moved to another base", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.*", "comment.created"], base: "main" });
+    await webhook("pull_request", prEvent("opened", 4, "dev", "alice"), repo);
+    await hub(repo).ingest("d1", [fact(repo, "pr.base_changed", 4, { from: "dev", to: "main" })]);
+    await hub(repo).ingest("d2", [fact(repo, "comment.created", 4, { comment_id: 1 })]);
+    expect(kinds(await inbox(acct, "i"))).toEqual(["pr.base_changed", "comment.created"]);
+  });
+
+  it("know the PRs open when subscribing, and only while a filter needs them", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "pr", pr: 2, baseline: { state: "open", head_sha: SHA_B, base_ref: "main" } });
+    const open = [
+      { number: 1, head_sha: SHA_A, base_ref: "main", author: "Carol", draft: false },
+      { number: 2, head_sha: SHA_B, base_ref: "main", author: "dave", draft: true },
+    ];
+    const wide = (body: { kinds: string[]; author?: string; base?: string }) =>
+      hub(repo).subscribe({ account: acct, inbox: "wide", pr: null, ...body }, { id: repo, full_name: "octo/widgets" });
+    const result = await wide({ kinds: ["check.failed", "pr.closed"], author: "carol" });
+    if (!result.ok) throw new Error(result.detail);
+    // The first filter asks for the open PRs; later ones, and the same
+    // one again, don't.
+    expect(result.needs_open_prs).toBe(true);
+    expect(await wide({ kinds: ["check.failed", "pr.closed"], author: "carol" })).toMatchObject({ ok: true, created: false });
+    expect(await wide({ kinds: ["check.failed", "pr.closed"], author: "carol" })).not.toHaveProperty("needs_open_prs");
+    const second = await wide({ kinds: ["pr.opened"], base: "main" });
+    expect(second).toMatchObject({ ok: true, created: true });
+    expect(second).not.toHaveProperty("needs_open_prs");
+    await hub(repo).rememberOpenPrs(open);
+    expect((await stats(repo)).prs.map((p) => [p.number, p.author, p.head_sha])).toEqual([[1, "Carol", SHA_A], [2, "dave", SHA_B]]);
+    if (second.ok) await hub(repo).unsubscribe(second.subscription.id);
+
+    // A status carries only a head SHA; it's matched to the PR at that head.
+    const status = Object.assign(example("status"), { sha: SHA_A, state: "failure", context: "ci" });
+    await webhook("status", status, repo);
+    expect((await inbox(acct, "wide")).map((e) => [e.kind, e.pr])).toEqual([["check.failed", 1]]);
+
+    // A closed PR is forgotten once nothing watches it.
+    await hub(repo).ingest("d1", [fact(repo, "pr.closed", 1)]);
+    expect(kinds(await inbox(acct, "wide"))).toEqual(["check.failed", "pr.closed"]);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2]);
+
+    // So is every PR no PR subscription watches, once the filter goes.
+    await webhook("pull_request", prEvent("opened", 3, "main", "carol"), repo);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2, 3]);
+    expect(await hub(repo).unsubscribe(result.subscription.id)).toBe(true);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2]);
+    // And new PRs aren't remembered without one.
+    await webhook("pull_request", prEvent("opened", 4, "main", "carol"), repo);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2]);
+  });
+
+  it("take only the gaps from an open-PR listing for PRs already known", async () => {
+    const repo = fresh();
+    const result = await hub(repo).subscribe(
+      { account: fresh(), inbox: "i", pr: null, kinds: ["pr.*"], base: "main" },
+      { id: repo, full_name: "octo/widgets" },
+    );
+    expect(result).toMatchObject({ ok: true, needs_open_prs: true });
+    // Between the listing and rememberOpenPrs: PR 4 merged, PR 5 was pushed
+    // to and moved to dev, with its author not yet known.
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("INSERT INTO prs (number, state, head_sha, base_ref, author) VALUES (4, 'merged', ?, 'main', 'x')", SHA_A);
+      state.storage.sql.exec("INSERT INTO prs (number, state, draft, head_sha, base_ref) VALUES (5, 'open', 0, ?, 'dev')", SHA_A);
+    });
+    await hub(repo).rememberOpenPrs([4, 5, 6].map((n) => ({ number: n, head_sha: SHA_B, base_ref: "main", author: `u${n}`, draft: true })));
+    const prs = (await stats(repo)).prs.map((p) => [p.number, p.state, p.draft, p.head_sha, p.base_ref, p.author]);
+    expect(prs).toEqual([
+      [4, "merged", 1, SHA_A, "main", "x"],
+      [5, "open", 0, SHA_A, "dev", "u5"],
+      [6, "open", 1, SHA_B, "main", "u6"],
+    ]);
+  });
+
+  it("write a PR's row only to fill a gap", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["review.*"], author: "alice" });
+    const seenAt = () => runInDurableObject(hub(repo), (_: RepoHub, state) =>
+      state.storage.sql.exec<{ seen_at: number | null; state: string | null; author: string | null }>(
+        "SELECT seen_at, state, author FROM prs WHERE number = 9").one());
+    // A row made from a reopen knows nothing but its state.
+    await hub(repo).ingest("d1", [fact(repo, "pr.reopened", 9)]);
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("UPDATE prs SET seen_at = 1 WHERE number = 9");
+    });
+    const seen = (head: string | null) => fact(repo, "pr.seen", 9, { head_sha: head, base: "main", author: "alice", state: "open" });
+    await hub(repo).ingest("d2", [seen(SHA_A)]);
+    const filled = await seenAt();
+    expect(filled).toMatchObject({ state: "open", author: "alice" });
+    expect(filled.seen_at).toBeGreaterThan(1);
+    // Nothing left to fill: no write, so seen_at stays put.
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("UPDATE prs SET seen_at = 1 WHERE number = 9");
+    });
+    await hub(repo).ingest("d3", [seen(SHA_B)]);
+    expect((await seenAt()).seen_at).toBe(1);
+    expect((await stats(repo)).prs[0].head_sha).toBe(SHA_A);
+  });
+
+  it("forget the least recently seen PRs when full, but never a watched one", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "pr", pr: 1 });
+    await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.*"], base: "main" });
+    const cap = REPO_LIMITS.trackedPrs;
+    try {
+      await runInDurableObject(hub(repo), () => {
+        REPO_LIMITS.trackedPrs = 3;
+      });
+      for (const n of [2, 3, 4]) {
+        await hub(repo).ingest(`d${n}`, [fact(repo, "pr.opened", n, { head_sha: SHA_A, base: "main", draft: false })]);
+        // Distinct, increasing seen_at.
+        await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+          state.storage.sql.exec("UPDATE prs SET seen_at = ? WHERE number = ?", n, n);
+        });
+      }
+      // PR 1 is watched, so 2, the oldest of the rest, made room for 4.
+      expect((await stats(repo)).prs.map((p) => p.number)).toEqual([1, 3, 4]);
+      // Three more fit only two: 3 and 4 go, and 1 stays.
+      await hub(repo).rememberOpenPrs([5, 6, 7].map((n) => ({ number: n, head_sha: SHA_B, base_ref: "main", author: "x", draft: false })));
+      expect((await stats(repo)).prs.map((p) => p.number)).toEqual([1, 5, 6]);
+    } finally {
+      await runInDurableObject(hub(repo), () => {
+        REPO_LIMITS.trackedPrs = cap;
+      });
+    }
+  });
+
+  it("are part of what makes a subscription the same", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    const plain = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"] });
+    const main = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], base: "main" });
+    const again = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], base: "main" }, 200);
+    const paul = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], author: "Paul" });
+    const paulAgain = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], author: "paul" }, 200);
+    expect(new Set([plain.id, main.id, paul.id]).size).toBe(3);
+    expect([again.id, paulAgain.id]).toEqual([main.id, paul.id]);
+    expect(plain).not.toHaveProperty("base");
+    expect(main.base).toBe("main");
+    await subscribe(repo, { account: acct, inbox: "i", pr: 1, base: "main" }, 400);
+    await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], author: "" }, 400);
+  });
+});
+
 describe("subscriptions", () => {
   it("are idempotent and validated", async () => {
     const repo = fresh();
@@ -234,6 +427,59 @@ describe("subscriptions", () => {
     expect((await del()).status).toBe(404);
     expect(await stats(repo)).toMatchObject({ subscriptions: [], prs: [] });
   });
+});
+
+describe("schema migration", () => {
+  // Older shapes of the tables. Version 3 meant different things on two
+  // branches: prs.author (this one) or new check tables (ticket 003).
+  const SUBS_V2 = `CREATE TABLE subscriptions (id TEXT PRIMARY KEY, account_id INTEGER NOT NULL, inbox TEXT NOT NULL, pr INTEGER,
+    spec TEXT NOT NULL, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, verified_until INTEGER, ttl_seconds INTEGER)`;
+  const PRS_V2 = `CREATE TABLE prs (number INTEGER PRIMARY KEY, state TEXT, draft INTEGER, head_sha TEXT, base_ref TEXT,
+    mergeable TEXT, mergeable_checked_at INTEGER)`;
+  const shapes: Record<string, { version: string; sql: string[]; author?: string }> = {
+    v2: { version: "2", sql: [SUBS_V2, PRS_V2] },
+    "v3 from ticket 003": {
+      version: "3",
+      sql: [SUBS_V2, PRS_V2, "CREATE TABLE IF NOT EXISTS checks (head_sha TEXT, kind TEXT, key TEXT, PRIMARY KEY (head_sha, kind, key))"],
+    },
+    "v3 from ticket 007": { version: "3", sql: [SUBS_V2, `${PRS_V2.slice(0, -1)}, author TEXT)`], author: "alice" },
+  };
+
+  for (const [name, shape] of Object.entries(shapes)) {
+    it(`brings ${name} to the current schema, keeping its rows`, async () => {
+      const repo = fresh();
+      await subscribe(repo, { account: fresh(), inbox: "i", pr: 1 });
+      await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+        const sql = state.storage.sql;
+        sql.exec("DROP TABLE subscriptions");
+        sql.exec("DROP TABLE prs");
+        for (const stmt of shape.sql) sql.exec(stmt);
+        sql.exec("INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at) VALUES ('sub_a', 1, 'i', 5, ?, 0, ?)",
+          JSON.stringify({ kinds: [], ignore: { self: false, bots: false, actors: [] } }), Date.now() + 3600_000);
+        sql.exec(`INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at) VALUES ('sub_b', 1, 'w', NULL, ?, 0, ?)`,
+          JSON.stringify({ kinds: ["pr.opened"], ignore: { self: false, bots: false, actors: [] }, base: "main" }), Date.now() + 3600_000);
+        if (shape.author) sql.exec("INSERT INTO prs (number, state, head_sha, author) VALUES (5, 'open', ?, ?)", SHA_A, shape.author);
+        else sql.exec("INSERT INTO prs (number, state, head_sha) VALUES (5, 'open', ?)", SHA_A);
+        sql.exec("UPDATE meta SET v = ? WHERE k = 'schema_version'", shape.version);
+        sql.exec("DELETE FROM meta WHERE k = 'tracks_all_prs'");
+
+        // A fresh object over the old storage migrates it, twice harmlessly.
+        new RepoHub(state, env);
+        new RepoHub(state, env);
+        const meta = (k: string) => sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v;
+        expect(meta("schema_version")).toBe("4");
+        expect(meta("tracks_all_prs")).toBe("1");
+        const columns = sql.exec<{ name: string }>("SELECT name FROM pragma_table_info('prs')").toArray().map((c) => c.name);
+        expect(columns).toEqual(expect.arrayContaining(["author", "seen_at"]));
+        expect(sql.exec("SELECT number, head_sha, author FROM prs").toArray()).toEqual([{ number: 5, head_sha: SHA_A, author: shape.author ?? null }]);
+        expect(sql.exec("SELECT id FROM subscriptions ORDER BY id").toArray()).toEqual([{ id: "sub_a" }, { id: "sub_b" }]);
+        if (name.includes("003")) expect(sql.exec("SELECT name FROM sqlite_master WHERE name = 'checks'").toArray()).toHaveLength(1);
+      });
+      // And it works: the filter matches PR 5's base once known.
+      await hub(repo).ingest("d1", [fact(repo, "pr.base_changed", 5, { from: "dev", to: "main" })]);
+      expect((await stats(repo)).prs[0].base_ref).toBe("main");
+    });
+  }
 });
 
 describe("dedupe", () => {
