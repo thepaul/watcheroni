@@ -8,6 +8,7 @@ import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
+import { selfhost } from "./selfhost.ts";
 import { RENEW_EVERY_MS, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "./server.ts";
 import { UsageError, currentBranchPr, parseTarget, targetKey } from "./targets.ts";
 
@@ -24,6 +25,7 @@ Usage:
   watcheroni unwatch <target...>
   watcheroni ls
   watcheroni login | logout   sign in to the server ($WATCHERONI_SERVER)
+  watcheroni selfhost [--help] run your own server (from a watcheroni clone)
 
 Targets are owner/repo#123 or a pull request URL. With none, the open PR
 for the current git branch.
@@ -54,6 +56,8 @@ export function parseDuration(s: string): number {
 }
 
 async function main(argv: string[]): Promise<number> {
+  // Its options are the server script's own.
+  if (argv[0] === "selfhost") return selfhost(argv.slice(1));
   const split = argv.indexOf("--");
   const command = split === -1 ? [] : argv.slice(split + 1);
   const { values: opts, positionals } = parseArgs({

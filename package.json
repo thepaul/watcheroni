@@ -7,7 +7,8 @@
   ],
   "scripts": {
     "test": "npm test --workspaces --if-present",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "selfhost": "npm run selfhost -w @watcheroni/server --"
   },
   "engines": {
     "node": ">=22"

@@ -4,3 +4,5 @@ dist/
 .dev.vars
 *.log
 .deploy.vars
+.selfhost-app.json
+wrangler.selfhost.json
