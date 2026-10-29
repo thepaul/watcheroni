@@ -88,19 +88,18 @@ session watches.
 
 ## Installing
 
+This version of the plugin goes with the watcheroni CLI 0.1.0, and runs
+it as `watcheroni@^0.1.0`; `watcheroni --version` says which one runs.
+
 The plugin puts a `watcheroni` command on the Bash tool's PATH. It runs, in
 order: `$WATCHERONI_CLI` (a path to `watcheroni.mjs`), a `watcheroni`
-installed with `npm install -g watcheroni`, the build in a clone of the
-watcheroni repository when the plugin is installed from that clone, or
-`npx --yes watcheroni`.
+installed with `npm install -g watcheroni@^0.1.0`, the build in a clone of
+the watcheroni repository when the plugin runs from that clone, or
+`npx --yes watcheroni@^0.1.0`. npx needs the npm registry the first time.
 
-Until the CLI is published on npm, build it in a clone of the repository
-and use that:
-
-```
-npm install && npm run build -w watcheroni
-node packages/cli/dist/watcheroni.mjs wait
-```
+If it exits 127, none of those worked (npx is missing, or it's turned off
+with `WATCHERONI_NO_NPX`). Ask the user to run
+`npm install -g watcheroni@^0.1.0`; it needs Node.js 22 or later.
 
 Local mode needs a GitHub login: `gh auth login`, or `GH_TOKEN` /
 `GITHUB_TOKEN` in the environment. The token stays on this machine.

@@ -46,18 +46,19 @@ jobs:
           node-version: 26
           registry-url: https://registry.npmjs.org
       - run: npm ci
-      - name: Check the tag matches the package versions
+      - name: Check the tag matches the package and plugin versions
         env:
           TAG: ${{ github.ref_name }}
         run: |
           status=0
-          for pkg in packages/cli packages/protocol packages/server; do
-            version=$(node -p "require('./$pkg/package.json').version")
+          for manifest in packages/cli/package.json packages/protocol/package.json packages/server/package.json plugin/.claude-plugin/plugin.json; do
+            version=$(node -p "require('./$manifest').version")
             if [ "v$version" != "$TAG" ]; then
-              echo "::error file=$pkg/package.json::version is $version but the tag is $TAG"
+              echo "::error file=$manifest::version is $version but the tag is $TAG"
               status=1
             fi
           done
+          node scripts/plugin-version.mjs --check || status=1
           exit $status
       - run: npm run build -w watcheroni
       - run: npm run build -w @watcheroni/protocol

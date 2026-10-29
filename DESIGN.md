@@ -1003,7 +1003,12 @@ marketplace:
   the session ID from the hook's input.
 - **`bin/watcheroni`**, which the plugin puts on the Bash tool's PATH: it
   runs `$WATCHERONI_CLI`, a global install, the clone's own build when
-  the plugin is installed from a local clone, or `npx watcheroni`.
+  the plugin runs in place from a clone, or `npx watcheroni@^X.Y.Z`. The
+  plugin has the CLI's version (`scripts/plugin-version.mjs` keeps them in
+  step, and a test checks), so it runs the CLI it was released with. The
+  SessionStart hook lets npx use only its cache, which a session that
+  watched anything through npx has filled, so it never waits on the
+  registry.
 
 Because the cursor lives on the server, a `wait` killed by an app restart
 loses nothing; the next one gets everything since the last

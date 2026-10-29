@@ -6,11 +6,18 @@
 #   1. $WATCHERONI_CLI, a path to watcheroni.mjs
 #   2. another `watcheroni` on PATH (npm install -g watcheroni)
 #   3. this repository's build, packages/cli/dist/watcheroni.mjs, when the
-#      plugin is installed in place from a clone of the repository
-#      (npm run build -w watcheroni)
-#   4. npx --yes watcheroni, unless WATCHERONI_NO_NPX is set
+#      plugin runs in place from a clone of the repository
+#      (claude --plugin-dir plugin, after npm run build -w watcheroni).
+#      An installed plugin runs from Claude Code's cache, without it.
+#   4. npx --yes watcheroni@^X.Y.Z, the CLI version this plugin version
+#      goes with, unless WATCHERONI_NO_NPX is set. With
+#      WATCHERONI_NPX_OFFLINE set, only a copy npx already has in its cache
+#      is used, so it never waits on the registry.
 #
 # Exits 127 if none of them is available.
+
+# Kept equal to plugin.json's version (see RELEASING.md).
+cli="watcheroni@^0.1.0"
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
@@ -36,8 +43,11 @@ if [ -f "$build" ]; then
 fi
 
 if [ -z "$WATCHERONI_NO_NPX" ] && command -v npx >/dev/null 2>&1; then
-  exec npx --yes watcheroni "$@"
+  if [ -n "$WATCHERONI_NPX_OFFLINE" ]; then
+    exec npx --offline --yes "$cli" "$@"
+  fi
+  exec npx --yes "$cli" "$@"
 fi
 
-echo "watcheroni: the CLI isn't installed. Run \`npm install -g watcheroni\`, or build it from a clone with \`npm run build -w watcheroni\` and set WATCHERONI_CLI to packages/cli/dist/watcheroni.mjs." >&2
+echo "watcheroni: the CLI isn't installed. Run \`npm install -g $cli\`, or build it from a clone with \`npm run build -w watcheroni\` and set WATCHERONI_CLI to packages/cli/dist/watcheroni.mjs." >&2
 exit 127
