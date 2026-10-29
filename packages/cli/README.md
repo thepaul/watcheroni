@@ -49,6 +49,21 @@ then polls GitHub itself every 2 minutes with your `gh` login (or
 `GH_TOKEN` / `GITHUB_TOKEN`), and that token never leaves your machine.
 See "Local mode" below.
 
+## Claude Code
+
+The watcheroni plugin for Claude Code has a session keep watching the PRs
+it opens or pushes to, in the background, and deal with failing checks
+and review feedback as they arrive:
+
+```
+claude plugin marketplace add thepaul/watcheroni
+claude plugin install watcheroni@watcheroni
+```
+
+It runs this CLI through npx unless it's installed. See
+[the plugin's README](https://github.com/thepaul/watcheroni/tree/main/plugin)
+for what it does and doesn't do.
+
 ## Commands
 
 ```

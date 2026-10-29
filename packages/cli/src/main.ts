@@ -362,6 +362,10 @@ function run(command: string[], stdin: string, env: Record<string, string>): Pro
 process.on("SIGINT", () => process.exit(130));
 process.on("SIGTERM", () => process.exit(143));
 
+// The plugin's wrapper sets this so it can't run itself in a loop; a
+// command `exec` runs should look for watcheroni afresh.
+delete process.env.WATCHERONI_WRAPPER;
+
 main(process.argv.slice(2)).then(
   (code) => process.exit(code),
   (e: unknown) => {

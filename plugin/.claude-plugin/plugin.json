@@ -1,10 +1,12 @@
 {
   "name": "watcheroni",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Keep watching your pull requests after you push: CI failures, reviews, comments and merge conflicts wake the session",
   "author": {
     "name": "Paul Cannon"
   },
+  "homepage": "https://github.com/thepaul/watcheroni/tree/main/plugin",
+  "repository": "https://github.com/thepaul/watcheroni",
   "license": "MIT",
   "keywords": ["github", "pull-requests", "ci", "code-review"]
 }
