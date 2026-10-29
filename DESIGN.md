@@ -630,12 +630,12 @@ server can be down without losing events.
   delivery isn't queued when the scan has seen a newer successful
   `installation` delivery for that installation, and one already queued
   is dropped when such a delivery turns up. Only original deliveries
-  count as newer: a redelivery has a new ID but carries an old event. That holds only within a
-  scan, and a newer one that lands after the old one was redelivered
-  can't undo it. `installation_repositories` is still redelivered: the
-  list doesn't say which repos an event was about, so a later `added`
-  can't be told apart from one that undoes a failed `removed`; at worst
-  a re-added repo's watches are revoked.
+  count as newer: a redelivery has a new ID but carries an old event.
+  That holds only within a scan, and a newer one that lands after the
+  old one was redelivered can't undo it. `installation_repositories` is
+  still redelivered: the list doesn't say which repos an event was
+  about, so a later `added` can't be told apart from one that undoes a
+  failed `removed`; at worst a re-added repo's watches are revoked.
 - So a run makes at most 13 subrequests, and a missed delivery is
   redelivered 1 to 11 minutes after it failed, or later when more than
   10 are queued.

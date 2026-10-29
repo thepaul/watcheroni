@@ -23,6 +23,9 @@ export const REDELIVERY_LIMITS = {
   // Redelivery requests made for one GUID before giving up on it,
   // counting those GitHub refused with a 422 or 5xx.
   attempts: 3,
+  // How long one call to GitHub may take, so a hung one can't hold up
+  // the run (and every later run, which waits on it) for long.
+  timeoutMs: 30_000,
 };
 const PER_PAGE = 100;
 // Deliveries newer than this may still be in flight (GitHub waits 10 s),
@@ -217,7 +220,7 @@ export class Control extends DurableObject<Env> {
     for (let page = 0; page < REDELIVERY_LIMITS.pages; page++) {
       const saved = this.getMeta("scan_next");
       const url = saved ?? `${GITHUB_API_URL}/app/hook/deliveries?per_page=${PER_PAGE}`;
-      const res = await fetch(url, { headers });
+      const res = await fetch(url, { headers, signal: AbortSignal.timeout(REDELIVERY_LIMITS.timeoutMs) });
       if (!res.ok) {
         await res.body?.cancel();
         // GitHub won't take the saved page link (expired, say): start the
@@ -308,7 +311,11 @@ export class Control extends DurableObject<Env> {
     for (const row of this.due()) {
       const ordered = INSTALLATION_EVENTS.has(row.event) && row.installation_id !== null;
       if (ordered && held.has(row.installation_id!)) continue;
-      const res = await fetch(`${GITHUB_API_URL}/app/hook/deliveries/${row.delivery_id}/attempts`, { method: "POST", headers });
+      const res = await fetch(`${GITHUB_API_URL}/app/hook/deliveries/${row.delivery_id}/attempts`, {
+        method: "POST",
+        headers,
+        signal: AbortSignal.timeout(REDELIVERY_LIMITS.timeoutMs),
+      });
       await res.body?.cancel();
       if (res.status !== 422) refusedInARow = 0;
       if (res.ok) {

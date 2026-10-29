@@ -80,7 +80,15 @@ class FakeHooks {
       const req = new Request(input, init);
       const url = new URL(req.url);
       this.calls++;
-      if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
+      if (this.delayMs) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, this.delayMs);
+          req.signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            reject(req.signal.reason);
+          });
+        });
+      }
       if (url.origin !== API) throw new Error(`unexpected fetch ${req.url}`);
       if ((req.headers.get("Authorization") ?? "").split(".").length !== 3) return Response.json({}, { status: 401 });
       if (req.method === "GET" && url.pathname === "/app/hook/deliveries") return this.list(url);
@@ -419,6 +427,25 @@ describe("redelivery when things go wrong", () => {
     const stub = control();
     expect(await stub.redeliver()).toMatchObject({ redelivered: 1, pending: 2 });
     expect(gh.redelivered).toEqual([comment.id]);
+  });
+
+  it("gives up on a call to GitHub that hangs", async () => {
+    const gh = hooks();
+    gh.add(502);
+    gh.delayMs = 5_000;
+    const stub = control();
+    const timeout = REDELIVERY_LIMITS.timeoutMs;
+    REDELIVERY_LIMITS.timeoutMs = 50;
+    try {
+      const run = await stub.redeliver();
+      expect(run.error).toMatch(/timed out|abort/i);
+      expect(run.pages).toBe(0);
+      // The next run isn't held up.
+      gh.delayMs = 0;
+      expect(await stub.redeliver()).toMatchObject({ redelivered: 1 });
+    } finally {
+      REDELIVERY_LIMITS.timeoutMs = timeout;
+    }
   });
 
   it("makes a real run wait for a dry run under way, then run", async () => {
