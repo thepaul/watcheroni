@@ -808,6 +808,12 @@ with no runtime dependencies, so installing is quick and there's nothing
 to break. Later, for people without Node: standalone binaries built with
 `bun build --compile` on GitHub Releases, and a Homebrew formula.
 
+*As built:* `watcheroni` and `@watcheroni/protocol` (built to JS and
+`.d.ts`; the workspace uses its TypeScript source) are published together
+from a `vX.Y.Z` tag by `.github/workflows/release.yml`, with provenance.
+The server carries the same version for `/v1/meta`. See
+[RELEASING.md](RELEASING.md).
+
 ### Commands
 
 ```

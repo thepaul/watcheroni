@@ -1,0 +1,79 @@
+name: Release
+
+# Pushing a tag vX.Y.Z publishes watcheroni and @watcheroni/protocol X.Y.Z
+# to npm with provenance, after the same checks as CI. See RELEASING.md.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    permissions:
+      contents: read
+      # For provenance, and for npm trusted publishing once it's set up.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          # Node 26 comes with npm 11, which can publish through trusted
+          # publishing (OIDC) as well as with a token.
+          node-version: 26
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Check the tag matches the package versions
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          status=0
+          for pkg in packages/cli packages/protocol packages/server; do
+            version=$(node -p "require('./$pkg/package.json').version")
+            if [ "v$version" != "$TAG" ]; then
+              echo "::error file=$pkg/package.json::version is $version but the tag is $TAG"
+              status=1
+            fi
+          done
+          exit $status
+      - run: npm run build -w watcheroni
+      - run: npm run build -w @watcheroni/protocol
+      - name: Check the CLI bundle runs
+        run: node packages/cli/dist/watcheroni.mjs --version
+      # Each publish is skipped if that version is already on npm, so a
+      # run that failed halfway can be re-run.
+      - name: Publish @watcheroni/protocol
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version=$(node -p "require('./packages/protocol/dist/package.json').version")
+          if npm view "@watcheroni/protocol@$version" version >/dev/null 2>&1; then
+            echo "@watcheroni/protocol@$version is already published"
+          else
+            npm publish ./packages/protocol/dist --provenance --access public
+          fi
+      - name: Publish watcheroni
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version=$(node -p "require('./packages/cli/package.json').version")
+          if npm view "watcheroni@$version" version >/dev/null 2>&1; then
+            echo "watcheroni@$version is already published"
+          else
+            npm publish -w watcheroni --provenance --access public
+          fi
