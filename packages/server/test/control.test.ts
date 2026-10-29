@@ -2,7 +2,7 @@ import examples from "@octokit/webhooks-examples/api.github.com/index.json";
 import { createScheduledController, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { REDELIVERY_LIMITS, nextLink, retryable, type Control, type ControlStats, type RedeliveryRun } from "../src/control";
+import { REDELIVERY_LIMITS, nextLink, parseDeliveries, retryable, type Control, type ControlStats, type RedeliveryRun } from "../src/control";
 import type { WatchEvent } from "../src/protocol";
 import { sign } from "../src/webhook/signature";
 import worker from "../src/worker";
@@ -24,7 +24,8 @@ afterEach(() => {
 // ---- A stand-in for GitHub's webhook deliveries ----------------------
 
 interface FakeDelivery {
-  id: number;
+  // Decimal digits: GitHub's IDs are int64s past 2^53.
+  id: string;
   guid: string;
   delivered_at: string;
   redelivery: boolean;
@@ -36,8 +37,10 @@ interface FakeDelivery {
 }
 
 // Delivery IDs grow across tests too, since the `control` object's cursor
-// outlives a test.
-let nextDeliveryId = 5_000_000;
+// outlives a test. They start where GitHub's were in October 2026, far
+// past 2^53, so neighbours round to the same JS number.
+let nextDeliveryId = 3850938326099951600n;
+const plus = (id: string, n: number) => String(BigInt(id) + BigInt(n));
 
 class FakeHooks {
   deliveries: FakeDelivery[] = [];
@@ -45,8 +48,8 @@ class FakeHooks {
   calls = 0;
   lists = 0;
   failList: (n: number, url: URL) => number = () => 0;
-  redelivered: number[] = [];
-  redeliverStatus: number | ((id: number) => number) = 202;
+  redelivered: string[] = [];
+  redeliverStatus: number | ((id: string) => number) = 202;
   // How long GitHub takes to answer, so that calls can overlap.
   delayMs = 0;
   // The status a redelivery itself gets. By default it succeeds.
@@ -61,7 +64,7 @@ class FakeHooks {
     more: Partial<FakeDelivery> = {},
   ): FakeDelivery {
     const d: FakeDelivery = {
-      id: nextDeliveryId++,
+      id: String(nextDeliveryId++),
       guid,
       delivered_at: new Date(Date.now() - ageMs).toISOString(),
       redelivery: false,
@@ -93,7 +96,7 @@ class FakeHooks {
       if ((req.headers.get("Authorization") ?? "").split(".").length !== 3) return Response.json({}, { status: 401 });
       if (req.method === "GET" && url.pathname === "/app/hook/deliveries") return this.list(url);
       const m = url.pathname.match(/^\/app\/hook\/deliveries\/(\d+)\/attempts$/);
-      if (req.method === "POST" && m) return this.redeliver(Number(m[1]));
+      if (req.method === "POST" && m) return this.redeliver(m[1]);
       throw new Error(`unexpected fetch ${req.method} ${req.url}`);
     });
   }
@@ -103,17 +106,22 @@ class FakeHooks {
     const fail = this.failList(++this.lists, url);
     if (fail) return Response.json({ message: "Failed" }, { status: fail });
     const perPage = Number(url.searchParams.get("per_page") ?? 30);
-    const start = Number(url.searchParams.get("cursor") ?? Infinity);
-    const sorted = [...this.deliveries].sort((a, b) => b.id - a.id).filter((d) => d.id <= start);
+    const cursor = url.searchParams.get("cursor");
+    const sorted = [...this.deliveries]
+      .sort((a, b) => (BigInt(b.id) > BigInt(a.id) ? 1 : -1))
+      .filter((d) => cursor === null || BigInt(d.id) <= BigInt(cursor));
     const page = sorted.slice(0, perPage);
     const headers = new Headers();
     if (sorted.length > perPage) {
       headers.set("Link", `<${API}/app/hook/deliveries?per_page=${perPage}&cursor=${sorted[perPage].id}>; rel="next"`);
     }
-    return Response.json(page.map(({ body: _, ...d }) => ({ ...d, duration: 0.1, status: "", action: null, repository_id: 1 })), { headers });
+    headers.set("content-type", "application/json");
+    // IDs as bare JSON numbers, as GitHub sends them.
+    const text = JSON.stringify(page.map(({ body: _, ...d }) => ({ ...d, duration: 0.1, status: "", action: null, repository_id: 1 })));
+    return new Response(text.replace(/"id":"(\d+)"/g, '"id":$1'), { headers });
   }
 
-  private async redeliver(id: number): Promise<Response> {
+  private async redeliver(id: string): Promise<Response> {
     const original = this.deliveries.find((d) => d.id === id);
     if (!original) return Response.json({ message: "Not Found" }, { status: 404 });
     const refuse = typeof this.redeliverStatus === "number" ? this.redeliverStatus : this.redeliverStatus(id);
@@ -133,11 +141,11 @@ function hooks(): FakeHooks {
   return gh;
 }
 
-const guidsOf = (gh: FakeHooks, ids: number[]) => ids.map((id) => gh.deliveries.find((d) => d.id === id)!.guid);
+const guidsOf = (gh: FakeHooks, ids: string[]) => ids.map((id) => gh.deliveries.find((d) => d.id === id)!.guid);
 
-async function setCursor(stub: DurableObjectStub<Control>, cursor: number): Promise<void> {
+async function setCursor(stub: DurableObjectStub<Control>, cursor: string): Promise<void> {
   await runInDurableObject(stub, (_: Control, state) => {
-    state.storage.sql.exec("INSERT INTO meta (k, v) VALUES ('cursor', ?)", String(cursor));
+    state.storage.sql.exec("INSERT INTO meta (k, v) VALUES ('cursor', ?)", cursor.padStart(20, "0"));
   });
 }
 
@@ -145,6 +153,16 @@ describe("helpers", () => {
   it("redelivers only what could succeed next time", () => {
     expect([0, 429, 500, 502, 503, 504].every(retryable)).toBe(true);
     expect([200, 202, 400, 401, 404, 413].some(retryable)).toBe(false);
+  });
+
+  it("keeps delivery IDs past 2^53 exact", () => {
+    const text = `[{"id":3850938326099951601,"guid":"a","installation_id":5},{"id": 3850938326099951602,"guid":"b \\"id\\":7"}]`;
+    expect(3850938326099951601 === 3850938326099951602).toBe(true);
+    const items = parseDeliveries(text);
+    expect(items.map((d) => d.id)).toEqual(["3850938326099951601", "3850938326099951602"]);
+    expect(items[0].installation_id).toBe(5);
+    expect(items[1].guid).toBe('b "id":7');
+    expect(() => parseDeliveries(`{"message":"x"}`)).toThrow(/unexpected/);
   });
 
   it("follows only GitHub's own next links", () => {
@@ -170,7 +188,7 @@ describe("redelivery", () => {
     expect(run).toMatchObject({ pages: 1, queued: 3, redelivered: 3, pending: 0, caught_up: true });
     expect(gh.redelivered).toEqual(failed.map((d) => d.id));
     // The cursor is the newest delivery that had settled.
-    expect(run.cursor).toBe(inFlight.id - 1);
+    expect(run.cursor).toBe(plus(inFlight.id, -1));
     expect(gh.redelivered).not.toContain(old.id);
     expect(gh.redelivered).not.toContain(ok.id);
     expect(gh.redelivered).not.toContain(refused.id);
@@ -206,7 +224,7 @@ describe("redelivery", () => {
     const three = await stub.redeliver();
     expect(three).toMatchObject({ pages: 1, caught_up: true });
     expect(gh.redelivered).toEqual([lastFailure.id, firstFailure.id, later.id]);
-    expect(three.cursor).toBeGreaterThan(later.id);
+    expect(BigInt(three.cursor!)).toBeGreaterThan(BigInt(later.id));
   });
 
   it("caps redeliveries per run and carries on next run", async () => {
@@ -280,6 +298,33 @@ describe("redelivery", () => {
       (instance as unknown as { env: Env }).env = { ...env, GITHUB_APP_PRIVATE_KEY: "" };
     });
     expect((await stub.redeliver()).error).toMatch(/isn't configured/);
+  });
+});
+
+describe("delivery IDs", () => {
+  it("tells apart neighbouring IDs past 2^53", async () => {
+    const gh = hooks();
+    const stub = control();
+    const before = gh.add(200, 30 * 60_000);
+    await setCursor(stub, before.id);
+    // The next ID rounds to the same JS number as the cursor.
+    const failed = gh.add(500, 20 * 60_000);
+    expect(Number(failed.id)).toBe(Number(before.id));
+    const run = await stub.redeliver();
+    expect(run).toMatchObject({ queued: 1, redelivered: 1, cursor: failed.id });
+    expect(gh.redelivered).toEqual([failed.id]);
+    expect((await stub.stats()).meta.cursor).toBe(failed.id.padStart(20, "0"));
+  });
+
+  it("starts afresh over an older table layout", async () => {
+    const stub = control();
+    const stats = await runInDurableObject(stub, (instance: Control, state) => {
+      state.storage.sql.exec("UPDATE meta SET v = '1' WHERE k = 'schema'");
+      state.storage.sql.exec("INSERT INTO meta (k, v) VALUES ('cursor', '3850938326099951600')");
+      const Fresh = instance.constructor as new (s: DurableObjectState, e: Env) => Control;
+      return new Fresh(state, env).stats();
+    });
+    expect(stats.meta).toEqual({ schema: "2" });
   });
 });
 
@@ -384,7 +429,7 @@ describe("redelivery when things go wrong", () => {
     const stub = control();
 
     const dry = await stub.redeliver({ dryRun: true });
-    expect(dry.would_redeliver?.map((r) => r.delivery_id)).toEqual([repos.id, other.id, repos.id + 2]);
+    expect(dry.would_redeliver?.map((r) => r.delivery_id)).toEqual([repos.id, other.id, plus(repos.id, 2)]);
     expect(gh.redelivered).toEqual([]);
     gh.add(200, 2 * 60_000, undefined, undefined, inst(9));
     expect(await stub.redeliver()).toMatchObject({ redelivered: 2, pending: 0 });

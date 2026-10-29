@@ -589,6 +589,11 @@ server can be down without losing events.
   `?confirm=production` does it redeliver, to the App's webhook URL,
   which is production's. The free plan allows 5 cron triggers an
   account.
+- **Delivery IDs** are int64s already past 2^53 (about 3.85e18 in
+  October 2026), so they never become JS numbers: the list is parsed
+  with each `id` kept as its digits, and they're stored and compared as
+  20 zero-padded digits, which sort like the numbers. RPC results and
+  `/debug/control` give them as strings.
 - **The cursor** is a delivery ID: everything up to it has been looked
   at. A run lists deliveries newest first (`per_page=100`, following
   `Link: rel="next"`) until it reaches the cursor, or 3 days back, or 1
