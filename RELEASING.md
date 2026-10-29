@@ -96,7 +96,18 @@ so the first release uses a token:
 5. Then, for each of `watcheroni` and `@watcheroni/protocol`, on its
    npmjs.com settings page add a trusted publisher: GitHub Actions,
    repository `thepaul/watcheroni`, workflow `release.yml`, environment
-   `npm`. Delete the `NPM_TOKEN` environment secret
+   `npm`, with the **publish** permission. "Stage publish" alone isn't
+   enough: the workflow runs `npm publish`, which then fails with
+   `403 Forbidden ... OIDC permission denied for this action`. An entry's
+   permissions can't be changed; `npm trust revoke` it and add it again:
+
+   ```
+   npm trust list watcheroni
+   npm trust revoke --id <id> watcheroni
+   npm trust github watcheroni --file release.yml --repo thepaul/watcheroni --env npm --allow-publish
+   ```
+
+   Delete the `NPM_TOKEN` environment secret
    (`gh secret delete NPM_TOKEN --env npm -R thepaul/watcheroni`) and
    revoke the token, and set each package to "require two-factor
    authentication and disallow tokens".
