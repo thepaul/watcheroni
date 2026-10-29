@@ -94,6 +94,11 @@ the credentials file. The environment wins, and `WATCHERONI_SERVER=`
 `WATCHERONI_CREDENTIALS` moves just the credentials. `watcheroni logout`
 revokes the key and forgets it.
 
+To run your own server, with your own GitHub App, on Cloudflare's free
+plan: `watcheroni selfhost` in a clone of the repository (see
+[the server's README](../server/README.md#run-your-own)). It also sets
+`server` in `config.json`.
+
 `wait`, `stream` and `exec` then:
 
 1. Create the inbox on the server (`PUT /v1/inboxes/{name}`), which also

@@ -56,7 +56,8 @@ There are two Workers, with separate Durable Objects and secrets:
   `--env production` on `wrangler secret put` and the like.
 
 The GitHub App's webhook can point at only one of them; it points at
-production.
+production. Its slug, for the install link, is the `GITHUB_APP_SLUG`
+var.
 
 Both need `STORAGE_KEY` (32 random bytes, base64) for the cached
 installation tokens; without it they're cached in memory only:
@@ -65,6 +66,41 @@ installation tokens; without it they're cached in memory only:
 openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put STORAGE_KEY
 openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put STORAGE_KEY --env production
 ```
+
+## Run your own
+
+To run your own server, with your own GitHub App, on your own Cloudflare
+account (the free plan is enough), from the root of a clone:
+
+```
+npm install
+npm run selfhost -- --dry-run   # what it will do, changing nothing
+npm run selfhost                # or `watcheroni selfhost`
+```
+
+It signs you in to Cloudflare if needed, deploys the Worker (named
+`watcheroni` unless `--name`) to learn its workers.dev URL, opens your
+browser at a pre-filled GitHub "create App" page (`--org ORG` for an
+organization's App, `--public` to let anyone install it), sets the
+secrets, deploys again with the App's ID, client ID and slug, asks you
+to tick "Enable Device Flow" on the App's settings page, and points the
+CLI at the new server. Then install the App on your repositories (it
+prints the link), and `npx watcheroni login` and `npx watcheroni wait`.
+Anyone else using your server sets `WATCHERONI_SERVER` to its URL.
+
+It's a script here rather than part of the published CLI because it
+deploys this source with this package's wrangler, so it needs a clone
+anyway; `watcheroni selfhost` just runs it from the clone you're in.
+
+The Worker's configuration is `wrangler.selfhost.json` (gitignored),
+made from `wrangler.jsonc`'s production settings with your name and
+App. After a `git pull`, redeploy with `npm run selfhost -- --update`,
+which remakes it. Other wrangler commands take `-c
+wrangler.selfhost.json`, e.g. `npx wrangler tail -c
+wrangler.selfhost.json`. If a run stops part way, run it again: the App
+it created is kept in `.selfhost-app.json` (mode 0600, gitignored, and
+deleted once setup finishes), so it carries on without making another.
+It won't deploy over a Worker that already exists on your account.
 
 ## Confirm hibernation on Cloudflare
 

@@ -455,9 +455,10 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   and `Installation.addRepo`. Account keeps the index that `GET` and
   `DELETE` read, and drops a row when a `watch.*` event for it is
   delivered, so it follows RepoHub ending watches.
-- The install URL comes from `APP_SLUG` in `src/subscriptions.ts`, not a
-  `GITHUB_APP_SLUG` var. `GET /debug/installations/{id}` shows the
-  object's state.
+- The install URL (in `/v1/meta`, `app_not_installed` and the landing
+  page) comes from the `GITHUB_APP_SLUG` var, through `installUrl(env)`
+  in `src/subscriptions.ts`; a self-hosted copy has its own App.
+  `GET /debug/installations/{id}` shows the object's state.
 
 ### Control
 
@@ -1009,7 +1010,7 @@ acknowledgement.
 ```
 git clone https://github.com/<owner>/watcheroni && cd watcheroni
 npm install
-npx watcheroni selfhost
+npm run selfhost            # or `watcheroni selfhost`, in the clone
 ```
 
 `selfhost` walks through:
@@ -1025,6 +1026,49 @@ npx watcheroni selfhost
 4. `wrangler deploy`, then pointing the CLI at the new server.
 
 It runs on the deployer's own Cloudflare account, free plan included.
+
+*As built:* the work is a script with the server,
+`packages/server/selfhost/selfhost.ts`, run by `npm run selfhost` at the
+root; the CLI's `watcheroni selfhost` finds it in the clone it's run in
+and runs it, and outside a clone says to clone. Not a CLI command proper,
+because it deploys the server's source with the server's own `wrangler`:
+it needs a clone whatever runs it, and putting it in the CLI would mean
+publishing `wrangler` or the server with a package that is otherwise one
+dependency-free file. In order, it:
+
+1. checks `wrangler whoami`, and runs `wrangler login` if needed;
+2. refuses if a Worker of that name (`--name`, default `watcheroni`)
+   already exists on the account, so it can't deploy over a real server;
+3. deploys once with empty GitHub vars, to learn the Worker's workers.dev
+   URL, which the App's URLs need;
+4. serves a page on `127.0.0.1` that posts the manifest to GitHub
+   (`--org` for an organization's App; private unless `--public`;
+   named `watcheroni-<workers.dev subdomain>` unless `--app-name`), and
+   exchanges the code GitHub redirects back with at
+   `POST /app-manifests/{code}/conversions`;
+5. sets the five secrets with `wrangler secret put`, values on stdin;
+6. deploys with `GITHUB_APP_ID`, `GITHUB_CLIENT_ID` and `GITHUB_APP_SLUG`;
+7. has the user tick "Enable Device Flow" on the App's settings page,
+   since a manifest can't, and checks it by starting a device flow until
+   GitHub stops answering `device_flow_disabled`;
+8. checks `/v1/meta` reports the new client ID, and sets `server` in
+   `~/.config/watcheroni/config.json`.
+
+The Worker's configuration is `packages/server/wrangler.selfhost.json`,
+gitignored, made from `wrangler.jsonc`'s production environment (its
+bindings and crons) under the deployer's name, on workers.dev, with
+their App's vars. It's remade on every run, so `npm run selfhost --
+--update` after a pull picks up new bindings, migrations and crons and
+deploys. GitHub shows the private key once, so the App's details and
+generated keys are saved in `.selfhost-app.json` (mode 0600,
+gitignored) as soon as the App exists, and a run that stopped part way
+carries on with them; the file is deleted once setup finishes.
+`--dry-run` prints each command, the configuration and the manifest,
+and changes nothing. Its tests (`packages/server/selfhost/test`) run in
+Node with Cloudflare and GitHub stubbed, including the local callback
+server; a real run against a fresh Cloudflare account hasn't been done
+yet. A custom domain is by hand: add a route to the configuration and
+change the App's webhook and Setup URLs.
 
 ## Testing
 
