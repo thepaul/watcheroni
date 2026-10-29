@@ -50,6 +50,7 @@ import {
 export const SERVER_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const CONFIG_FILE = "wrangler.selfhost.json";
 export const PENDING_FILE = ".selfhost-app.json";
+export const WORKER_FILE = ".selfhost-worker.json";
 
 export const DEFAULT_NAME = "watcheroni";
 
@@ -65,15 +66,30 @@ export interface Options {
 }
 
 // .selfhost-app.json: written once the check that no Worker of this name
-// exists has passed, before the first deploy, so a later run knows the
-// Worker there is the one selfhost made. The App and its keys join it
-// once GitHub has made the App, since GitHub shows the key only once.
+// exists has passed, before the first deploy. After that deploy it says
+// `created`, with the newest version ID selfhost made, and a later run
+// carries on only if the Worker's deployment history still has that
+// version: otherwise the Worker there now isn't the one selfhost made.
+// The App and its keys join it once GitHub has made the App, since GitHub
+// shows the key only once.
 interface State {
   name: string;
   account_id: string;
+  created?: boolean;
+  version_id?: string;
   app?: NewApp;
   ticket_key?: string;
   storage_key?: string;
+}
+
+// .selfhost-worker.json, once setup has finished: the same for --update,
+// so an edited wrangler.selfhost.json can't send a deploy to another
+// Worker. (Not in wrangler.selfhost.json itself, since wrangler warns
+// about fields it doesn't know.)
+interface WorkerRecord {
+  name: string;
+  account_id: string;
+  version_id: string;
 }
 
 export interface Deps {
@@ -169,6 +185,38 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
 
   const writeConfig = (vars: WorkerVars) =>
     deps.writeFile(CONFIG_FILE, `${JSON.stringify(selfhostConfig(wranglerJsonc, name, vars, accountId), null, 2)}\n`);
+  // The Worker's deployment history: the version IDs in it, newest last,
+  // or null if there's no such Worker.
+  const history = async (): Promise<string[] | null> => {
+    const { code, output, stdout } = await wrangler(["deployments", "list", "--name", name, "--json"], { quiet: true });
+    if (code !== 0) {
+      if (/\b10007\b/.test(output)) return null;
+      throw new SelfhostFailed(`couldn't read the deployment history of the Worker ${name}`);
+    }
+    let list: { created_on?: string; versions?: { version_id?: string }[] }[];
+    try {
+      list = JSON.parse(stdout ?? "");
+    } catch {
+      throw new SelfhostFailed(`couldn't read the deployment history of the Worker ${name}`);
+    }
+    return [...list]
+      .sort((a, b) => String(a.created_on).localeCompare(String(b.created_on)))
+      .flatMap((d) => (d.versions ?? []).map((v) => String(v.version_id)));
+  };
+  // Before changing the Worker: is it still the one selfhost deployed?
+  const confirm = async (versionId: string, fix: string) => {
+    if (!(await history())?.includes(versionId)) {
+      throw new SelfhostFailed(
+        `the Worker ${name} on Cloudflare account ${accountId} isn't the one selfhost deployed: its deployment history ` +
+          `doesn't have version ${versionId}. It may have been deleted and made again, or redeployed many times since. ${fix}`,
+      );
+    }
+  };
+  const newestVersion = async () => {
+    const versions = await history();
+    if (!versions?.length) throw new SelfhostFailed(`the Worker ${name} has no deployments`);
+    return versions[versions.length - 1];
+  };
   const deploy = async () => {
     const { code, output } = await wrangler(["deploy", "-c", CONFIG_FILE]);
     if (code !== 0) throw new SelfhostFailed(`wrangler deploy failed (exit ${code})`);
@@ -179,14 +227,26 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
           "open Workers & Pages in the dashboard once to choose a workers.dev subdomain, then run this again.",
       );
     }
-    return url;
+    const versionId = /Current Version ID:\s*([0-9a-f-]{36})/i.exec(output)?.[1] ?? (await newestVersion());
+    return { url, versionId };
   };
+  const recordWorker = (versionId: string) =>
+    deps.writeFile(WORKER_FILE, `${JSON.stringify({ name, account_id: accountId, version_id: versionId } satisfies WorkerRecord, null, 2)}\n`);
 
   if (o.update) {
     if (!saved) throw new SelfhostFailed(`there's no finished setup to update (${CONFIG_FILE}); run selfhost without --update first`);
+    const recordText = deps.readFile(WORKER_FILE);
+    const record = recordText ? (JSON.parse(recordText) as Partial<WorkerRecord>) : null;
+    if (!record?.version_id || record.name !== name || record.account_id !== accountId) {
+      throw new SelfhostFailed(
+        `${WORKER_FILE} doesn't confirm that ${CONFIG_FILE} is for the Worker selfhost deployed (${name} on account ${accountId}), so it won't deploy`,
+      );
+    }
+    await confirm(record.version_id, `Check ${CONFIG_FILE}; it won't deploy until that's sorted out.`);
     print(`Remaking ${CONFIG_FILE} from wrangler.jsonc and deploying ${name}...`);
     writeConfig(saved);
-    const url = await deploy();
+    const { url, versionId } = await deploy();
+    recordWorker(versionId);
     print(`Deployed ${url}.`);
     return url;
   }
@@ -199,25 +259,30 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
 
   // 2. A first deploy, without an App, for the URL. Never over a Worker
   // that's already there, which might be someone's real server, unless
-  // the state file says this setup made it.
+  // the state file says selfhost made it and its history agrees.
   let state: State;
-  if (pending) {
+  const saveState = () => deps.writeFile(PENDING_FILE, JSON.stringify(state, null, 2), true);
+  if (pending?.created && pending.version_id) {
     state = pending;
+    await confirm(pending.version_id, `If it's yours to remove, delete it; or remove ${PENDING_FILE} and choose another --name.`);
   } else {
-    const { code, output } = await wrangler(["deployments", "list", "--name", name, "--json"], { quiet: true });
-    if (code === 0) {
+    if ((await history()) !== null) {
       throw new SelfhostFailed(
-        `a Worker called ${name} already exists on Cloudflare account ${accountId}; choose another with --name` +
-          (config ? ` and delete ${CONFIG_FILE}` : ""),
+        pending
+          ? `a Worker called ${name} now exists on Cloudflare account ${accountId}, but selfhost's first deploy never finished, ` +
+              `so it isn't one selfhost made. If it's yours to remove, delete that Worker; or remove ${PENDING_FILE} and choose another --name.`
+          : `a Worker called ${name} already exists on Cloudflare account ${accountId}; choose another with --name` +
+              (config ? ` and delete ${CONFIG_FILE}` : ""),
       );
     }
-    if (!/\b10007\b/.test(output)) throw new SelfhostFailed(`couldn't check whether a Worker called ${name} exists`);
-    state = { name, account_id: accountId };
-    deps.writeFile(PENDING_FILE, JSON.stringify(state, null, 2), true);
+    state = pending ?? { name, account_id: accountId };
+    saveState();
   }
   print(`Deploying the Worker ${name}, so it has a URL for the App...`);
   writeConfig(state.app ? appVars(state.app) : NO_APP);
-  const url = await deploy();
+  const { url, versionId: firstVersion } = await deploy();
+  state = { ...state, created: true, version_id: firstVersion };
+  saveState();
 
   // 3. The GitHub App.
   if (state.app && state.ticket_key && state.storage_key) {
@@ -230,7 +295,7 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     const app = await deps.createApp((redirectUrl) => ({ ...appManifest({ server: url, appName, public: o.public }), redirect_url: redirectUrl }), o.org);
     state = { ...state, app, ticket_key: newKey(), storage_key: newKey() };
     // Before anything else can fail: GitHub shows the key only once.
-    deps.writeFile(PENDING_FILE, JSON.stringify(state, null, 2), true);
+    saveState();
     print(`Created ${app.html_url}.`);
   }
   const app = state.app!;
@@ -248,11 +313,17 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     const { code } = await wrangler(["secret", "put", secret, "-c", CONFIG_FILE], { input: value });
     if (code !== 0) throw new SelfhostFailed(`wrangler secret put ${secret} failed (exit ${code}); run selfhost again to carry on`);
   }
+  // Each secret made a new version; remember the newest.
+  state = { ...state, version_id: await newestVersion() };
+  saveState();
 
   // 5. The App's vars, and the real deploy.
   print(`Deploying ${name} with the App's ID, client ID and slug...`);
   writeConfig(appVars(app));
-  await deploy();
+  const { versionId: lastVersion } = await deploy();
+  state = { ...state, version_id: lastVersion };
+  saveState();
+  recordWorker(lastVersion);
 
   // 6. Device flow, which `watcheroni login` uses.
   while (!(await deps.deviceFlowEnabled(app.client_id))) {
@@ -298,6 +369,7 @@ export function defaultAppName(url: string): string {
 export function dryRunDeps(real: Pick<Deps, "readFile" | "print">): Deps {
   const { print } = real;
   let configName = "";
+  const deployed: string[] = [];
   const fakeApp: NewApp = {
     id: 123456,
     slug: "watcheroni-example",
@@ -318,8 +390,19 @@ export function dryRunDeps(real: Pick<Deps, "readFile" | "print">): Deps {
         const stdout = JSON.stringify({ loggedIn: true, accounts: [{ id: "your-account-id", name: "your account" }] });
         return { code: 0, output: stdout, stdout };
       }
-      if (args[0] === "deployments") return { code: 1, output: "This Worker does not exist on your account. [code: 10007]" };
-      if (args[0] === "deploy") return { code: 0, output: `https://${configName}.your-subdomain.workers.dev` };
+      if (args[0] === "deployments") {
+        // What this dry run has "deployed", or what a finished setup
+        // recorded; otherwise no Worker yet.
+        const record = JSON.parse(real.readFile(WORKER_FILE) ?? "null") as WorkerRecord | null;
+        const ids = deployed.length ? deployed : record?.name === args[3] ? [record.version_id] : [];
+        if (!ids.length) return { code: 1, output: "This Worker does not exist on your account. [code: 10007]" };
+        const stdout = JSON.stringify(ids.map((id, i) => ({ created_on: String(i), versions: [{ version_id: id }] })));
+        return { code: 0, output: stdout, stdout };
+      }
+      if (args[0] === "deploy") {
+        deployed.push(`00000000-0000-0000-0000-${String(deployed.length + 1).padStart(12, "0")}`);
+        return { code: 0, output: `https://${configName}.your-subdomain.workers.dev\nCurrent Version ID: ${deployed.at(-1)}` };
+      }
       return { code: 0, output: "" };
     },
     createApp: async (manifestFor, org) => {

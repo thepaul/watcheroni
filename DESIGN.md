@@ -1089,10 +1089,14 @@ order, it:
 3. refuses if a Worker of that name (`--name`, default `watcheroni`)
    already exists on the account, so it can't deploy over a real server.
    Once that check passes it writes `.selfhost-app.json` (mode 0600,
-   gitignored) with the Worker's name and account; that file is the only
-   thing that lets a later run skip the check;
+   gitignored) with the Worker's name and account;
 4. deploys once with empty GitHub vars, to learn the Worker's workers.dev
-   URL, which the App's URLs need;
+   URL, which the App's URLs need, and marks the file `created` with the
+   version ID the deploy made. Only that mark lets a later run skip the
+   check, and only while the Worker's deployment history
+   (`wrangler deployments list`) still has the recorded version, which
+   is updated after the secrets and the last deploy. A Worker deleted
+   and made again by someone else, or a hand-edited file, fails that;
 5. serves a page on `127.0.0.1` (answering only requests whose `Host` is
    `127.0.0.1:<port>`, against DNS rebinding) that posts the manifest to
    GitHub (`--org` for an organization's App; private unless `--public`;
@@ -1107,11 +1111,18 @@ order, it:
 8. has the user tick "Enable Device Flow" on the App's settings page,
    since a manifest can't, and checks it by starting a device flow until
    GitHub stops answering `device_flow_disabled`;
-9. deletes `.selfhost-app.json`, checks `/v1/meta` reports the new client
-   ID, and sets `server` in `~/.config/watcheroni/config.json`.
+9. records the Worker's name, account and newest version in
+   `.selfhost-worker.json` (gitignored; not in `wrangler.selfhost.json`,
+   since wrangler warns about fields it doesn't know), deletes
+   `.selfhost-app.json`, checks `/v1/meta` reports the new client ID, and
+   sets `server` in `~/.config/watcheroni/config.json`.
 
 A run that stops part way carries on from `.selfhost-app.json` with its
-Worker, account and App. Later runs keep to the Worker and account the
+Worker, account and App; if its first deploy never finished, it checks
+again that no Worker of that name exists. `--update` deploys only if
+`.selfhost-worker.json` matches the configuration's name and account and
+that Worker's history has the recorded version, and records the new one,
+so an edited `wrangler.selfhost.json` can't send it to another Worker. Later runs keep to the Worker and account the
 first one chose (from that file, or from the configuration once setup
 has finished): a different `--name` or `CLOUDFLARE_ACCOUNT_ID` is
 refused, as is a state file that doesn't name its Worker and account.

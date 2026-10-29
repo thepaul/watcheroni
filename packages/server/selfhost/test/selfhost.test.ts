@@ -1,9 +1,9 @@
-import { createPrivateKey, generateKeyPairSync } from "node:crypto";
+import { createPrivateKey, generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { AppManifest, NewApp } from "../manifest.ts";
 import { NO_APP, selfhostConfig } from "../setup.ts";
-import { CONFIG_FILE, type Deps, type Options, PENDING_FILE, SelfhostFailed, defaultAppName, dryRunDeps, selfhost } from "../selfhost.ts";
+import { CONFIG_FILE, type Deps, type Options, PENDING_FILE, SelfhostFailed, WORKER_FILE, defaultAppName, dryRunDeps, selfhost } from "../selfhost.ts";
 
 const WRANGLER_JSONC = readFileSync(new URL("../../wrangler.jsonc", import.meta.url), "utf8");
 const URL_ = "https://watcheroni.acme.workers.dev";
@@ -27,6 +27,9 @@ function fake(
     files?: Record<string, string>;
     loggedIn?: boolean;
     workerExists?: boolean;
+    // The Worker's deployment history on Cloudflare (null: no Worker),
+    // shared between runs that pass the same object.
+    cloud?: { history: string[] | null };
     deviceFlowAfter?: number;
     accounts?: { id: string; name: string }[];
   } = {},
@@ -36,6 +39,7 @@ function fake(
   const manifests: AppManifest[] = [];
   const printed: string[] = [];
   let loggedIn = o.loggedIn ?? true;
+  const cloud = o.cloud ?? { history: o.workerExists ? [randomUUID()] : null };
   let deviceChecks = 0;
   let pauses = 0;
   let cliServer: string | null = null;
@@ -50,10 +54,17 @@ function fake(
         case "login":
           loggedIn = true;
           return { code: 0, output: "" };
-        case "deployments":
-          return o.workerExists ? { code: 0, output: "[]" } : { code: 1, output: "This Worker does not exist on your account. [code: 10007]" };
+        case "deployments": {
+          if (!cloud.history) return { code: 1, output: "This Worker does not exist on your account. [code: 10007]" };
+          const stdout = JSON.stringify(cloud.history.map((id, i) => ({ created_on: `2026-10-29T00:00:${String(i).padStart(2, "0")}Z`, versions: [{ version_id: id }] })));
+          return { code: 0, output: stdout, stdout };
+        }
+        case "secret":
+          (cloud.history ??= []).push(randomUUID());
+          return { code: 0, output: "" };
         case "deploy":
-          return { code: 0, output: `Uploaded\n  ${URL_}\n` };
+          (cloud.history ??= []).push(randomUUID());
+          return { code: 0, output: `Uploaded\n  ${URL_}\nCurrent Version ID: ${cloud.history.at(-1)}\n` };
       }
       return { code: 0, output: "" };
     },
@@ -70,7 +81,7 @@ function fake(
     serverClientId: async () => APP.client_id,
     print: (line) => void printed.push(line),
   };
-  return { deps, files, wrangler, manifests, printed, counts: () => ({ deviceChecks, pauses }), cliServer: () => cliServer };
+  return { deps, files, cloud, wrangler, manifests, printed, counts: () => ({ deviceChecks, pauses }), cliServer: () => cliServer };
 }
 
 describe("selfhost", () => {
@@ -89,8 +100,11 @@ describe("selfhost", () => {
       "secret put GITHUB_WEBHOOK_SECRET",
       "secret put TICKET_KEY",
       "secret put STORAGE_KEY",
+      "deployments list --name",
       `deploy -c ${CONFIG_FILE}`,
     ]);
+    // The newest version is recorded for --update.
+    expect(JSON.parse(f.files[WORKER_FILE])).toEqual({ name: "watcheroni", account_id: ACCOUNT, version_id: f.cloud.history!.at(-1) });
     const [first, last] = f.wrangler.filter((c) => c.args[0] === "deploy");
     expect(first.config!.vars).toEqual({ GITHUB_APP_ID: "", GITHUB_CLIENT_ID: "", GITHUB_APP_SLUG: "" });
     expect(last.config!.vars).toEqual({ GITHUB_APP_ID: "42", GITHUB_CLIENT_ID: "Iv23mine", GITHUB_APP_SLUG: "watcheroni-acme" });
@@ -133,15 +147,15 @@ describe("selfhost", () => {
   it("carries on with the App from a run that stopped part way, without making another", async () => {
     const first = fake();
     const real = first.deps.wrangler;
+    // The first deploy worked, so the resume file says selfhost made the Worker.
     first.deps.wrangler = async (args, o) => (args[0] === "secret" ? { code: 1, output: "" } : real(args, o));
     await expect(selfhost(OPTIONS, first.deps)).rejects.toThrow(SelfhostFailed);
     const pending = JSON.parse(first.files[PENDING_FILE]);
-    expect(pending.app.id).toBe(42);
+    expect(pending).toMatchObject({ created: true, version_id: first.cloud.history![0], app: { id: 42 } });
 
-    const second = fake({ files: { [CONFIG_FILE]: first.files[CONFIG_FILE], [PENDING_FILE]: first.files[PENDING_FILE] } });
+    const second = fake({ cloud: first.cloud, files: { [CONFIG_FILE]: first.files[CONFIG_FILE], [PENDING_FILE]: first.files[PENDING_FILE] } });
     await selfhost(OPTIONS, second.deps);
     expect(second.manifests).toEqual([]);
-    expect(second.wrangler.some((c) => c.args[0] === "deployments")).toBe(false);
     const secrets = Object.fromEntries(second.wrangler.filter((c) => c.args[0] === "secret").map((c) => [c.args[2], c.input]));
     expect(secrets.TICKET_KEY).toBe(pending.ticket_key);
     expect(secrets.STORAGE_KEY).toBe(pending.storage_key);
@@ -155,10 +169,22 @@ describe("selfhost", () => {
 
     await expect(selfhost(OPTIONS, fake({ files: { [CONFIG_FILE]: config } }).deps)).rejects.toThrow(/already set up/);
 
-    const update = fake({ files: { [CONFIG_FILE]: config } });
+    const update = fake({ cloud: done.cloud, files: { [CONFIG_FILE]: config, [WORKER_FILE]: done.files[WORKER_FILE] } });
     await selfhost({ ...OPTIONS, update: true }, update.deps);
-    expect(update.wrangler.map((c) => c.args[0])).toEqual(["whoami", "deploy"]);
-    expect(update.wrangler[1].config).toMatchObject({ name: "watcheroni", vars: { GITHUB_APP_SLUG: "watcheroni-acme" } });
+    expect(update.wrangler.map((c) => c.args[0])).toEqual(["whoami", "deployments", "deploy"]);
+    expect(update.wrangler[2].config).toMatchObject({ name: "watcheroni", vars: { GITHUB_APP_SLUG: "watcheroni-acme" } });
+    expect(JSON.parse(update.files[WORKER_FILE]).version_id).toBe(done.cloud.history!.at(-1));
+
+    // A configuration edited to point at another Worker, which has its own
+    // history, isn't deployed to.
+    const edited = config.replace('"name": "watcheroni"', '"name": "production"');
+    const record = update.files[WORKER_FILE].replace('"name": "watcheroni"', '"name": "production"');
+    const redirected = fake({ cloud: { history: [randomUUID()] }, files: { [CONFIG_FILE]: edited, [WORKER_FILE]: record } });
+    await expect(selfhost({ ...OPTIONS, update: true }, redirected.deps)).rejects.toThrow(/isn't the one selfhost deployed/);
+    expect(redirected.wrangler.some((c) => c.args[0] === "deploy")).toBe(false);
+    // Or one without the record at all.
+    const unrecorded = fake({ cloud: done.cloud, files: { [CONFIG_FILE]: config } });
+    await expect(selfhost({ ...OPTIONS, update: true }, unrecorded.deps)).rejects.toThrow(/doesn't confirm/);
 
     await expect(selfhost({ ...OPTIONS, update: true }, fake().deps)).rejects.toThrow(/no finished setup/);
   });
@@ -190,6 +216,31 @@ describe("selfhost keeps to one Worker on one account", () => {
     // nothing touched a Worker called watcheroni.
     expect(f.wrangler.some((c) => c.args.includes("watcheroni"))).toBe(false);
     expect(f.files[PENDING_FILE]).toBeUndefined();
+  });
+
+  it("a first deploy that failed proves nothing: a Worker that appears meanwhile is refused", async () => {
+    const cloud: { history: string[] | null } = { history: null };
+    const first = fake({ cloud });
+    const real = first.deps.wrangler;
+    first.deps.wrangler = async (args, o) => (args[0] === "deploy" ? { code: 1, output: "" } : real(args, o));
+    await expect(selfhost(OPTIONS, first.deps)).rejects.toThrow(/wrangler deploy failed/);
+    expect(JSON.parse(first.files[PENDING_FILE])).toEqual({ name: "watcheroni", account_id: ACCOUNT });
+
+    // Someone else makes a Worker of that name.
+    cloud.history = [randomUUID()];
+    const second = fake({ cloud, files: { ...first.files } });
+    await expect(selfhost(OPTIONS, second.deps)).rejects.toThrow(/first deploy never finished, so it isn't one selfhost made/);
+    expect(second.wrangler.some((c) => ["deploy", "secret"].includes(c.args[0]))).toBe(false);
+    expect(cloud.history).toHaveLength(1);
+  });
+
+  it("refuses to carry on when the recorded version isn't in the Worker's history", async () => {
+    const pending = state({ created: true, version_id: randomUUID(), app: APP, ticket_key: "t", storage_key: "s" });
+    for (const history of [[randomUUID()], null]) {
+      const f = fake({ cloud: { history }, files: { [PENDING_FILE]: pending } });
+      await expect(selfhost(OPTIONS, f.deps)).rejects.toThrow(/isn't the one selfhost deployed/);
+      expect(f.wrangler.some((c) => ["deploy", "secret"].includes(c.args[0]))).toBe(false);
+    }
   });
 
   it("refuses a --name that differs from the resume file or the configuration", async () => {

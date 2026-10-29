@@ -6,3 +6,4 @@ dist/
 .deploy.vars
 .selfhost-app.json
 wrangler.selfhost.json
+.selfhost-worker.json

@@ -106,8 +106,11 @@ Worker's name and account, and then the App it created, are kept in
 `.selfhost-app.json` (mode 0600, gitignored, and deleted once setup
 finishes), so it carries on with the same Worker and without making
 another App. It won't deploy over a Worker that already exists on your
-account unless that file says selfhost made it, and later runs refuse a
-different `--name`. If GitHub creates the App but the next step fails,
+account unless that file says selfhost made it and the Worker's
+deployment history still has the version selfhost recorded, and later
+runs refuse a different `--name`. `--update` checks the same against
+`.selfhost-worker.json` (gitignored), which records the Worker once
+setup has finished. If GitHub creates the App but the next step fails,
 the App's key can't be fetched again: delete the App (it says where)
 and run it again.
 
