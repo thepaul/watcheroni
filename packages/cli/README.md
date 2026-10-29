@@ -96,7 +96,7 @@ revokes the key and forgets it.
 
 To run your own server, with your own GitHub App, on Cloudflare's free
 plan: `watcheroni selfhost` in a clone of the repository (see
-[the server's README](../server/README.md#run-your-own)). It also sets
+[the server's README](https://github.com/thepaul/watcheroni/tree/main/packages/server#run-your-own)). It also sets
 `server` in `config.json`.
 
 `wait`, `stream` and `exec` then:
