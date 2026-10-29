@@ -125,11 +125,21 @@ describe("login", () => {
 });
 
 describe("meta", () => {
-  it("sends browsers at the root to the project page", async () => {
-    // Not followed: here the follow-up would come back to this Worker.
-    const res = await call("/", { redirect: "manual" });
-    expect(res.status).toBe(302);
-    expect(res.headers.get("Location")).toBe("https://github.com/thepaul/watcheroni");
+  it("serves a landing page at the root", async () => {
+    const res = await call("/");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/^text\/html/);
+    // Nothing from another host, and no scripts at all.
+    expect(res.headers.get("content-security-policy")).toContain("default-src 'none'");
+    expect(res.headers.get("set-cookie")).toBeNull();
+    const html = await res.text();
+    expect(html).toContain('href="https://github.com/apps/watcheroni/installations/new"');
+    expect(html).toContain("npx watcheroni login");
+    expect(html).toContain("npx watcheroni wait");
+    expect(html).toContain("claude plugin install watcheroni@watcheroni");
+    expect(html).toContain("is still open. Run `watcheroni wait` again to keep watching.");
+    expect(html).not.toMatch(/<script|src="http/);
+    expect((await call("/", { method: "HEAD" })).status).toBe(200);
     expect((await call("/", { method: "POST" })).status).toBe(401);
   });
 
@@ -140,6 +150,8 @@ describe("meta", () => {
     const html = await res.text();
     expect(html).toContain("watcheroni is installed");
     expect(html).toContain("npx watcheroni login");
+    expect(html).toContain('href="/"');
+    expect(html).not.toContain("<script");
     const requested = await (await call("/github/setup?setup_action=request&installation_id=<script>")).text();
     expect(requested).toContain("Installation requested");
     expect(requested).not.toContain("<script>");
