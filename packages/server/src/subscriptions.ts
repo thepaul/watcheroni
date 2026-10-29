@@ -109,7 +109,7 @@ export async function createSubscription(
       ttl_seconds: parsed.ttl_seconds,
       verified_until: verifiedUntil,
     },
-    repo,
+    { ...repo, installation_id: found.id },
     baseline,
   );
   if (!result.ok) {

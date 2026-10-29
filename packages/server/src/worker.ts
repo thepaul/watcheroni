@@ -422,7 +422,10 @@ async function webhook(request: Request, env: Env): Promise<Response> {
   const events = normalise(event, delivery, payload, new Date().toISOString());
   // Deliveries that normalise to nothing never reach a Durable Object.
   const repoId = events[0]?.repo?.id;
-  const ingest = repoId ? await repoHubStub(env, repoId).ingest(delivery, events) : null;
+  const installationId = (payload as { installation?: { id?: unknown } }).installation?.id;
+  const ingest = repoId
+    ? await repoHubStub(env, repoId).ingest(delivery, events, typeof installationId === "number" ? installationId : undefined)
+    : null;
   return json({ events, ingest }, 202);
 }
 
@@ -448,18 +451,19 @@ function installationFact(payload: {
 // Subscriptions straight into RepoHub, with no GitHub checks, for tests
 // and for poking at a RepoHub:
 //   GET    /debug/repos/{id}                     RepoHub's state
-//   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, ignore?, full_name?, baseline?}
+//   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, ignore?, full_name?, installation_id?, baseline?}
 //   DELETE /debug/repos/{id}/subscriptions/{sub}
 async function debugRepo(request: Request, env: Env, repoId: number, subs: boolean, subId?: string): Promise<Response> {
   const hub = repoHubStub(env, repoId);
   if (!subs && request.method === "GET") return json(await hub.stats());
   if (subs && !subId && request.method === "POST") {
-    const body = await readJson<NewSubscription & { full_name?: string; private?: boolean; baseline?: PrBaseline }>(request);
+    const body = await readJson<NewSubscription & { full_name?: string; private?: boolean; installation_id?: number; baseline?: PrBaseline }>(request);
     if (!body || typeof body.inbox !== "string" || !INBOX_NAME.test(body.inbox)) {
       return problem(400, "invalid_request", "Body needs account, inbox and pr");
     }
-    const { full_name = `repo-${repoId}`, private: isPrivate, baseline, ...sub } = body;
-    const result = await hub.subscribe({ ...sub, pr: sub.pr ?? null }, { id: repoId, full_name, private: isPrivate }, baseline);
+    const { full_name = `repo-${repoId}`, private: isPrivate, installation_id, baseline, ...sub } = body;
+    const repo = { id: repoId, full_name, private: isPrivate, installation_id };
+    const result = await hub.subscribe({ ...sub, pr: sub.pr ?? null }, repo, baseline);
     if (!result.ok) {
       const { status, code, detail } = result;
       return problem(status, code, detail, result.retry_after ? { retry_after: result.retry_after } : {});

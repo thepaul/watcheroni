@@ -232,7 +232,7 @@ describe("subscribing to a public repo", () => {
     // RepoHub has the routing copy, with the baseline.
     const stats = await hubStats(repo.id);
     expect(stats.subscriptions.map((s) => [s.id, s.account, s.inbox, s.pr])).toEqual([[sub.id, user.id, "box", 7]]);
-    expect(stats.prs).toEqual([{ number: 7, state: "open", draft: 0, head_sha: SHA, base_ref: "main" }]);
+    expect(stats.prs).toEqual([{ number: 7, state: "open", draft: 0, head_sha: SHA, base_ref: "main", mergeable: "mergeable" }]);
     expect((await installation(repo.installation!).stats()).repos).toEqual([repo.id]);
 
     // A review on the PR reaches the inbox.
