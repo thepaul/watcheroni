@@ -412,14 +412,19 @@ export class ServerReader {
           this.o.log(`${this.client.url}: ${msg.code}${msg.detail ? `: ${msg.detail}` : ""}`);
         }
       });
-      ws.addEventListener("close", (ev) => {
+      const finish = (code: number, reason: string) => {
         clearTimeout(connectTimer);
         clearInterval(pinger);
         if (this.ws === ws) this.ws = null;
-        resolve({ opened, code: ev.code, reason: ev.reason });
+        resolve({ opened, code, reason });
+      };
+      ws.addEventListener("close", (ev) => finish(ev.code, ev.reason));
+      // An error is followed by close, except on Node 22, whose WebSocket
+      // fires only the error when the handshake fails (a non-101 answer,
+      // such as a wrong key), so a failed open ends here.
+      ws.addEventListener("error", () => {
+        if (!opened) finish(1006, "");
       });
-      // An error is always followed by close.
-      ws.addEventListener("error", () => {});
       this.abort.signal.addEventListener("abort", () => {
         if (ws.readyState === WebSocket.CONNECTING) ws.close();
       });
