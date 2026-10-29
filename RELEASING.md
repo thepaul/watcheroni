@@ -77,8 +77,11 @@ The packages must exist on npm before trusted publishing can be set up,
 so the first release uses a token:
 
 1. On npmjs.com, create a granular access token with read and write
-   access to all packages (or the `watcheroni` scope), "bypass two-factor
-   authentication" ticked, and a short expiry (a week).
+   access to **all packages**, "bypass two-factor authentication" ticked,
+   and a short expiry (a week). Not just the `watcheroni` scope or org:
+   that covers `@watcheroni/protocol`, but the unscoped `watcheroni` is a
+   new package of your own user, and creating it with such a token fails
+   with `403 Forbidden - PUT https://registry.npmjs.org/watcheroni`.
 2. In the repository's Settings, Environments, create the `npm`
    environment (if a release run hasn't already). Under "Deployment
    branches and tags", choose "Selected branches and tags" and add the
