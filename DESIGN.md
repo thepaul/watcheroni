@@ -795,16 +795,20 @@ earlier shape of them under schema 3), fed by internal kinds from
   quick status that finishes before Actions creates its runs gives an
   early `checks.completed`, and the full one follows. The CLI's local
   mode re-sends on the same changes (`Memory.rollup.data`).
-- **While throttled** no webhook's events are delivered, but PR facts
+- **While throttled** a webhook's events aren't delivered, but PR facts
   (a push, a base change, a merge) and check facts are still recorded
   and rolled up, so a push or a run that finishes during a throttle
-  doesn't leave a head stale or its rollup open. Settled
-  `checks.completed` and `merge.*` come from the alarm, so they are
-  delivered even while the repo is throttled.
+  doesn't leave a head stale or its rollup open. A merge or close still
+  ends its PR's watches: each of the PR's subscriptions gets the
+  `pr.merged` or `pr.closed` (if its kinds take it) and `watch.ended`,
+  and repository-wide ones get nothing. Settled `checks.completed` and
+  `merge.*` come from the alarm, so they are delivered even while the
+  repo is throttled.
 - **`check.failed` once per run.** A run created already finished gives
   `check.completed` and `check.failed` from its `created` webhook; if
   GitHub also sends `completed` for it, RepoHub delivers `check.failed`
-  only for the delivery that recorded the run as finished, for the first time or with a new conclusion.
+  only for the delivery that recorded the run as finished, for the
+  first time or with a new conclusion.
 - **Suites are mostly seen through their runs.** GitHub sends
   `check_suite.requested` only to the suite's own App, so the queued,
   never-run suites the rule ignores rarely appear at all. A suite first
@@ -813,7 +817,8 @@ earlier shape of them under schema 3), fed by internal kinds from
   jobs wait on earlier ones (their runs are created late) from finishing
   early. A late `created` doesn't undo a run's completion, but a run
   completed again with another conclusion (Apps can update their runs)
-  replaces it, and sends `check.failed` again if it failed;
+  replaces it if its `completed_at` is no older, and sends
+  `check.failed` again if it failed;
   suites take the newest by GitHub's `updated_at`, and statuses by their
   increasing ID; on a tie the finished one wins. A finished run with no
   conclusion counts as neutral, never as a success.

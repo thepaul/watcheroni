@@ -337,6 +337,34 @@ describe("end of a watch", () => {
 });
 
 describe("throttling", () => {
+  it("still ends the watches of a PR merged while throttled", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "a", pr: 5 });
+    await subscribe(repo, { account: acct, inbox: "reviews", pr: 5, kinds: ["review.*"] });
+    await subscribe(repo, { account: acct, inbox: "wide", pr: null, kinds: ["pr.*"] });
+    const keep = await subscribe(repo, { account: acct, inbox: "b", pr: 6 });
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("INSERT INTO buckets (name, tokens, updated_at) VALUES ('ingest', 0, ?)", Date.now());
+    });
+    const res = await hub(repo).ingest("m", [
+      fact(repo, "comment.created", 5, { comment_id: 1 }),
+      fact(repo, "pr.merged", 5, { merge_sha: SHA_B }),
+    ]);
+    expect(res).toMatchObject({ accepted: false, reason: "throttled" });
+    // The PR's subscriptions get the merge (if their kinds take it) and
+    // watch.ended, but not the comment.
+    expect(kinds(await inbox(acct, "a"))).toEqual(["repo.throttled", "pr.merged", "watch.ended"]);
+    expect(kinds(await inbox(acct, "reviews"))).toEqual(["repo.throttled", "watch.ended"]);
+    // Nothing for other PRs or repository-wide subscriptions.
+    expect(kinds(await inbox(acct, "wide"))).toEqual(["repo.throttled"]);
+    expect(kinds(await inbox(acct, "b"))).toEqual(["repo.throttled"]);
+    const s = await stats(repo);
+    expect(s.subscriptions.map((x) => x.id).sort()).toEqual([keep.id, s.subscriptions.find((x) => x.pr === null)!.id].sort());
+    expect(s.prs.map((p) => p.number)).toEqual([6]);
+  });
+
+
   it("drops deliveries past the burst, tells each inbox once, and reports the count when it lifts", async () => {
     const repo = fresh();
     const acct = fresh();
@@ -612,6 +640,30 @@ describe("checks.completed", () => {
       ["check.failed", "failure"],
       ["checks.completed", "failure"],
     ]);
+  });
+
+  it("keeps the latest completion of a run when they arrive out of order", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "i", pr: 7, kinds: ["check.failed"], baseline: { state: "open", head_sha: SHA_A } });
+    const completed = (conclusion: string, completedAt: string) => {
+      const payload = example("check_run", "completed");
+      Object.assign(payload.check_run as object, {
+        id: 811, name: "external", head_sha: SHA_A, status: "completed", conclusion, completed_at: completedAt,
+        pull_requests: [{ number: 7 }], check_suite: { id: 91 }, app: { id: 7 },
+      });
+      return payload;
+    };
+    await webhook("check_run", completed("failure", "2026-10-28T10:02:00Z"), repo);
+    // An older completion arrives late: it changes nothing.
+    await webhook("check_run", completed("success", "2026-10-28T10:01:00Z"), repo);
+    await webhook("check_run", completed("failure", "2026-10-28T10:02:00Z"), repo);
+    const rows = (await stats(repo)).checks.filter((c) => c.kind === "run");
+    expect(rows.map((c) => c.conclusion)).toEqual(["failure"]);
+    expect((await inbox(acct, "i")).map((e) => e.kind)).toEqual(["check.failed"]);
+    // A newer one does.
+    await webhook("check_run", completed("success", "2026-10-28T10:03:00Z"), repo);
+    expect((await stats(repo)).checks.filter((c) => c.kind === "run").map((c) => c.conclusion)).toEqual(["success"]);
   });
 
   it("follows a push made while the repo is throttled", async () => {

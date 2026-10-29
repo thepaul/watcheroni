@@ -177,7 +177,8 @@ type CheckRow = {
   suite_id: number | null;
   status: string | null; // queued, in_progress, completed; pending for a status
   conclusion: string | null;
-  // Newest wins: a status's ID, or GitHub's `updated_at` for a suite.
+  // Newest wins: a status's ID, a suite's `updated_at`, a run's
+  // `completed_at`.
   ord: number;
   // When RepoHub last heard of it, for pruning.
   seen_at: number;
@@ -565,6 +566,11 @@ export class RepoHub extends DurableObject<Env> {
       }
       this.rollUp(heads, now);
       this.throttle(now, outgoing);
+      // A merge or close still ends its watches, so none is left hanging:
+      // each subscription gets the event and `watch.ended`, nothing else.
+      const ending = facts.filter((e) => e.pr !== null && (e.kind === "pr.merged" || e.kind === "pr.closed"));
+      this.match([...ending, ...ending.map(watchEnded)], outgoing, true);
+      this.forgetEnded(ending);
       const ids = this.enqueue(outgoing, now);
       result.events = countItems(outgoing);
       Object.assign(result, await this.deliverRows(ids, now));
@@ -594,26 +600,9 @@ export class RepoHub extends DurableObject<Env> {
 
     // 5. Match, ending watches on PRs that merged or closed.
     const ended = events.filter((e) => e.pr !== null && (e.kind === "pr.merged" || e.kind === "pr.closed"));
-    for (const e of ended) {
-      events.push({
-        v: 1,
-        id: `${e.id}.ended`,
-        sub: null,
-        kind: "watch.ended",
-        at: e.at,
-        received_at: e.received_at,
-        repo: e.repo,
-        pr: e.pr,
-        actor: null,
-        data: { reason: e.kind === "pr.merged" ? "merged" : "closed" },
-        links: e.links,
-      });
-    }
+    events.push(...ended.map(watchEnded));
     this.match(events.filter((e) => !INTERNAL_KINDS.has(e.kind)), outgoing);
-    for (const e of ended) {
-      this.sql.exec("DELETE FROM subscriptions WHERE pr = ?", e.pr);
-      this.forgetPrIfUnwatched(e.pr!);
-    }
+    this.forgetEnded(ended);
 
     // 6. Outbox first, then deliver what fits inline.
     const ids = this.enqueue(outgoing, now);
@@ -697,9 +686,19 @@ export class RepoHub extends DurableObject<Env> {
     return prs.map(({ number }) => ({ ...e, id: `${e.id}.pr${number}`, pr: number }));
   }
 
+  // Forgets the subscriptions of PRs that `ended` (merges and closes)
+  // finished, once their last events are matched.
+  private forgetEnded(ended: UnsequencedEvent[]): void {
+    for (const e of ended) {
+      this.sql.exec("DELETE FROM subscriptions WHERE pr = ?", e.pr);
+      this.forgetPrIfUnwatched(e.pr!);
+    }
+  }
+
   // Groups matching events by account. An event goes to each inbox once,
-  // naming the first subscription in that inbox that matched.
-  private match(events: UnsequencedEvent[], out: Map<number, Delivery[]>): void {
+  // naming the first subscription in that inbox that matched. `prOnly`
+  // leaves out repository-wide subscriptions.
+  private match(events: UnsequencedEvent[], out: Map<number, Delivery[]>, prOnly = false): void {
     if (!events.length) return;
     const prs = [...new Set(events.map((e) => e.pr).filter((n) => n !== null))];
     const subs = this.sql
@@ -712,7 +711,7 @@ export class RepoHub extends DurableObject<Env> {
     for (const event of events) {
       const inboxes = new Set<string>();
       for (const sub of subs) {
-        if (sub.pr === null ? event.kind.startsWith("watch.") : sub.pr !== event.pr) continue;
+        if (sub.pr === null ? prOnly || event.kind.startsWith("watch.") : sub.pr !== event.pr) continue;
         if (!matchesKind(sub.kinds, event.kind) || ignored(sub, event)) continue;
         const key = `${sub.account}\u0000${sub.inbox}`;
         if (inboxes.has(key)) continue;
@@ -788,10 +787,14 @@ export class RepoHub extends DurableObject<Env> {
     const runId = num(d.check_run_id);
     if (runId !== null) {
       // A late `created` never undoes a completion, but an App can complete
-      // a run again with another conclusion.
+      // a run again with another conclusion; the latest by `completed_at`
+      // (the fact's time) wins.
       const written = upsert(
-        "run", String(runId), done ? "completed" : (str(d.status) ?? "queued"), done ? str(d.conclusion) : null, 0,
-        done ? "checks.status IS NOT 'completed' OR excluded.conclusion IS NOT checks.conclusion" : "checks.status IS NOT 'completed'",
+        "run", String(runId), done ? "completed" : (str(d.status) ?? "queued"), done ? str(d.conclusion) : null,
+        done ? Date.parse(e.at) || 0 : 0,
+        done
+          ? "checks.status IS NOT 'completed' OR (excluded.conclusion IS NOT checks.conclusion AND excluded.ord >= checks.ord)"
+          : "checks.status IS NOT 'completed'",
       );
       if (done && written.rowsWritten > 0) finished.add(runId);
       // GitHub tells only the suite's own App that it was requested, so a
@@ -1207,6 +1210,23 @@ export class RepoHub extends DurableObject<Env> {
   private deleteMeta(k: string): void {
     this.sql.exec("DELETE FROM meta WHERE k = ?", k);
   }
+}
+
+// The `watch.ended` that follows a `pr.merged` or `pr.closed`.
+function watchEnded(e: UnsequencedEvent): UnsequencedEvent {
+  return {
+    v: 1,
+    id: `${e.id}.ended`,
+    sub: null,
+    kind: "watch.ended",
+    at: e.at,
+    received_at: e.received_at,
+    repo: e.repo,
+    pr: e.pr,
+    actor: null,
+    data: { reason: e.kind === "pr.merged" ? "merged" : "closed" },
+    links: e.links,
+  };
 }
 
 function toSubscription(row: SubRow): Subscription {
