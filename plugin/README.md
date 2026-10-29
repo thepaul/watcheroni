@@ -32,7 +32,7 @@ The plugin needs Node.js 22 or later. It runs the
 install it, which saves a registry check on each run:
 
 ```
-npm install -g watcheroni@^0.2.1
+npm install -g watcheroni@^0.2.2
 ```
 
 Plugin version X.Y.Z goes with CLI X.Y.Z; through npx it uses the latest

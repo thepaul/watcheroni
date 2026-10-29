@@ -1,6 +1,6 @@
 {
   "name": "@watcheroni/protocol",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Types and constants for the watcheroni protocol (PROTOCOL.md)",
   "private": true,
   "license": "MIT",

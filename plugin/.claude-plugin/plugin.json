@@ -1,6 +1,6 @@
 {
   "name": "watcheroni",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Keep watching your pull requests after you push: CI failures, reviews, comments and merge conflicts wake the session",
   "author": {
     "name": "Paul Cannon"
