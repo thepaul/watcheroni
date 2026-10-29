@@ -288,8 +288,14 @@ async function debug(request: Request, url: URL, env: Env): Promise<Response> {
   if (instRoute && request.method === "GET") return json(await installationStub(env, Number(instRoute[1])).stats());
   if (url.pathname === "/debug/control" && request.method === "GET") return json(await controlStub(env).stats());
   // One run of the redelivery cron job, now. It lists the App's
-  // deliveries, wherever they went, and redelivers to the App's webhook URL.
-  if (url.pathname === "/debug/control/redeliver" && request.method === "POST") return json(await controlStub(env).redeliver());
+  // deliveries, wherever they went, and redelivers to the App's webhook
+  // URL, which is production's even on the test server. So by default
+  // it's a dry run, listing what it would redeliver; ?confirm=production
+  // redelivers.
+  if (url.pathname === "/debug/control/redeliver" && request.method === "POST") {
+    const dryRun = url.searchParams.get("confirm") !== "production";
+    return json(await controlStub(env).redeliver({ dryRun }));
+  }
 
   const m = url.pathname.match(/^\/debug\/accounts\/(\d{1,15})(\/.*)$/);
   if (!m) return problem(404, "not_found", "No such endpoint");

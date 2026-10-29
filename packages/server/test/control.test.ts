@@ -2,7 +2,7 @@ import examples from "@octokit/webhooks-examples/api.github.com/index.json";
 import { createScheduledController, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { REDELIVERY_LIMITS, nextLink, retryable, type Control, type ControlStats } from "../src/control";
+import { REDELIVERY_LIMITS, nextLink, retryable, type Control, type ControlStats, type RedeliveryRun } from "../src/control";
 import type { WatchEvent } from "../src/protocol";
 import { sign } from "../src/webhook/signature";
 import worker from "../src/worker";
@@ -30,31 +30,46 @@ interface FakeDelivery {
   redelivery: boolean;
   status_code: number;
   event: string;
+  installation_id: number | null;
   // What the webhook carried, for redelivering it to the Worker.
   body?: { event: string; payload: unknown };
 }
 
+// Delivery IDs grow across tests too, since the `control` object's cursor
+// outlives a test.
+let nextDeliveryId = 5_000_000;
+
 class FakeHooks {
   deliveries: FakeDelivery[] = [];
-  private nextId = 5_000_000;
-  // Calls seen, and which ones to fail.
+  // Calls seen, and which ones to fail: a status, or 0 not to.
+  calls = 0;
   lists = 0;
-  failList: (n: number) => boolean = () => false;
+  failList: (n: number, url: URL) => number = () => 0;
   redelivered: number[] = [];
-  redeliverStatus = 202;
+  redeliverStatus: number | ((id: number) => number) = 202;
+  // How long GitHub takes to answer, so that calls can overlap.
+  delayMs = 0;
   // The status a redelivery itself gets. By default it succeeds.
   outcome: (d: FakeDelivery) => Promise<number> = async () => 200;
 
   // A delivery `ageMs` ago. IDs grow with each one added, as on GitHub.
-  add(status: number, ageMs = 5 * 60_000, guid: string = crypto.randomUUID(), body?: FakeDelivery["body"]): FakeDelivery {
+  add(
+    status: number,
+    ageMs = 5 * 60_000,
+    guid: string = crypto.randomUUID(),
+    body?: FakeDelivery["body"],
+    more: Partial<FakeDelivery> = {},
+  ): FakeDelivery {
     const d: FakeDelivery = {
-      id: this.nextId++,
+      id: nextDeliveryId++,
       guid,
       delivered_at: new Date(Date.now() - ageMs).toISOString(),
       redelivery: false,
       status_code: status,
       event: body?.event ?? "issue_comment",
+      installation_id: 1,
       body,
+      ...more,
     };
     this.deliveries.push(d);
     return d;
@@ -64,6 +79,8 @@ class FakeHooks {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const req = new Request(input, init);
       const url = new URL(req.url);
+      this.calls++;
+      if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
       if (url.origin !== API) throw new Error(`unexpected fetch ${req.url}`);
       if ((req.headers.get("Authorization") ?? "").split(".").length !== 3) return Response.json({}, { status: 401 });
       if (req.method === "GET" && url.pathname === "/app/hook/deliveries") return this.list(url);
@@ -75,7 +92,8 @@ class FakeHooks {
 
   // Newest first; `cursor` is the ID a page starts at.
   private list(url: URL): Response {
-    if (this.failList(++this.lists)) return Response.json({ message: "Server Error" }, { status: 502 });
+    const fail = this.failList(++this.lists, url);
+    if (fail) return Response.json({ message: "Failed" }, { status: fail });
     const perPage = Number(url.searchParams.get("per_page") ?? 30);
     const start = Number(url.searchParams.get("cursor") ?? Infinity);
     const sorted = [...this.deliveries].sort((a, b) => b.id - a.id).filter((d) => d.id <= start);
@@ -84,19 +102,19 @@ class FakeHooks {
     if (sorted.length > perPage) {
       headers.set("Link", `<${API}/app/hook/deliveries?per_page=${perPage}&cursor=${sorted[perPage].id}>; rel="next"`);
     }
-    return Response.json(page.map(({ body: _, ...d }) => ({ ...d, duration: 0.1, status: "", action: null, installation_id: 1, repository_id: 1 })), { headers });
+    return Response.json(page.map(({ body: _, ...d }) => ({ ...d, duration: 0.1, status: "", action: null, repository_id: 1 })), { headers });
   }
 
   private async redeliver(id: number): Promise<Response> {
     const original = this.deliveries.find((d) => d.id === id);
     if (!original) return Response.json({ message: "Not Found" }, { status: 404 });
-    if (this.redeliverStatus !== 202) return Response.json({}, { status: this.redeliverStatus });
+    const refuse = typeof this.redeliverStatus === "number" ? this.redeliverStatus : this.redeliverStatus(id);
+    if (refuse !== 202) return Response.json({}, { status: refuse });
     this.redelivered.push(id);
     // A redelivery is a new delivery with the same GUID. Dated a little
     // back, so the next scan doesn't wait for it to settle.
     const status = await this.outcome(original);
-    const d = this.add(status, 2 * 60_000, original.guid, original.body);
-    d.redelivery = true;
+    this.add(status, 2 * 60_000, original.guid, original.body, { redelivery: true, event: original.event, installation_id: original.installation_id });
     return Response.json({}, { status: 202 });
   }
 }
@@ -205,18 +223,20 @@ describe("redelivery", () => {
     for (let i = 0; i < 150; i++) gh.add(200, 20 * 60_000);
 
     // GitHub fails the second page.
-    gh.failList = (n) => n === 2;
+    gh.failList = (n) => (n === 2 ? 502 : 0);
     const one = await stub.redeliver();
     expect(one).toMatchObject({ pages: 1, caught_up: false, cursor: before.id, redelivered: 0 });
     expect(one.error).toMatch(/502/);
     expect((await stub.stats()).meta.last_error).toMatch(/502/);
 
     // GitHub accepts no redeliveries either.
-    gh.failList = () => false;
+    gh.failList = () => 0;
     gh.redeliverStatus = 503;
     const two = await stub.redeliver();
     expect(two).toMatchObject({ pages: 1, caught_up: true, queued: 2, redelivered: 0, pending: 2 });
     expect(two.error).toMatch(/503/);
+    // A 5xx counts as an attempt on the first row only; the rest wait.
+    expect((await stub.stats()).attempts).toEqual([{ guid: failures[0].guid, n: 1 }]);
 
     gh.redeliverStatus = 202;
     const three = await stub.redeliver();
@@ -252,6 +272,127 @@ describe("redelivery", () => {
       (instance as unknown as { env: Env }).env = { ...env, GITHUB_APP_PRIVATE_KEY: "" };
     });
     expect((await stub.redeliver()).error).toMatch(/isn't configured/);
+  });
+});
+
+describe("redelivery when things go wrong", () => {
+  it("moves past a delivery GitHub refuses with a 422, and gives up on it", async () => {
+    const gh = hooks();
+    const [bad, ...good] = [gh.add(502), gh.add(502), gh.add(502)];
+    gh.redeliverStatus = (id) => (id === bad.id ? 422 : 202);
+    const stub = control();
+
+    const one = await stub.redeliver();
+    expect(one).toMatchObject({ redelivered: 2, pending: 1 });
+    expect(one.error).toBeUndefined();
+    expect(gh.redelivered).toEqual(good.map((d) => d.id));
+    await stub.redeliver();
+    expect(await stub.redeliver()).toMatchObject({ redelivered: 0, pending: 0 });
+    const stats = await stub.stats();
+    expect(stats.queue).toEqual([]);
+    expect(stats.attempts.find((a) => a.guid === bad.guid)?.n).toBe(REDELIVERY_LIMITS.attempts);
+    // And it isn't queued again.
+    expect(await stub.redeliver()).toMatchObject({ queued: 0, pending: 0 });
+  });
+
+  it("redelivers what's queued even when listing fails", async () => {
+    const gh = hooks();
+    const failures = Array.from({ length: 15 }, () => gh.add(502));
+    const stub = control();
+    expect(await stub.redeliver()).toMatchObject({ redelivered: 10, pending: 5 });
+    gh.failList = () => 502;
+    const two = await stub.redeliver();
+    expect(two).toMatchObject({ pages: 0, redelivered: 5, pending: 0 });
+    expect(two.error).toMatch(/502/);
+    expect(gh.redelivered).toEqual(failures.map((d) => d.id));
+  });
+
+  it("starts the scan again when GitHub rejects the saved page link", async () => {
+    const gh = hooks();
+    const stub = control();
+    const before = gh.add(200, 50 * 60_000);
+    await setCursor(stub, before.id);
+    const failure = gh.add(500, 40 * 60_000);
+    for (let i = 0; i < 350; i++) gh.add(200, 20 * 60_000);
+
+    expect(await stub.redeliver()).toMatchObject({ pages: 3, caught_up: false });
+    expect((await stub.stats()).meta.scan_next).toContain("cursor=");
+    gh.failList = (_, url) => (url.searchParams.has("cursor") ? 422 : 0);
+    const two = await stub.redeliver();
+    expect(two.error).toMatch(/422/);
+    expect(two.cursor).toBe(before.id);
+    expect((await stub.stats()).meta.scan_next).toBeUndefined();
+
+    gh.failList = () => 0;
+    const lists = gh.lists;
+    expect(await stub.redeliver()).toMatchObject({ pages: 3, scanned: 300, caught_up: false, cursor: before.id });
+    expect(gh.lists).toBe(lists + 3);
+    expect(await stub.redeliver()).toMatchObject({ caught_up: true, redelivered: 1 });
+    expect(gh.redelivered).toEqual([failure.id]);
+  });
+
+  it("doesn't queue a failure whose redelivery succeeded on an earlier page and run", async () => {
+    const gh = hooks();
+    const stub = control();
+    const before = gh.add(200, 50 * 60_000);
+    await setCursor(stub, before.id);
+    const failed = gh.add(500, 40 * 60_000);
+    for (let i = 0; i < 300; i++) gh.add(200, 20 * 60_000);
+    gh.add(200, 10 * 60_000, failed.guid, undefined, { redelivery: true });
+
+    expect(await stub.redeliver()).toMatchObject({ pages: 3, caught_up: false, queued: 0 });
+    // Only the redelivery was written down, not the 299 first-time successes.
+    const remembered = await runInDurableObject(stub, (_: Control, state) =>
+      state.storage.sql.exec<{ guid: string }>("SELECT guid FROM scan_ok").toArray().map((r) => r.guid),
+    );
+    expect(remembered).toEqual([failed.guid]);
+    expect(await stub.redeliver()).toMatchObject({ pages: 1, caught_up: true, queued: 0, pending: 0 });
+    expect(gh.redelivered).toEqual([]);
+  });
+
+  it("runs once for overlapping calls", async () => {
+    const gh = hooks();
+    gh.add(502);
+    gh.delayMs = 50;
+    const stub = control();
+    const [a, b] = await Promise.all([stub.redeliver(), stub.redeliver()]);
+    expect(a).toEqual(b);
+    expect(a.redelivered).toBe(1);
+    expect(gh.calls).toBe(2); // one list, one redelivery
+  });
+
+  it("doesn't redeliver an installation event a newer one has overtaken", async () => {
+    const gh = hooks();
+    const inst = (id: number, event = "installation") => ({ installation_id: id, event });
+    // Suspended, then unsuspended: the failed suspend mustn't arrive last.
+    gh.add(503, 20 * 60_000, undefined, undefined, inst(7));
+    gh.add(200, 10 * 60_000, undefined, undefined, inst(7));
+    // Repos changes aren't undone that way, and other installations are
+    // separate.
+    const repos = gh.add(503, 15 * 60_000, undefined, undefined, inst(7, "installation_repositories"));
+    const other = gh.add(503, 15 * 60_000, undefined, undefined, inst(8));
+    // Queued, then overtaken before it was redelivered.
+    gh.add(503, 9 * 60_000, undefined, undefined, inst(9));
+    const stub = control();
+
+    const dry = await stub.redeliver({ dryRun: true });
+    expect(dry.would_redeliver?.map((r) => r.delivery_id)).toEqual([repos.id, other.id, repos.id + 2]);
+    expect(gh.redelivered).toEqual([]);
+    gh.add(200, 2 * 60_000, undefined, undefined, inst(9));
+    expect(await stub.redeliver()).toMatchObject({ redelivered: 2, pending: 0 });
+    expect(gh.redelivered).toEqual([repos.id, other.id]);
+  });
+
+  it("only dry-runs from the debug route unless told to redeliver to production", async () => {
+    const gh = hooks();
+    const d = gh.add(502);
+    const run = (query = "") => exports.default.fetch(`${BASE}/debug/control/redeliver${query}`, { method: "POST", headers: DEBUG });
+    const dry = await (await run()).json<RedeliveryRun>();
+    expect(dry.would_redeliver?.map((r) => r.guid)).toContain(d.guid);
+    expect(gh.redelivered).toEqual([]);
+    const real = await (await run("?confirm=production")).json<RedeliveryRun>();
+    expect(real.would_redeliver).toBeUndefined();
+    expect(gh.redelivered).toContain(d.id);
   });
 });
 

@@ -513,7 +513,7 @@ set and sent as `Authorization: Bearer`:
 | `POST /debug/accounts/{id}/inboxes/{name}/events` | Inject synthetic events, standing in for RepoHub |
 | `POST /debug/repos/{id}/subscriptions`, `DELETE .../{sub}` | Subscribe RepoHub directly, without the GitHub checks |
 | `GET /debug/repos/{id}`, `GET /debug/installations/{id}` | What a `RepoHub` or `Installation` object holds |
-| `GET /debug/control`, `POST /debug/control/redeliver` | What `Control` holds; one run of the redelivery job, now |
+| `GET /debug/control`, `POST /debug/control/redeliver` | What `Control` holds; one run of the redelivery job, now (a dry run unless `?confirm=production`) |
 
 ### Webhook handling in the Worker
 
@@ -581,9 +581,12 @@ server can be down without losing events.
   `env.production.triggers`; the top level has `"crons": []`). Both
   Workers use the same App, whose webhooks go to production, so a cron
   on the test server would redeliver the same failures twice. On the
-  test server `POST /debug/control/redeliver` runs the job by hand (it
-  too redelivers to the App's webhook URL, production). The free plan
-  allows 5 cron triggers an account.
+  test server `POST /debug/control/redeliver` runs the job by hand. It's
+  a dry run by default: it scans (moving the cursor and queueing
+  failures) and lists what it would redeliver. Only with
+  `?confirm=production` does it redeliver, to the App's webhook URL,
+  which is production's. The free plan allows 5 cron triggers an
+  account.
 - **The cursor** is a delivery ID: everything up to it has been looked
   at. A run lists deliveries newest first (`per_page=100`, following
   `Link: rel="next"`) until it reaches the cursor, or 3 days back, or 1
@@ -592,18 +595,42 @@ server can be down without losing events.
   cursor moves to the top only when a scan finishes. State is saved
   after every page, so a run that fails (GitHub 5xx, say) resumes where
   it stopped. Deliveries less than a minute old are left for the next
-  run, since one GitHub is still waiting on may be listed late.
+  run, since one GitHub is still waiting on may be listed late. A saved
+  page link that GitHub rejects with a 4xx restarts the scan from the
+  top, with the cursor unchanged.
 - **What's redelivered:** a GUID with a failed attempt (status 5xx, 429
   or no response) and no later successful one. The Worker's own refusals
-  (400, 401, 413) aren't. Failures go to a `queue` table; each run asks
-  GitHub to redeliver the oldest 10 (`POST .../attempts`), and the rest
-  wait. A redelivery GitHub accepts leaves the queue; if it fails as
-  well, that's a new failed delivery for a later scan. At most 3
-  redeliveries per GUID. A 400 or 404 drops the GUID; a 422 (GitHub's
-  "too many") or 5xx keeps the queue for next run.
+  (400, 401, 413) aren't. Since a GUID that failed can only succeed on a
+  redelivery, only successful redeliveries are written down during a
+  scan; a first-time success, the usual case, costs no row writes.
+  Failures go to a `queue` table; each run asks GitHub to redeliver the
+  oldest 10 (`POST .../attempts`), and the rest wait. A redelivery
+  GitHub accepts leaves the queue; if it fails as well, that's a new
+  failed delivery for a later scan. At most 3 redelivery requests per
+  GUID, counting ones GitHub refused with a 422 or 5xx, so one bad row
+  can't block the queue: a 422 moves on to the next row, a 5xx or 429
+  stops the run's redeliveries (a 429 isn't counted), and a 400 or 404
+  drops the GUID. Listing and redelivering fail separately, so a listing
+  error doesn't hold up what's already queued.
+- **Installation events.** `Installation.onEvent` doesn't dedupe or
+  order events, so a failed `installation` event (say `suspend`)
+  redelivered after a newer one for the same installation succeeded
+  (`unsuspend`) would revoke watches wrongly. The deliveries list
+  carries `event` and `installation_id`, so a failed `installation`
+  delivery isn't queued when the scan has seen a newer successful
+  `installation` delivery for that installation, and one already queued
+  is dropped when such a delivery turns up. That holds only within a
+  scan, and a newer one that lands after the old one was redelivered
+  can't undo it. `installation_repositories` is still redelivered: the
+  list doesn't say which repos an event was about, so a later `added`
+  can't be told apart from one that undoes a failed `removed`; at worst
+  a re-added repo's watches are revoked.
 - So a run makes at most 13 subrequests, and a missed delivery is
   redelivered 1 to 11 minutes after it failed, or later when more than
   10 are queued.
+- **Throughput ceiling:** a run scans at most 300 deliveries, so the job
+  keeps up with up to 300 webhooks per 10 minutes (about 43,000 a day).
+  Above that, scans fall further behind each run.
 
 ## Credentials
 
