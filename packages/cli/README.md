@@ -49,20 +49,17 @@ then polls GitHub itself every 2 minutes with your `gh` login (or
 `GH_TOKEN` / `GITHUB_TOKEN`), and that token never leaves your machine.
 See "Local mode" below.
 
-## Claude Code
+## Coding agents
 
-The watcheroni plugin for Claude Code has a session keep watching the PRs
-it opens or pushes to, in the background, and deal with failing checks
-and review feedback as they arrive:
+An agent that can run a command in the background can use `wait` as it
+is: start it, carry on, and read what it printed when it exits. What the
+agent does about the events is up to whoever sets it up. Give each agent
+session its own `--inbox` (or `WATCHERONI_INBOX`), so they don't read
+each other's events; inside Claude Code that's automatic.
 
-```
-claude plugin marketplace add thepaul/watcheroni
-claude plugin install watcheroni@watcheroni
-```
-
-It runs this CLI through npx unless it's installed. See
-[the plugin's README](https://github.com/thepaul/watcheroni/tree/main/plugin)
-for what it does and doesn't do.
+For Claude Code there's also a
+[plugin](https://github.com/thepaul/watcheroni/tree/main/plugin) that
+teaches a session the commands and puts the CLI on its PATH.
 
 ## Commands
 

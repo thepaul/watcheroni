@@ -35,14 +35,14 @@ execFile(
     // Unread events count too: a wait would print them.
     if (err || !stdout.trim() || /^Inbox \S+ is watching nothing\.$/.test(stdout.trim())) process.exit(0);
     const how = hook.source === "compact"
-      ? "If a `watcheroni wait` isn't still running in the background, start one"
-      : "Background commands from before the session was resumed have stopped, so start `watcheroni wait` again";
+      ? "A `watcheroni wait` started before the compaction may still be running in the background."
+      : "Background commands from before the session was resumed have stopped, so no `watcheroni wait` is running.";
     const context = [
-      `watcheroni: this session's inbox, ${inbox}, still has work:`,
+      `watcheroni: this session's inbox, ${inbox}, is still watching:`,
       "",
       stdout.trim(),
       "",
-      `${how} with run_in_background, and keep the loop going as the watcheroni:watch-pr skill describes. Nothing is lost while no wait runs: the next one reports what changed since the last.`,
+      `${how} Nothing is lost while none runs: the next \`watcheroni wait\` (see the watcheroni:watch-pr skill) reports everything since the last. \`watcheroni unwatch\` stops watching a PR.`,
     ].join("\n");
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: { hookEventName: "SessionStart", additionalContext: context },

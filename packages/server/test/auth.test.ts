@@ -137,7 +137,7 @@ describe("meta", () => {
     expect(html).toContain('href="https://github.com/apps/watcheroni/installations/new"');
     expect(html).toContain("npx watcheroni login");
     expect(html).toContain("npx watcheroni wait");
-    expect(html).toContain("claude plugin install watcheroni@watcheroni");
+    expect(html).toContain("watcheroni exec -- <var>command</var>");
     expect(html).toContain("is still open. Run `watcheroni wait` again to keep watching.");
     expect(html).not.toMatch(/<script|src="http/);
     expect((await call("/", { method: "HEAD" })).status).toBe(200);

@@ -9,6 +9,7 @@ const PROTOCOL_URL = `${REPO_URL}/blob/main/PROTOCOL.md`;
 const SELF_HOSTING_URL = `${REPO_URL}/blob/main/DESIGN.md#self-hosting`;
 const PLUGIN_URL = `${REPO_URL}/tree/main/plugin`;
 const CLI_URL = `${REPO_URL}/tree/main/packages/cli#readme`;
+const RECIPES_URL = `${REPO_URL}/blob/main/docs/recipes.md`;
 
 // What `watcheroni wait` prints (packages/cli/src/format.ts), as in the
 // CLI's README.
@@ -42,10 +43,12 @@ export function landingPage(installUrl: string | undefined): Response {
 </ol>
 <p>It needs Node.js 22 or later. No App? The CLI also works on its own, polling GitHub with your <code>gh</code> login; see <a href="${CLI_URL}">its README</a>.</p>
 
-<h2>In Claude Code</h2>
-<p>The <a href="${PLUGIN_URL}">plugin</a> has Claude watch the pull requests it opens or pushes to, in the background, and deal with failing checks and review feedback as they come in:</p>
-<pre><code>claude plugin marketplace add thepaul/watcheroni
-claude plugin install watcheroni@watcheroni</code></pre>
+<h2>Use it your way</h2>
+<ul>
+<li><code>watcheroni stream</code> prints each event as a line of JSON, and <code>watcheroni exec -- <var>command</var></code> runs a command for each one: <a href="${RECIPES_URL}">recipes</a> for desktop notifications, Slack and more.</li>
+<li>A coding agent can run <code>watcheroni wait</code> in the background and read what it prints when it exits. For Claude Code there's a <a href="${PLUGIN_URL}">plugin</a> that teaches it the commands.</li>
+<li>Or skip the CLI: <a href="${PROTOCOL_URL}">the protocol</a> is plain HTTP and WebSockets.</li>
+</ul>
 
 <h2>What the server keeps</h2>
 <ul>

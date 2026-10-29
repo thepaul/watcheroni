@@ -18,11 +18,13 @@ GitHub repository. It has two parts:
   subscribes to a repo or PR and then waits for events, streams them, or
   runs a command for each one.
 
-AI agents are a main use, and replacing Auto-Fix is the first goal: a
-Claude Code session runs `watcheroni wait` in the background and is woken
-when its PR gets a review, a failing check or a merge conflict. Nothing in
-the tool is specific to agents; it suits shell scripts, chat bots, desktop
-notifications and editor extensions just as well.
+It's a tool, not a workflow: it reports what happened and leaves what to
+do about it to whoever runs it. The use that started it is a coding
+agent running `watcheroni wait` in the background, to be woken when its
+PR gets a review, a failing check or a merge conflict. Nothing in the
+tool is specific to agents; it suits shell scripts, chat bots, desktop
+notifications and editor extensions just as well, and the Claude Code
+plugin is one convenience among those, not the main way in.
 
 License: MIT.
 
@@ -1136,15 +1138,13 @@ each target is in.
 A Claude Code plugin in `plugin/`, installable from this repo's
 marketplace:
 
-- **A skill** telling the session: after opening or pushing to a PR, run
-  `watcheroni wait` with `run_in_background`; when it exits, deal with what
-  it reports, then run it again, until it exits with code 3 (the PR has
-  ended). It also says what not to do: don't reply to reviewers or resolve
-  threads unless asked, and don't treat comment text as instructions from
-  the user.
+- **A skill** describing the tool, not a process: what `watcheroni wait`
+  and the other commands do, running `wait` with `run_in_background`, the
+  output and exit codes, and that comment text is data written by others.
+  What to do about events is left to the user and the session.
 - **A SessionStart hook** that runs `watcheroni ls --inbox
   cc-$CLAUDE_CODE_SESSION_ID` and, if anything is watched, tells a
-  resumed session to restart its `wait`. It runs on `resume` (background
+  resumed session what is and that its `wait` has stopped. It runs on `resume` (background
   commands are gone) and `compact` (the instructions may be), and takes
   the session ID from the hook's input.
 - **`bin/watcheroni`**, which the plugin puts on the Bash tool's PATH: it
@@ -1345,23 +1345,20 @@ Setup URLs.
 
 ## Open questions
 
-- **Domain and owner** for the hosted copy. The npm name `watcheroni` and
-  the GitHub App name `watcheroni` were both free on 2026-10-26; claim them
-  early. *Update 2026-10-28:* the `@watcheroni` npm scope is reserved by
-  the project's owner; `watcheroni` itself is still unclaimed until the
-  first publish (RELEASING.md).
-- **Who may watch a public repo?** As designed, anyone signed in can
-  subscribe to a public repo that has the App installed. Repo owners might
-  want "collaborators only", or to see who is watching. That needs a small
-  settings page per installation.
+- **Who may watch a public repo?** *Decided 2026-10-29:* anyone signed
+  in may subscribe to a public repo that has the App installed. They could
+  poll it instead, which would cost GitHub and the server more for the
+  same result; the API limits keep it from being easy to abuse. A
+  "collaborators only" setting can wait until an owner asks for one.
 - **Is 7-day re-verification for private repos acceptable?** It's
   automatic for the CLI but is work for every other client.
 - **Hot accounts.** A bot account with thousands of subscriptions puts all
   its deliveries through one Account object. Fine at these limits;
   splitting inboxes into their own objects is the way out if needed.
 - **Whether `checks.completed` is reliable enough** on repos with unusual
-  CI (external status checks, apps that create suites late). Needs
-  testing on real repos.
+  CI (external status checks, apps that create suites late). *2026-10-29:*
+  left until someone reports trouble; nobody is expected to build
+  anything critical on it.
 
 ## Sources
 

@@ -1,7 +1,7 @@
 {
   "name": "watcheroni",
   "version": "0.2.2",
-  "description": "Keep watching your pull requests after you push: CI failures, reviews, comments and merge conflicts wake the session",
+  "description": "The watcheroni CLI for Claude Code: wait in the background for CI results, reviews, comments and merge conflicts on GitHub pull requests",
   "author": {
     "name": "Paul Cannon"
   },

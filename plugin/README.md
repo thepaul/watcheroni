@@ -1,16 +1,16 @@
 # watcheroni plugin for Claude Code
 
-Keeps a Claude Code session watching its pull requests after it pushes, so
-failing checks, reviews, comments and merge conflicts wake the session
-instead of waiting for you to notice them.
+A convenience for using the [watcheroni CLI](../packages/cli/README.md)
+from Claude Code. Any agent that can run a background command can use the
+CLI directly; this plugin just saves a session from having to learn it.
 
-- **`watch-pr` skill:** after opening or pushing to a PR, Claude runs
-  `watcheroni wait` in the background, acts on what it reports, and runs it
-  again until the PR is merged or closed. It fixes failing checks and
-  addresses review feedback, but doesn't reply to reviewers or resolve
-  threads unless you ask, and treats comment text as data, not instructions.
+- **`watch-pr` skill:** tells Claude what `watcheroni wait` and the other
+  commands do, how to run them in the background, and how to read their
+  output and exit codes. What to do about the events is up to you and
+  Claude.
 - **SessionStart hook:** when a session is resumed or compacted and its
-  inbox still watches PRs, it tells Claude to restart its `wait`.
+  inbox still watches PRs, it tells Claude which ones, and that its
+  background `wait` may have stopped.
 - **`bin/watcheroni`:** finds the CLI (see the skill's "Installing").
 
 ## Install
@@ -24,8 +24,8 @@ claude plugin install watcheroni@watcheroni
 
 (or `/plugin marketplace add thepaul/watcheroni` and
 `/plugin install watcheroni@watcheroni` inside Claude Code), then start a
-new session. Claude now watches the PRs it opens or pushes to; you can
-also ask it to "watch PR octo/widgets#123".
+new session. Then ask Claude to "watch PR octo/widgets#123", or to watch
+the PRs it opens, and say what it should do when something happens.
 
 The plugin needs Node.js 22 or later. It runs the
 [watcheroni CLI](../packages/cli/README.md) through `npx` unless you
