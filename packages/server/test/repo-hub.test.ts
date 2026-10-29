@@ -306,6 +306,28 @@ describe("repo-wide base and author filters", () => {
     expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2]);
   });
 
+  it("take only the gaps from an open-PR listing for PRs already known", async () => {
+    const repo = fresh();
+    const result = await hub(repo).subscribe(
+      { account: fresh(), inbox: "i", pr: null, kinds: ["pr.*"], base: "main" },
+      { id: repo, full_name: "octo/widgets" },
+    );
+    expect(result).toMatchObject({ ok: true, needs_open_prs: true });
+    // Between the listing and rememberOpenPrs: PR 4 merged, PR 5 was pushed
+    // to and moved to dev, with its author not yet known.
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("INSERT INTO prs (number, state, head_sha, base_ref, author) VALUES (4, 'merged', ?, 'main', 'x')", SHA_A);
+      state.storage.sql.exec("INSERT INTO prs (number, state, draft, head_sha, base_ref) VALUES (5, 'open', 0, ?, 'dev')", SHA_A);
+    });
+    await hub(repo).rememberOpenPrs([4, 5, 6].map((n) => ({ number: n, head_sha: SHA_B, base_ref: "main", author: `u${n}`, draft: true })));
+    const prs = (await stats(repo)).prs.map((p) => [p.number, p.state, p.draft, p.head_sha, p.base_ref, p.author]);
+    expect(prs).toEqual([
+      [4, "merged", 1, SHA_A, "main", "x"],
+      [5, "open", 0, SHA_A, "dev", "u5"],
+      [6, "open", 1, SHA_B, "main", "u6"],
+    ]);
+  });
+
   it("write a PR's row only to fill a gap", async () => {
     const repo = fresh();
     const acct = fresh();

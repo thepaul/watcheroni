@@ -834,7 +834,8 @@ export class RepoHub extends DurableObject<Env> {
   }
 
   // Makes room for `n` more rows under the limit by forgetting the PRs
-  // least recently written that no PR subscription watches. Returns how
+  // least recently written (`seen_at`, set only by writes made anyway, not
+  // on every event) that no PR subscription watches. Returns how
   // many rows there's room for.
   private roomForPrs(n: number): number {
     const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM prs").one().n;
@@ -859,7 +860,10 @@ export class RepoHub extends DurableObject<Env> {
 
   // RPC: the repo's open PRs, listed by the Worker after `subscribe`
   // answered `needs_open_prs`, so PRs opened before the filter can match.
-  // One statement; rows already right aren't rewritten.
+  // One statement. New rows are written whole; rows RepoHub already has
+  // only get their gaps filled, since the listing may be older than a
+  // push, base change or close that arrived meanwhile (so a PR known to
+  // be closed or merged stays so).
   rememberOpenPrs(open: OpenPr[]): void {
     if (!this.tracksAllPrs()) return;
     const prs = open.filter((p) => Number.isSafeInteger(p.number) && p.number > 0).slice(0, 100);
@@ -878,10 +882,12 @@ export class RepoHub extends DurableObject<Env> {
        SELECT json_extract(value, '$.number'), 'open', json_extract(value, '$.draft'), json_extract(value, '$.head_sha'),
          json_extract(value, '$.base_ref'), json_extract(value, '$.author'), ?
        FROM json_each(?) WHERE true
-       ON CONFLICT (number) DO UPDATE SET state = 'open', draft = excluded.draft, head_sha = excluded.head_sha,
-         base_ref = excluded.base_ref, author = excluded.author, seen_at = excluded.seen_at
-       WHERE prs.state IS NOT 'open' OR prs.draft IS NOT excluded.draft OR prs.head_sha IS NOT excluded.head_sha
-         OR prs.base_ref IS NOT excluded.base_ref OR prs.author IS NOT excluded.author`,
+       ON CONFLICT (number) DO UPDATE SET state = COALESCE(prs.state, excluded.state), draft = COALESCE(prs.draft, excluded.draft),
+         head_sha = COALESCE(prs.head_sha, excluded.head_sha), base_ref = COALESCE(prs.base_ref, excluded.base_ref),
+         author = COALESCE(prs.author, excluded.author), seen_at = excluded.seen_at
+       WHERE (prs.state IS NULL) OR (prs.draft IS NULL AND excluded.draft IS NOT NULL)
+         OR (prs.head_sha IS NULL AND excluded.head_sha IS NOT NULL) OR (prs.base_ref IS NULL AND excluded.base_ref IS NOT NULL)
+         OR (prs.author IS NULL AND excluded.author IS NOT NULL)`,
       this.now(), JSON.stringify(rows),
     );
   }

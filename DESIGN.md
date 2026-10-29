@@ -238,12 +238,15 @@ earliest due time, or clears it.
   repo-wide subscription has one (a `tracks_all_prs` flag in `meta`, set
   by `subscribe` and recomputed when a repo-wide subscription goes),
   `prs` holds every open PR RepoHub has heard of, not only watched ones,
-  up to 1,000; past that, the least recently seen PRs no PR subscription
-  needs are forgotten. Rows come from:
+  up to 1,000; past that, the least recently written PRs that no PR
+  subscription needs are forgotten (`seen_at` is set only by writes
+  RepoHub makes anyway, not on every event). Rows come from:
   - the repo's open PRs, once: the subscription that sets the flag
     answers `needs_open_prs`, and the Worker then lists the 100 most
     recently updated (one more installation API call) and passes them to
-    `rememberOpenPrs`, one upsert that leaves rows already right alone.
+    `rememberOpenPrs`, one upsert that writes new rows whole but only
+    fills gaps in rows it already has, since the listing can be older than
+    a push, base change or close that arrived meanwhile.
     If the list fails, the subscription stands anyway;
   - `pr.opened`, `pr.reopened`, and an internal `pr.seen` fact, which the
     normaliser emits (`head_sha`, `base`, `author`, `state`) after the
