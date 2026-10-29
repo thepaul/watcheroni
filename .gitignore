@@ -7,3 +7,4 @@ dist/
 .selfhost-app.json
 wrangler.selfhost.json
 .selfhost-worker.json
+.DS_Store
