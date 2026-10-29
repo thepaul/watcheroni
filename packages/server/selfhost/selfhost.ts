@@ -247,15 +247,27 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
   if (o.trustWorker) {
     // Only for the Worker these files are about, and only by someone at
     // the terminal who has seen its deployments.
-    if (!(pending || saved)) throw new SelfhostFailed(`there's no selfhost setup here (${PENDING_FILE} or ${CONFIG_FILE}) to trust a Worker for`);
-    if ((await history()) === null) throw new SelfhostFailed(`there's no Worker called ${name} on Cloudflare account ${accountId}`);
+    if (pending && !pending.created) {
+      throw new SelfhostFailed(
+        `selfhost's first deploy of ${name} never finished, so there's no Worker of its to trust. ` +
+          `If a Worker called ${name} exists, it isn't one selfhost made: delete that Worker or remove ${PENDING_FILE}.`,
+      );
+    }
+    if (!pending && !saved) throw new SelfhostFailed(`there's no selfhost setup here (${PENDING_FILE} or ${CONFIG_FILE}) to trust a Worker for`);
+    // The version recorded is the newest one shown, and nothing may be
+    // deployed while the question waits.
+    const seen = await history();
+    if (!seen?.length) throw new SelfhostFailed(`there's no Worker called ${name} on Cloudflare account ${accountId}`);
+    const newest = seen[seen.length - 1];
     print(`The deployments of the Worker ${name} on Cloudflare account ${accountId}:`);
     await wrangler(["deployments", "list", "--name", name]);
     print("If any of these weren't made by you or selfhost, stop here.");
     const answer = await deps.ask(`Type the Worker's name (${name}) to have selfhost treat it as the one it deployed: `);
     if (answer === null) throw new SelfhostFailed("--trust-worker asks for confirmation, so it needs a terminal");
     if (answer.trim() !== name) throw new SelfhostFailed("that isn't the Worker's name; nothing changed");
-    const newest = await newestVersion();
+    if ((await history())?.at(-1) !== newest) {
+      throw new SelfhostFailed(`${name} was deployed to while you were reading; nothing changed. Run --trust-worker again to see the new deployment.`);
+    }
     if (pending) deps.writeFile(PENDING_FILE, JSON.stringify({ ...pending, created: true, version_id: newest }, null, 2), true);
     else recordWorker(newest);
     print(`Recorded version ${newest}. Run ${pending ? "npm run selfhost" : "npm run selfhost -- --update"} again.`);

@@ -284,6 +284,26 @@ describe("selfhost keeps to one Worker on one account", () => {
     expect(await selfhost(OPTIONS, rerun.deps)).toBe(URL_);
   });
 
+  it("--trust-worker refuses without a setup, after an unfinished first deploy, and when deployed to meanwhile", async () => {
+    const none = fake({ cloud: { history: [randomUUID()] }, answer: "watcheroni" });
+    await expect(selfhost({ ...OPTIONS, trustWorker: true }, none.deps)).rejects.toThrow(/no selfhost setup here/);
+    expect(none.wrangler.map((c) => c.args[0])).toEqual(["whoami"]);
+
+    const unfinished = fake({ cloud: { history: [randomUUID()] }, answer: "mine", files: { [PENDING_FILE]: state() } });
+    await expect(selfhost({ ...OPTIONS, trustWorker: true }, unfinished.deps)).rejects.toThrow(
+      /delete that Worker or remove \.selfhost-app\.json/,
+    );
+    expect(unfinished.wrangler.map((c) => c.args[0])).toEqual(["whoami"]);
+    expect(unfinished.files[PENDING_FILE]).toBe(state());
+
+    const pending = state({ created: true, version_id: randomUUID(), app: APP, ticket_key: "t", storage_key: "s" });
+    const cloud = { history: [randomUUID()] };
+    const raced = fake({ cloud, answer: "mine", files: { [PENDING_FILE]: pending } });
+    raced.deps.ask = async () => (cloud.history.push(randomUUID()), "mine");
+    await expect(selfhost({ ...OPTIONS, trustWorker: true }, raced.deps)).rejects.toThrow(/deployed to while you were reading/);
+    expect(raced.files[PENDING_FILE]).toBe(pending);
+  });
+
   it("--trust-worker works for --update too", async () => {
     const done = fake();
     await selfhost(OPTIONS, done.deps);
