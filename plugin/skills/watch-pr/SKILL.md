@@ -38,7 +38,7 @@ is running; to add a PR, stop the running one, then
 | 2 | Timed out, nothing happened | Start `watcheroni wait` again |
 | 3 | Every watched PR was merged or closed | Read any final events, tell the user, and stop |
 | 4 | No GitHub login | Ask the user to run `gh auth login` (it's interactive), then start again |
-| 1 | Error | Read the message. "in use by process" means a `wait` is already running for this session: leave it be |
+| 1 | Error | Read the message. An `npm error` means the CLI couldn't be fetched: see "Installing". "in use by process" means a `wait` is already running for this session: leave it be |
 | 127 | CLI not found | See "Installing" below |
 
 Events wait in the inbox until a `wait` prints them, so nothing is lost
@@ -88,19 +88,20 @@ session watches.
 
 ## Installing
 
+This version of the plugin goes with the watcheroni CLI 0.1.0, and runs
+it as `watcheroni@^0.1.0`; `watcheroni --version` says which one runs.
+
 The plugin puts a `watcheroni` command on the Bash tool's PATH. It runs, in
 order: `$WATCHERONI_CLI` (a path to `watcheroni.mjs`), a `watcheroni`
-installed with `npm install -g watcheroni`, the build in a clone of the
-watcheroni repository when the plugin is installed from that clone, or
-`npx --yes watcheroni`.
+installed with `npm install -g watcheroni@^0.1.0`, the build in a clone of
+the watcheroni repository when the plugin runs from that clone, or
+`npx --yes watcheroni@^0.1.0`. npx needs the npm registry the first time.
 
-Until the CLI is published on npm, build it in a clone of the repository
-and use that:
-
-```
-npm install && npm run build -w watcheroni
-node packages/cli/dist/watcheroni.mjs wait
-```
+If it exits 127, none of those worked (npx is missing, or it's turned off
+with `WATCHERONI_NO_NPX`). If it exits 1 with an `npm error` (no network,
+`ETARGET`, `ENOTCACHED`), npx couldn't get the CLI. Either way, ask the
+user to run `npm install -g watcheroni@^0.1.0`, which needs Node.js 22 or
+later, then start again.
 
 Local mode needs a GitHub login: `gh auth login`, or `GH_TOKEN` /
 `GITHUB_TOKEN` in the environment. The token stays on this machine.

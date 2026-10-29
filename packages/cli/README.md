@@ -49,6 +49,21 @@ then polls GitHub itself every 2 minutes with your `gh` login (or
 `GH_TOKEN` / `GITHUB_TOKEN`), and that token never leaves your machine.
 See "Local mode" below.
 
+## Claude Code
+
+The watcheroni plugin for Claude Code has a session keep watching the PRs
+it opens or pushes to, in the background, and deal with failing checks
+and review feedback as they arrive:
+
+```
+claude plugin marketplace add thepaul/watcheroni
+claude plugin install watcheroni@watcheroni
+```
+
+It runs this CLI through npx unless it's installed. See
+[the plugin's README](https://github.com/thepaul/watcheroni/tree/main/plugin)
+for what it does and doesn't do.
+
 ## Commands
 
 ```
@@ -62,6 +77,8 @@ watcheroni ls
 
 Targets are `owner/repo#123` or PR URLs. With none, it's the open PR for
 the current git branch, found through the checkout's GitHub remotes.
+`owner/repo` watches a whole repository, in server mode only (see
+below).
 
 - **`wait`** polls (every 2 minutes; `--interval`) until something
   happens, waits `--settle` for related events, prints them with the
@@ -133,6 +150,25 @@ is offered to the server again at most hourly. When the server ends a
 subscription, a `watch.ended` or `watch.expired` stops the watch here too;
 after a `watch.revoked` (the App uninstalled or the repo removed from it)
 the PR goes back to being polled from this machine.
+
+A whole repository (`owner/repo`) is watched by the server or not at all,
+since local mode would have to poll every PR in it. It needs `--kinds`,
+which the subscription carries (and which, as always, also filters what
+`wait` prints), and may narrow to PRs against one branch (`--base main`)
+or opened by one user (`--author alice`):
+
+```
+watcheroni wait octo/widgets --kinds pr.opened --base main
+watcheroni wait octo/widgets --kinds check.failed --author alice
+```
+
+If the server won't take it (the App isn't installed, say) or can't be
+reached, the command exits 1. Once subscribed it's remembered in the
+inbox (`ls` lists it, `unwatch octo/widgets` ends every whole-repository
+watch on it, on the server too), and while it lasts `wait` never exits 3:
+it exits 0 on events and 2 on timeout. A `watch.*` event from the server
+(`watch.expired` after a week unread, `watch.revoked`) ends it; name it
+again to start over.
 
 Because an inbox may be fed by subscriptions made elsewhere, which can't
 be listed yet, `wait` with no PR watched here reads the inbox until

@@ -10,13 +10,23 @@ Two packages go to npm, always with the same version:
   package in `packages/protocol/dist` (JS, `.d.ts`, and a `package.json`
   pointing at them), and that directory is what gets published.
 
+The Claude Code plugin (`plugin/`) isn't on npm either; people install
+it from this repository's `main` branch through the marketplace in
+`.claude-plugin/marketplace.json`. It carries the same version too, in
+`plugin/.claude-plugin/plugin.json`, and runs the CLI as
+`npx watcheroni@^X.Y.Z`, so a plugin only ever runs a CLI it was released
+with (or a later patch). Claude Code updates an installed plugin only
+when that version changes, so a change to `plugin/` reaches users with
+the next release.
+
 The server (`packages/server`) isn't published, but it carries the same
 version, which `/v1/meta` reports as `server: "watcheroni/X.Y.Z"`. A
 server deployed from `main` between releases reports the last release.
 
 Releases are published by `.github/workflows/release.yml` when a `vX.Y.Z`
 tag is pushed: it runs the CI checks, checks the tagged commit is on
-`main` and the tag matches all three `package.json` versions, builds, and publishes both packages with
+`main` and the tag matches all three `package.json` versions and the
+plugin's, builds, and publishes both packages with
 provenance. Nobody publishes from their own machine.
 
 ## Making a release
@@ -24,6 +34,7 @@ provenance. Nobody publishes from their own machine.
 ```
 git switch main && git pull
 npm version 0.2.0 --workspaces --no-git-tag-version   # all three packages and the lockfile
+node scripts/plugin-version.mjs                        # the plugin, from the CLI's version
 git commit -am "Release 0.2.0"
 git tag v0.2.0
 git push origin main v0.2.0
@@ -44,6 +55,18 @@ be overwritten; publish a new patch version, and
 
 Before 1.0, a breaking change to the CLI's output or flags, or to the
 protocol types, bumps the minor version.
+
+The plugin is live as soon as the release commit is on `main`, perhaps a
+few minutes before npm has the CLI it asks for. Until then a plugin that
+was just updated fails to start the new CLI through npx (an older
+installed one keeps working); it's fixed once the publish finishes.
+If the release workflow fails, fix it quickly, or revert the plugin's
+version on `main`.
+
+A new marketplace install gets `main` as it is, straight away, without
+waiting for a release. So a change to `plugin/` that needs CLI features
+not yet on npm breaks new installs until the release that has them:
+land such changes with, or just before, that release.
 
 ## Publishing credentials
 
