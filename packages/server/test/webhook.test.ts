@@ -73,12 +73,22 @@ describe("normalising", () => {
   });
 
   it("reviews, comments and threads", async () => {
-    const review = await events("pull_request_review", example("pull_request_review", "submitted"));
-    expect(review[0]).toMatchObject({ kind: "review.submitted", data: { review_id: expect.any(Number), state: expect.stringMatching(/^[a-z_]+$/) } });
+    const submitted = example("pull_request_review", "submitted") as Example & { review: { state: string; body: string | null } };
+    // GitHub's examples are all "commented" with no text: only a wrapper
+    // for comments, which come as their own events.
+    expect(await events("pull_request_review", submitted)).toEqual([]);
+    const review = await events("pull_request_review", { ...submitted, review: { ...submitted.review, body: "Some notes" } });
+    expect(review[0]).toMatchObject({ kind: "review.submitted", data: { review_id: expect.any(Number), state: "commented" } });
+    const approved = await events("pull_request_review", { ...submitted, review: { ...submitted.review, state: "approved" } });
+    expect(approved[0]).toMatchObject({ kind: "review.submitted", data: { state: "approved" } });
     const comment = await events("pull_request_review_comment", example("pull_request_review_comment", "created"));
     expect(comment[0]).toMatchObject({ kind: "review_comment.created", data: { comment_id: expect.any(Number), path: expect.any(String) } });
     const thread = await events("pull_request_review_thread", example("pull_request_review_thread", "resolved"));
-    expect(thread[0]).toMatchObject({ kind: "thread.resolved", data: { thread_node_id: expect.any(String) } });
+    expect(thread[0]).toMatchObject({
+      kind: "thread.resolved",
+      data: { thread_node_id: expect.any(String), path: expect.any(String), line: expect.any(Number), comment_id: expect.any(Number) },
+      links: { api: expect.stringMatching(/\/pulls\/comments\/\d+$/) },
+    });
     const issueComment = await events("issue_comment", example("issue_comment", "created"));
     expect(issueComment[0].kind).toBe("comment.created");
   });

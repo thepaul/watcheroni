@@ -35,7 +35,7 @@ interface Payload {
   requested_reviewer?: User;
   requested_team?: { slug: string };
   changes?: { base?: { ref?: { from: string } } };
-  review?: { id: number; state: string; html_url?: string; submitted_at?: string };
+  review?: { id: number; state: string; body?: string | null; html_url?: string; submitted_at?: string };
   comment?: {
     id: number;
     html_url?: string;
@@ -46,7 +46,10 @@ interface Payload {
     line?: number | null;
     in_reply_to_id?: number;
   };
-  thread?: { node_id: string };
+  thread?: {
+    node_id: string;
+    comments?: { id: number; url?: string; path?: string; line?: number | null; original_line?: number | null }[];
+  };
   issue?: { number: number; html_url?: string; url?: string; updated_at?: string; pull_request?: object };
   label?: { name: string };
   check_run?: {
@@ -158,7 +161,10 @@ export function normalise(
       const { review, pull_request: pr } = payload;
       if (!review || !pr) break;
       const links = { html: review.html_url, api: `${pr.url}/reviews/${review.id}` };
-      if (action === "submitted") {
+      // A "commented" review with no text is only a wrapper for its
+      // comments (a reply in a thread is one), which arrive as
+      // pull_request_review_comment (PROTOCOL.md, "Kinds").
+      if (action === "submitted" && !(review.state.toLowerCase() === "commented" && !review.body?.trim())) {
         emit("review.submitted", pr.number, { review_id: review.id, state: review.state.toLowerCase() }, review.submitted_at, links);
       } else if (action === "dismissed") {
         emit("review.dismissed", pr.number, { review_id: review.id }, null, links);
@@ -182,7 +188,13 @@ export function normalise(
     case "pull_request_review_thread": {
       const { thread, pull_request: pr } = payload;
       if (!thread || !pr || (action !== "resolved" && action !== "unresolved")) break;
-      emit(`thread.${action}`, pr.number, { thread_node_id: thread.node_id }, null, { html: pr.html_url });
+      const first = thread.comments?.[0];
+      emit(`thread.${action}`, pr.number, {
+        thread_node_id: thread.node_id,
+        path: first?.path ?? null,
+        line: first?.line ?? first?.original_line ?? null,
+        comment_id: first?.id ?? null,
+      }, null, { html: pr.html_url, api: first?.url });
       break;
     }
 

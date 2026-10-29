@@ -239,7 +239,10 @@ describe("subscribing to a public repo", () => {
     const review = example("pull_request_review", "submitted") as {
       repository: { id: number; full_name: string };
       pull_request: { number: number };
+      review: { state: string };
     };
+    // GitHub's example is "commented" with no text, which is no event.
+    review.review.state = "approved";
     review.repository.id = repo.id;
     review.repository.full_name = fullName(repo);
     review.pull_request.number = 7;
