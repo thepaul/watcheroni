@@ -889,6 +889,12 @@ with no runtime dependencies, so installing is quick and there's nothing
 to break. Later, for people without Node: standalone binaries built with
 `bun build --compile` on GitHub Releases, and a Homebrew formula.
 
+*As built:* `watcheroni` and `@watcheroni/protocol` (built to JS and
+`.d.ts`; the workspace uses its TypeScript source) are published together
+from a `vX.Y.Z` tag by `.github/workflows/release.yml`, with provenance.
+The server carries the same version for `/v1/meta`. See
+[RELEASING.md](RELEASING.md).
+
 ### Commands
 
 ```
@@ -942,7 +948,7 @@ agent can act on it without reading docs:
 ```
 octo/widgets#123: 3 new events
 - review.submitted by alice: changes_requested
-  gh api repos/octo/widgets/pulls/123/reviews/987654
+  gh api repos/octo/widgets/pulls/123/reviews/987654 --jq '.state, .body'
 - check.failed: "lint" on 4f2e1a9
   gh run view 555 --log-failed
 - merge.conflict with main
@@ -951,7 +957,7 @@ The PR is still open. Run `watcheroni wait` again to keep watching.
 ```
 
 Each line ends with the command that fetches the content, since the
-server doesn't send it.
+server doesn't send it, with a `--jq` filter that keeps just the text.
 
 ### Local state
 
@@ -1058,7 +1064,11 @@ It runs on the deployer's own Cloudflare account, free plan included.
    "commented" `review.submitted` plus a `review_comment.created`, so
    three replies make six lines; `thread.resolved` doesn't say which
    thread; and the printed `gh api` commands return whole JSON objects
-   where a `--jq` filter for the body would do. A failed
+   where a `--jq` filter for the body would do (all three fixed since:
+   `wait` prints a reply's body-less review only when its replies are
+   filtered out, threads carry `path`, `line` and their first
+   `comment_id`, and the commands filter with `--jq`; see PROTOCOL.md
+   "Kinds"). A failed
    `checks.completed` now prints `gh pr checks`, since its individual
    `check.failed` events may predate the watch.
 2. **CLI in local mode only** (`wait`, `stream`, `exec` polling GitHub).
