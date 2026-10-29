@@ -24,6 +24,7 @@ import {
   repoHubStub,
 } from "./subscriptions";
 import pkg from "../package.json";
+import { landingPage, setupPage } from "./pages";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
 import {
@@ -53,9 +54,6 @@ export { Installation } from "./installation";
 export { Control } from "./control";
 
 const MAX_WEBHOOK_BYTES = 2 * 1024 * 1024;
-// Where a browser visiting the server's root is sent, until there's a
-// page of its own. 302, not 301, so browsers don't remember it.
-const HOMEPAGE = "https://github.com/thepaul/watcheroni";
 const MAX_LABEL_LENGTH = 100;
 
 type AccountStub = DurableObjectStub<Account>;
@@ -75,7 +73,7 @@ export default {
     const route = `${request.method} ${pathname}`;
 
     if (pathname === "/healthz") return new Response("ok");
-    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return Response.redirect(HOMEPAGE, 302);
+    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return landingPage(INSTALL_URL);
     if (route === "GET /github/setup") return setupPage(url);
     if (route === "GET /v1/meta") return json(meta(env));
     if (route === "POST /github/webhook") return webhook(request, env);
@@ -188,7 +186,7 @@ function meta(env: Env): Meta {
   return {
     protocol: 1,
     server: `watcheroni/${pkg.version}`,
-    features: ["ws", "longpoll"],
+    features: ["ws", "longpoll", "repo_scope"],
     ...(env.GITHUB_CLIENT_ID
       ? {
           github: {
@@ -365,50 +363,6 @@ function isUpgrade(request: Request): boolean {
   return request.headers.get("Upgrade")?.toLowerCase() === "websocket";
 }
 
-// GET /github/setup: the App's "Setup URL", where GitHub sends people
-// after they install it or change its repos. GitHub passes
-// installation_id and setup_action (install, update, or request when an
-// organization's owner has to approve). Nothing from the query is echoed
-// into the page.
-function setupPage(url: URL): Response {
-  const requested = url.searchParams.get("setup_action") === "request";
-  const heading = requested ? "Installation requested" : "watcheroni is installed";
-  const lead = requested
-    ? "Your request has gone to the organization's owners. Once one of them approves it, GitHub will send watcheroni events from those repositories."
-    : "GitHub will now send watcheroni events from the repositories you chose.";
-  const html = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>watcheroni</title>
-<style>
-  :root { color-scheme: light dark; --fg: #1f2328; --bg: #fff; --muted: #59636e; --code: #f6f8fa; }
-  @media (prefers-color-scheme: dark) { :root { --fg: #e6edf3; --bg: #0d1117; --muted: #9198a1; --code: #161b22; } }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
-  main { max-width: 36rem; margin: 3rem auto; padding: 0 16px; }
-  h1 { font-size: 1.5rem; margin-bottom: .5rem; }
-  p { color: var(--muted); }
-  pre { background: var(--code); padding: .75rem 1rem; border-radius: 6px; overflow-x: auto; }
-  a { color: inherit; }
-</style>
-</head>
-<body>
-<main>
-<h1>${heading}</h1>
-<p>${lead}</p>
-<p>Next, sign in from your computer:</p>
-<pre>npx watcheroni login</pre>
-<p>Then, in a checkout whose branch has an open pull request:</p>
-<pre>npx watcheroni wait</pre>
-<p><a href="${HOMEPAGE}">How watcheroni works</a></p>
-</main>
-</body>
-</html>
-`;
-  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
-}
-
 // POST /github/webhook: steps 1, 3 and 4 of "Webhook handling in the
 // Worker" in DESIGN.md. The response lists the events and what RepoHub did
 // with them, which GitHub ignores and tests and tools read.
@@ -476,7 +430,7 @@ function installationFact(payload: {
 // Subscriptions straight into RepoHub, with no GitHub checks, for tests
 // and for poking at a RepoHub:
 //   GET    /debug/repos/{id}                     RepoHub's state
-//   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, ignore?, full_name?, installation_id?, baseline?}
+//   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, base?, author?, ignore?, full_name?, installation_id?, baseline?}
 //   DELETE /debug/repos/{id}/subscriptions/{sub}
 async function debugRepo(request: Request, env: Env, repoId: number, subs: boolean, subId?: string): Promise<Response> {
   const hub = repoHubStub(env, repoId);

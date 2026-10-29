@@ -8,7 +8,7 @@ import { GitHubError } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
-import { UsageError, parseTarget, targetKey } from "../src/targets.ts";
+import { UsageError, parseTarget, repoKey, targetKey, type Target } from "../src/targets.ts";
 import { alice, bob, check, snap } from "./fixtures.ts";
 
 let n = 0;
@@ -26,12 +26,21 @@ describe("targets", () => {
   it("parses short forms and URLs", () => {
     expect(parseTarget("octo/widgets#7")).toEqual({ owner: "octo", name: "widgets", number: 7 });
     expect(parseTarget("https://github.com/octo/widgets/pull/7/files")).toEqual({ owner: "octo", name: "widgets", number: 7 });
-    expect(targetKey(parseTarget("octo/my.repo#12"))).toBe("octo/my.repo#12");
+    expect(targetKey(parseTarget("octo/my.repo#12") as Target)).toBe("octo/my.repo#12");
+  });
+
+  it("takes whole repositories, named by their filters", () => {
+    expect(parseTarget("octo/widgets")).toEqual({ owner: "octo", name: "widgets" });
+    expect(parseTarget("https://github.com/octo/widgets/")).toEqual({ owner: "octo", name: "widgets" });
+    // Kinds sorted and deduplicated, the login lowercased, as the server keeps them.
+    expect(repoKey({ owner: "octo", name: "widgets", kinds: ["pr.opened", "check.failed", "pr.opened"], base: "main", author: "Paul" }))
+      .toBe("octo/widgets (check.failed,pr.opened; base main; author paul)");
+    expect(repoKey({ owner: "octo", name: "widgets", kinds: ["pr.*"] })).toBe("octo/widgets (pr.*)");
   });
 
   it("explains what it can't do", () => {
-    expect(() => parseTarget("octo/widgets")).toThrow(/needs the watcheroni server/);
     expect(() => parseTarget("widgets")).toThrow(UsageError);
+    expect(() => parseTarget("https://github.com/octo/widgets/issues/3")).toThrow(UsageError);
   });
 });
 

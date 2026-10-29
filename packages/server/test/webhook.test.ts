@@ -53,8 +53,9 @@ describe("webhook signature", () => {
 
 describe("normalising", () => {
   it("pull_request actions", async () => {
-    const opened = await events("pull_request", example("pull_request", "opened"));
-    expect(opened).toHaveLength(1);
+    const payload = example("pull_request", "opened") as { pull_request: { user: { login: string }; base: { ref: string } } };
+    const opened = await events("pull_request", payload);
+    expect(opened).toHaveLength(2);
     expect(opened[0]).toMatchObject({
       v: 1,
       id: "delivery-1.0",
@@ -63,6 +64,13 @@ describe("normalising", () => {
       repo: { id: expect.any(Number), full_name: expect.any(String) },
       actor: { login: expect.any(String) },
       data: { head_sha: expect.stringMatching(/^[0-9a-f]{40}$/), base: expect.any(String) },
+    });
+    // Last, for RepoHub only: what base and author filters match on.
+    expect(opened[1]).toMatchObject({
+      id: "delivery-1.1",
+      kind: "pr.seen",
+      pr: opened[0].pr,
+      data: { head_sha: opened[0].data.head_sha, base: payload.pull_request.base.ref, author: payload.pull_request.user.login, state: "open" },
     });
     expect((await events("pull_request", example("pull_request", "synchronize")))[0].kind).toBe("pr.pushed");
     const closed = example("pull_request", "closed");
@@ -94,6 +102,13 @@ describe("normalising", () => {
     });
     const issueComment = await events("issue_comment", example("issue_comment", "created"));
     expect(issueComment[0].kind).toBe("comment.created");
+    // A comment on a PR says who opened it.
+    const onPr = structuredClone(example("issue_comment", "created")) as { issue: { pull_request?: object; user: { login: string } } };
+    onPr.issue.pull_request = {};
+    expect((await events("issue_comment", onPr)).map((e) => [e.kind, e.data.author ?? null])).toEqual([
+      ["comment.created", null],
+      ["pr.seen", onPr.issue.user.login],
+    ]);
   });
 
   it("checks", async () => {

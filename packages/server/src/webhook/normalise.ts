@@ -5,13 +5,16 @@ import type { DataValue, UnsequencedEvent } from "../protocol";
 // step. `sub` is filled in later, when an event is matched to a
 // subscription.
 //
-// Besides protocol kinds this emits internal kinds that RepoHub uses for
-// its derived events and never delivers: `check.completed` for every
-// finished check run or status, failed or not, `check.started` for check
-// runs created and pending statuses, `check_suite.updated` for check
-// suites (all three feed the `checks.completed` rollup), and
-// `base.advanced` when a PR is merged into a branch, which may have given
-// other PRs on that base a conflict.
+// Besides protocol kinds this emits internal kinds that RepoHub uses and
+// never delivers, after the delivered events of each payload so their IDs
+// don't move: `check.completed` for every finished check run or status,
+// failed or not, `check.started` for check runs created and pending
+// statuses, `check_suite.updated` for check suites (all three feed the
+// `checks.completed` rollup), `base.advanced` when a PR is merged into a
+// branch, which may have given other PRs on that base a conflict, and
+// `pr.seen`, last, from any payload that describes the PR (its head, base,
+// author and state), for repository-wide subscriptions' `base` and
+// `author` filters.
 
 // Only the fields read below. Everything is optional because GitHub's
 // payloads vary by event, action and age.
@@ -19,6 +22,8 @@ interface User { id: number; login: string; type?: string }
 interface Repository { id: number; full_name: string; html_url?: string; url?: string }
 interface PullRequest {
   number: number;
+  state?: string;
+  user?: User;
   html_url?: string;
   url?: string;
   draft?: boolean;
@@ -55,7 +60,7 @@ interface Payload {
     node_id: string;
     comments?: { id: number; url?: string; path?: string; line?: number | null; original_line?: number | null }[];
   };
-  issue?: { number: number; html_url?: string; url?: string; updated_at?: string; pull_request?: object };
+  issue?: { number: number; html_url?: string; url?: string; updated_at?: string; pull_request?: object; state?: string; user?: User };
   label?: { name: string };
   check_run?: {
     id: number;
@@ -305,6 +310,23 @@ export function normalise(
         }, run.updated_at, { html: run.html_url, api: run.url });
       }
       break;
+    }
+  }
+
+  // Only alongside other events, so a delivery that's otherwise ignored
+  // still never reaches RepoHub.
+  if (out.length) {
+    const pr = payload.pull_request;
+    const issue = payload.issue;
+    if (pr && typeof pr.number === "number") {
+      emit("pr.seen", pr.number, {
+        head_sha: pr.head?.sha ?? null,
+        base: pr.base?.ref ?? null,
+        author: pr.user?.login ?? null,
+        state: pr.state ?? null,
+      }, null);
+    } else if (eventName === "issue_comment" && issue?.pull_request) {
+      emit("pr.seen", issue.number, { author: issue.user?.login ?? null, state: issue.state ?? null }, null);
     }
   }
   return out;

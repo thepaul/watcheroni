@@ -230,10 +230,42 @@ earliest due time, or clears it.
 
 - **Not built yet:** the `jobs` table (the alarm's one periodic job,
   the mergeability check, is the `merge_check_at` meta row, as pruning is
-  `prune_at`); the `base` and `author` filters for repository-wide
-  subscriptions (`/v1` answers 400 to them).
-- **Derived events** (schema 4) are described under "As built" in
+  `prune_at`).
+- **Derived events** (schema 5) are described under "As built" in
   "Derived events".
+- **`base` and `author`** (repository-wide only) are kept in `spec`, so
+  they count for idempotence; `author` is lowercased. They match against
+  `prs`, which gained `author` and `seen_at` columns (schema 4; every
+  migration step is idempotent, since "schema 3" meant `prs.author` on
+  one branch and ticket 003's check tables on another). While any
+  repo-wide subscription has one (a `tracks_all_prs` flag in `meta`, set
+  by `subscribe` and recomputed when a repo-wide subscription goes),
+  `prs` holds every open PR RepoHub has heard of, not only watched ones,
+  up to 1,000; past that, the least recently written PRs that no PR
+  subscription needs are forgotten (`seen_at` is set only by writes
+  RepoHub makes anyway, not on every event). Rows come from:
+  - the repo's open PRs, once: the subscription that sets the flag
+    answers `needs_open_prs`, and the Worker then lists the 100 most
+    recently updated (one more installation API call) and passes them to
+    `rememberOpenPrs`, one upsert that writes new rows whole but only
+    fills gaps in rows it already has, since the listing can be older than
+    a push, base change or close that arrived meanwhile.
+    If the list fails, the subscription stands anyway;
+  - `pr.opened`, `pr.reopened`, and an internal `pr.seen` fact, which the
+    normaliser emits (`head_sha`, `base`, `author`, `state`) after the
+    other events of any payload that describes the PR (`pull_request*`,
+    and `issue_comment` on a PR, which gives only the author). `pr.seen`
+    writes only to fill a gap, so most PR webhooks cost no row write; the
+    head and base move with `pr.pushed` and `pr.base_changed`. It never
+    makes a delivery that would otherwise be skipped reach RepoHub.
+
+  Closed and merged PRs are dropped as before, and when the last
+  filtering subscription goes, so are rows no PR subscription needs. A
+  filtered subscription gets an event only if its PR is known and
+  matches, so never issue events or statuses on a commit that's no known
+  PR's head. While rows are kept, head-SHA matching (below) also gives
+  such statuses those PRs, which unfiltered repo-wide subscriptions see
+  too.
 - **Expiry is pulled, not pushed.** There's no `touch`: reading an inbox
   only records `last_read_at` in Account (a WebSocket `hello` counts, and
   so does having a socket open). When a subscription reaches
@@ -595,6 +627,11 @@ server can be down without losing events.
   `?confirm=production` does it redeliver, to the App's webhook URL,
   which is production's. The free plan allows 5 cron triggers an
   account.
+- **Delivery IDs** are int64s already past 2^53 (about 3.85e18 in
+  October 2026), so they never become JS numbers: the list is parsed
+  with each `id` kept as its digits, and they're stored and compared as
+  20 zero-padded digits, which sort like the numbers. RPC results and
+  `/debug/control` give them as strings.
 - **The cursor** is a delivery ID: everything up to it has been looked
   at. A run lists deliveries newest first (`per_page=100`, following
   `Link: rel="next"`) until it reaches the cursor, or 3 days back, or 1
@@ -759,11 +796,18 @@ against the repo's and the installation's GitHub API budgets.
 
 ### As built in the prototype
 
-In `packages/server/src/repo-hub.ts` (schema 4: the `checks` and
-`rollups` tables, created idempotently, since test servers have had an
-earlier shape of them under schema 3), fed by internal kinds from
-`src/webhook/normalise.ts`. The `data` of both kinds is the CLI's
-(`packages/cli/src/diff.ts`). Where it differs from the above:
+In `packages/server/src/repo-hub.ts` (schema 5: the `checks` and
+`rollups` tables, which are caches, so a database from before 5 has
+them dropped and made afresh; test servers had an earlier shape of them
+under "3"), fed by internal kinds from `src/webhook/normalise.ts`, which
+come after a payload's delivered events so those keep their IDs. The
+`data` of both kinds is the CLI's (`packages/cli/src/diff.ts`). Where it
+differs from the above:
+
+- **Watched** means having a PR subscription. Since `prs` also holds PRs
+  kept only for repository-wide `base` and `author` filters, rollups,
+  mergeability checks, `base.advanced` and check pruning all look for a
+  subscription, not just a row.
 
 - **Facts.** `check_run.created` gives `check.started` (run ID, name,
   suite ID, App ID), or `check.completed` for a run created already
@@ -1018,7 +1062,8 @@ watcheroni config [get | set] <key> [value]
 ```
 
 - **Targets** are `owner/repo#123`, PR URLs, `owner/repo` (repo-wide, needs
-  `--kinds`), or nothing, meaning the current branch's PR (found through
+  `--kinds`, may narrow with `--base` and `--author`; server mode only,
+  and `wait` never exits 3 while one is watched), or nothing, meaning the current branch's PR (found through
   the git remote and the GitHub API).
 - **`wait`, `stream` and `exec` subscribe as needed**: they make sure the
   targets are watched in the current inbox, then read it. Most users never
@@ -1208,6 +1253,11 @@ It runs on the deployer's own Cloudflare account, free plan included.
 6. Repo-wide subscriptions; recipes for `exec` (desktop notifications,
    ntfy, Slack incoming webhooks) before any built-in notification
    support.
+   *Repo-wide subscriptions built:* `base` and `author` on the server
+   (see "As built" under "RepoHub"), and `owner/repo` targets in the CLI
+   with `--kinds`, `--base` and `--author`, in server mode only. A
+   repo-wide watch is remembered in the local inbox (`ls`, `unwatch`) and
+   keeps `wait` from exiting 3.
 
 ## Open questions
 

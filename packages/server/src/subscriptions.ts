@@ -17,7 +17,7 @@ import {
   type SubscriptionRequest,
   type SubscriptionsResponse,
 } from "./protocol";
-import type { PrBaseline, RepoHub, RepoInfo } from "./repo-hub";
+import type { OpenPr, PrBaseline, RepoHub, RepoInfo } from "./repo-hub";
 
 // The App's public page, where a repo owner installs it.
 export const APP_SLUG = "watcheroni";
@@ -27,6 +27,9 @@ const REPO_NAME = /^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})$/;
 const KIND_PATTERN = /^(\*|[a-z_]+(\.[a-z_]+)*(\.\*)?)$/;
 const MAX_KINDS = 50;
 const MAX_ACTORS = 100;
+// A branch name as git allows it, roughly, and a GitHub login (or a bot's).
+const BRANCH_NAME = /^[^\s~^:?*[\\\x00-\x1f\x7f]{1,255}$/;
+const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$/;
 
 type AccountStub = DurableObjectStub<Account>;
 
@@ -105,6 +108,8 @@ export async function createSubscription(
       inbox,
       pr: parsed.pr ?? null,
       kinds: parsed.kinds,
+      base: parsed.base,
+      author: parsed.author,
       ignore: parsed.ignore,
       ttl_seconds: parsed.ttl_seconds,
       verified_until: verifiedUntil,
@@ -123,6 +128,8 @@ export async function createSubscription(
     repo,
     pr: sub.pr,
     kinds: sub.kinds,
+    ...(sub.base === undefined ? {} : { base: sub.base }),
+    ...(sub.author === undefined ? {} : { author: sub.author }),
     ignore: sub.ignore,
     created_at: new Date(sub.created_at).toISOString(),
     expires_at: new Date(sub.expires_at).toISOString(),
@@ -131,6 +138,7 @@ export async function createSubscription(
   };
   await account.saveSubscription(info);
   await installation.addRepo(repo.id);
+  if (result.needs_open_prs) await rememberOpenPrs(env, installation, found.id, repo.full_name, repo.id);
   if (baseline) {
     info.baseline = { state: baseline.state, head_sha: baseline.head_sha, mergeable: baseline.mergeable ?? "unknown" };
   }
@@ -186,10 +194,47 @@ export async function deleteSubscription(env: Env, account: AccountStub, inbox: 
   return new Response(null, { status: 204 });
 }
 
+// The repo's first `base` or `author` filter: RepoHub learns its open PRs
+// (the 100 most recently updated; others from their next event), so PRs
+// opened before can match. Best effort: the subscription stands anyway.
+async function rememberOpenPrs(
+  env: Env,
+  installation: DurableObjectStub<Installation>,
+  installationId: number,
+  fullName: string,
+  repoId: number,
+): Promise<void> {
+  try {
+    const minted = await installation.token(installationId, 1);
+    if (!minted.ok) return;
+    const res = await githubGet(minted.token, `/repos/${fullName}/pulls?state=open&sort=updated&direction=desc&per_page=100`);
+    if (!res?.ok) {
+      console.error(`listing ${fullName}'s open PRs: ${res ? res.status : "unreachable"}`);
+      return;
+    }
+    const open: OpenPr[] = ((await res.json()) as (PullBody & { number: number })[]).map((pr) => ({
+      number: pr.number,
+      head_sha: pr.head?.sha ?? null,
+      base_ref: pr.base?.ref ?? null,
+      author: pr.user?.login ?? null,
+      draft: !!pr.draft,
+    }));
+    await repoHubStub(env, repoId).rememberOpenPrs(open);
+  } catch (e) {
+    console.error(`remembering ${fullName}'s open PRs failed`, e);
+  }
+}
+
+// A branch name git would take, roughly: see git-check-ref-format.
+function isBranchName(s: string): boolean {
+  return BRANCH_NAME.test(s) && !s.startsWith("-") && !s.startsWith("/") && !s.endsWith("/") && !s.endsWith(".")
+    && !s.endsWith(".lock") && !s.includes("..") && !s.includes("@{") && !s.includes("//");
+}
+
 // Checks the body's shape. Returns the request, or what's wrong with it.
 function parseRequest(body: Record<string, unknown> | null): SubscriptionRequest | string {
   if (!body || typeof body !== "object") return "Body must be a JSON object";
-  const { repo, pr, kinds, ignore, ttl_seconds } = body;
+  const { repo, pr, kinds, base, author, ignore, ttl_seconds } = body;
   if (typeof repo !== "string" || !REPO_NAME.test(repo)) return "repo must be owner/name";
   if (pr !== undefined && pr !== null && !(Number.isSafeInteger(pr) && (pr as number) > 0)) return "pr must be a pull request number";
   if (kinds !== undefined) {
@@ -200,7 +245,11 @@ function parseRequest(body: Record<string, unknown> | null): SubscriptionRequest
   if ((pr === undefined || pr === null) && !(kinds as string[] | undefined)?.length) {
     return "A repository-wide subscription must name at least one kind";
   }
-  if (body.base !== undefined || body.author !== undefined) return "base and author aren't supported by this server yet";
+  if (base !== undefined || author !== undefined) {
+    if (pr !== undefined && pr !== null) return "base and author are for repository-wide subscriptions; leave out pr";
+    if (base !== undefined && !(typeof base === "string" && isBranchName(base))) return "base must be a branch name";
+    if (author !== undefined && !(typeof author === "string" && LOGIN.test(author))) return "author must be a GitHub login";
+  }
   let parsedIgnore: SubscriptionRequest["ignore"];
   if (ignore !== undefined) {
     if (!ignore || typeof ignore !== "object") return "ignore must be an object";
@@ -220,6 +269,8 @@ function parseRequest(body: Record<string, unknown> | null): SubscriptionRequest
     repo,
     ...(pr === undefined || pr === null ? {} : { pr: pr as number }),
     ...(kinds === undefined ? {} : { kinds: kinds as string[] }),
+    ...(base === undefined ? {} : { base: base as string }),
+    ...(author === undefined ? {} : { author: author as string }),
     ...(parsedIgnore ? { ignore: parsedIgnore } : {}),
     ...(ttl_seconds === undefined ? {} : { ttl_seconds: ttl_seconds as number }),
   };
@@ -269,6 +320,7 @@ interface PullBody {
   mergeable?: boolean | null;
   head?: { sha?: string };
   base?: { ref?: string };
+  user?: { login?: string };
 }
 
 function toBaseline(pr: PullBody): PrBaseline {
