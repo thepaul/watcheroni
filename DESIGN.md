@@ -465,6 +465,10 @@ Holds the redelivery cursor for the cron job, a deny list of repos and
 accounts for the hosted copy's operator, limit overrides, and counters for
 a status page.
 
+In the prototype (`packages/server/src/control.ts`, migration tag `v4`)
+it holds only the redelivery state; see "As built" under "Missed
+deliveries".
+
 ## Worker routes
 
 Public API (defined in [PROTOCOL.md](PROTOCOL.md)):
@@ -509,6 +513,7 @@ set and sent as `Authorization: Bearer`:
 | `POST /debug/accounts/{id}/inboxes/{name}/events` | Inject synthetic events, standing in for RepoHub |
 | `POST /debug/repos/{id}/subscriptions`, `DELETE .../{sub}` | Subscribe RepoHub directly, without the GitHub checks |
 | `GET /debug/repos/{id}`, `GET /debug/installations/{id}` | What a `RepoHub` or `Installation` object holds |
+| `GET /debug/control`, `POST /debug/control/redeliver` | What `Control` holds; one run of the redelivery job, now |
 
 ### Webhook handling in the Worker
 
@@ -561,6 +566,44 @@ asks `Control` for its cursor, lists recent deliveries with the App JWT
 cursor. Redelivered webhooks keep their GUID, so RepoHub's dedupe makes
 this safe. GitHub keeps deliveries for 3 days, which bounds how long the
 server can be down without losing events.
+
+#### As built in the prototype
+
+`packages/server/src/control.ts`, with the cron in `scheduled` in
+`src/worker.ts`. Where it differs from the above:
+
+- **The work happens in Control**, not the cron handler: `scheduled`
+  makes one RPC, `Control.redeliver()`, which signs the JWT, lists and
+  redelivers. A cron invocation gets 10 ms of CPU on the free plan; a
+  Durable Object gets far more, its SQLite keeps the state, and an
+  in-memory guard stops runs overlapping.
+- **The cron is on production only** (`*/10 * * * *` under
+  `env.production.triggers`; the top level has `"crons": []`). Both
+  Workers use the same App, whose webhooks go to production, so a cron
+  on the test server would redeliver the same failures twice. On the
+  test server `POST /debug/control/redeliver` runs the job by hand (it
+  too redelivers to the App's webhook URL, production). The free plan
+  allows 5 cron triggers an account.
+- **The cursor** is a delivery ID: everything up to it has been looked
+  at. A run lists deliveries newest first (`per_page=100`, following
+  `Link: rel="next"`) until it reaches the cursor, or 3 days back, or 1
+  hour back on the very first run. A scan that needs more than 3 pages
+  saves its top and the next page's URL and carries on next run; the
+  cursor moves to the top only when a scan finishes. State is saved
+  after every page, so a run that fails (GitHub 5xx, say) resumes where
+  it stopped. Deliveries less than a minute old are left for the next
+  run, since one GitHub is still waiting on may be listed late.
+- **What's redelivered:** a GUID with a failed attempt (status 5xx, 429
+  or no response) and no later successful one. The Worker's own refusals
+  (400, 401, 413) aren't. Failures go to a `queue` table; each run asks
+  GitHub to redeliver the oldest 10 (`POST .../attempts`), and the rest
+  wait. A redelivery GitHub accepts leaves the queue; if it fails as
+  well, that's a new failed delivery for a later scan. At most 3
+  redeliveries per GUID. A 400 or 404 drops the GUID; a 422 (GitHub's
+  "too many") or 5xx keeps the queue for next run.
+- So a run makes at most 13 subrequests, and a missed delivery is
+  redelivered 1 to 11 minutes after it failed, or later when more than
+  10 are queued.
 
 ## Credentials
 

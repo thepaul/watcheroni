@@ -1,0 +1,280 @@
+import { DurableObject } from "cloudflare:workers";
+import { appJwt, githubHeaders } from "./app";
+import { GITHUB_API_URL } from "./github";
+
+// The single object named `control`: global state. For now that's the
+// redelivery of missed webhooks, which the cron trigger runs every 10
+// minutes. See "Missed deliveries" and "Control" in DESIGN.md.
+//
+// GitHub lists the App's deliveries newest first, a page at a time. A run
+// reads pages until it reaches the cursor (the newest delivery a finished
+// scan covered), queues the GUIDs whose deliveries failed and haven't
+// since succeeded, then asks GitHub to redeliver a few of them. A scan
+// that needs more pages than one run allows carries on from where it
+// stopped next run, and so does the queue, so a failed or capped run
+// loses nothing.
+
+// Pages of 100 per run, and redelivery requests per run. Each is a
+// subrequest (the free plan allows 50 an invocation) and costs a little
+// CPU; at ~5,000 webhooks a day a run sees ~35 new deliveries.
+export const REDELIVERY_LIMITS = {
+  pages: 3,
+  redeliveries: 10,
+  // Redeliveries asked for one GUID before giving up on it.
+  attempts: 3,
+};
+const PER_PAGE = 100;
+// Deliveries newer than this may still be in flight (GitHub waits 10 s),
+// so a scan starts below them and the next run picks them up.
+const SETTLE_MS = 60_000;
+// With no cursor yet (the first run), how far back to look.
+const FIRST_LOOKBACK_MS = 60 * 60_000;
+// GitHub keeps deliveries for 3 days; older ones can't be redelivered.
+const MAX_AGE_MS = 3 * 24 * 3600_000 - 3600_000;
+
+// One item of GET /app/hook/deliveries (the fields used here).
+interface HookDelivery {
+  id: number;
+  guid: string;
+  delivered_at: string;
+  redelivery: boolean;
+  status_code: number;
+  event: string;
+}
+
+export interface RedeliveryRun {
+  // Pages read, deliveries looked at, and failures newly queued.
+  pages: number;
+  scanned: number;
+  queued: number;
+  // Redeliveries GitHub accepted this run, and what's still queued.
+  redelivered: number;
+  pending: number;
+  // True when the scan reached the cursor; false when it carries on.
+  caught_up: boolean;
+  cursor: number | null;
+  error?: string;
+}
+
+export interface ControlStats {
+  meta: Record<string, string>;
+  queue: { guid: string; delivery_id: number; status_code: number; event: string }[];
+  attempts: { guid: string; n: number }[];
+}
+
+type QueueRow = { guid: string; delivery_id: number; delivered_at: number; status_code: number; event: string };
+
+// What's worth redelivering: no response, 429, or a 5xx. The Worker's own
+// refusals (401 bad signature, 413 too large, 400 not JSON) would only
+// fail again.
+export function retryable(statusCode: number): boolean {
+  return statusCode < 100 || statusCode === 429 || statusCode >= 500;
+}
+
+const succeeded = (statusCode: number) => statusCode >= 200 && statusCode < 400;
+
+export class Control extends DurableObject<Env> {
+  private readonly sql: SqlStorage;
+  private running: Promise<RedeliveryRun> | null = null;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec(`
+      -- cursor, scan_top, scan_next, last_run_at, last_error.
+      CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+      -- GUIDs to redeliver, by the latest failed delivery seen for each.
+      CREATE TABLE IF NOT EXISTS queue (
+        guid TEXT PRIMARY KEY,
+        delivery_id INTEGER NOT NULL,
+        delivered_at INTEGER NOT NULL,
+        status_code INTEGER NOT NULL,
+        event TEXT NOT NULL
+      );
+      -- Redeliveries asked for each GUID, kept while GitHub keeps them.
+      CREATE TABLE IF NOT EXISTS attempts (guid TEXT PRIMARY KEY, n INTEGER NOT NULL, last_at INTEGER NOT NULL);
+      -- GUIDs delivered successfully in the scan under way, so an older
+      -- failure of the same GUID isn't queued. Emptied when it finishes.
+      CREATE TABLE IF NOT EXISTS scan_ok (guid TEXT PRIMARY KEY);
+    `);
+  }
+
+  // The clock, separate so tests can move it.
+  protected now(): number {
+    return Date.now();
+  }
+
+  // ---- RPC -----------------------------------------------------------
+
+  // One run of the cron job. Runs don't overlap: a second call while one
+  // is under way gets that run's result.
+  redeliver(): Promise<RedeliveryRun> {
+    this.running ??= this.run().finally(() => {
+      this.running = null;
+    });
+    return this.running;
+  }
+
+  stats(): ControlStats {
+    return {
+      meta: Object.fromEntries(this.sql.exec<{ k: string; v: string }>("SELECT k, v FROM meta").toArray().map((r) => [r.k, r.v])),
+      queue: this.sql
+        .exec<QueueRow>("SELECT * FROM queue ORDER BY delivery_id")
+        .toArray()
+        .map(({ guid, delivery_id, status_code, event }) => ({ guid, delivery_id, status_code, event })),
+      attempts: this.sql.exec<{ guid: string; n: number }>("SELECT guid, n FROM attempts ORDER BY guid").toArray(),
+    };
+  }
+
+  // ---- The run -------------------------------------------------------
+
+  private async run(): Promise<RedeliveryRun> {
+    const now = this.now();
+    this.setMeta("last_run_at", new Date(now).toISOString());
+    this.sql.exec("DELETE FROM attempts WHERE last_at < ?", now - MAX_AGE_MS);
+    this.sql.exec("DELETE FROM queue WHERE delivered_at < ?", now - MAX_AGE_MS);
+    const result: RedeliveryRun = { pages: 0, scanned: 0, queued: 0, redelivered: 0, pending: 0, caught_up: false, cursor: null };
+    let headers: Record<string, string>;
+    try {
+      headers = githubHeaders(await appJwt(this.env, now));
+    } catch (e) {
+      return this.finish(result, String(e instanceof Error ? e.message : e));
+    }
+    let error: string | undefined;
+    try {
+      await this.scan(now, headers, result);
+      await this.redeliverQueued(now, headers, result);
+    } catch (e) {
+      error = String(e instanceof Error ? e.message : e);
+    }
+    return this.finish(result, error);
+  }
+
+  private finish(result: RedeliveryRun, error?: string): RedeliveryRun {
+    if (error) {
+      console.error(`redelivery: ${error}`);
+      this.setMeta("last_error", error);
+      result.error = error;
+    } else {
+      this.deleteMeta("last_error");
+    }
+    result.cursor = this.cursor();
+    result.pending = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM queue").one().n;
+    return result;
+  }
+
+  // Reads up to `pages` pages, newest first, from where the last run
+  // stopped. State is saved after each page, so a page GitHub fails to
+  // serve is simply asked for again next run.
+  private async scan(now: number, headers: Record<string, string>, result: RedeliveryRun): Promise<void> {
+    const cursor = this.cursor();
+    const cutoff = now - (cursor === null ? FIRST_LOOKBACK_MS : MAX_AGE_MS);
+    for (let page = 0; page < REDELIVERY_LIMITS.pages; page++) {
+      const url = this.getMeta("scan_next") ?? `${GITHUB_API_URL}/app/hook/deliveries?per_page=${PER_PAGE}`;
+      const res = await fetch(url, { headers });
+      if (!res.ok) throw new Error(`listing deliveries: GitHub answered ${res.status}`);
+      const items = (await res.json()) as HookDelivery[];
+      result.pages++;
+      let top = this.getMeta("scan_top") === null ? null : Number(this.getMeta("scan_top"));
+      let reached = false;
+      for (const item of items) {
+        const at = Date.parse(item.delivered_at);
+        if ((cursor !== null && item.id <= cursor) || at < cutoff) {
+          reached = true;
+          break;
+        }
+        // Until the scan has a top, skip deliveries that may be in flight.
+        if (top === null) {
+          if (at > now - SETTLE_MS) continue;
+          top = item.id;
+        }
+        result.scanned++;
+        if (this.classify(item, at)) result.queued++;
+      }
+      const next = nextLink(res.headers.get("Link"));
+      if (reached || !next) {
+        // The scan is complete: everything up to its top is queued or fine.
+        if (top !== null) this.setMeta("cursor", String(top));
+        this.deleteMeta("scan_top");
+        this.deleteMeta("scan_next");
+        this.sql.exec("DELETE FROM scan_ok");
+        result.caught_up = true;
+        return;
+      }
+      if (top !== null) this.setMeta("scan_top", String(top));
+      this.setMeta("scan_next", next);
+    }
+  }
+
+  // Notes one delivery. Returns true if it queued a new GUID.
+  private classify(item: HookDelivery, at: number): boolean {
+    if (succeeded(item.status_code)) {
+      this.sql.exec("INSERT OR IGNORE INTO scan_ok (guid) VALUES (?)", item.guid);
+      this.sql.exec("DELETE FROM queue WHERE guid = ?", item.guid);
+      return false;
+    }
+    if (!retryable(item.status_code)) return false;
+    // Newest first, so a later success of this GUID has been seen already.
+    if (this.sql.exec("SELECT 1 FROM scan_ok WHERE guid = ?", item.guid).toArray().length) return false;
+    const tried = this.sql.exec<{ n: number }>("SELECT n FROM attempts WHERE guid = ?", item.guid).toArray()[0]?.n ?? 0;
+    if (tried >= REDELIVERY_LIMITS.attempts) return false;
+    return (
+      this.sql.exec(
+        "INSERT OR IGNORE INTO queue (guid, delivery_id, delivered_at, status_code, event) VALUES (?, ?, ?, ?, ?)",
+        item.guid, item.id, at, item.status_code, item.event,
+      ).rowsWritten > 0
+    );
+  }
+
+  // Asks GitHub to redeliver the oldest queued GUIDs, up to the per-run
+  // cap. A redelivery GitHub accepts leaves the queue: if it fails too,
+  // that shows up as a new failed delivery in a later scan.
+  private async redeliverQueued(now: number, headers: Record<string, string>, result: RedeliveryRun): Promise<void> {
+    const rows = this.sql
+      .exec<QueueRow>("SELECT * FROM queue ORDER BY delivery_id LIMIT ?", REDELIVERY_LIMITS.redeliveries)
+      .toArray();
+    for (const row of rows) {
+      const res = await fetch(`${GITHUB_API_URL}/app/hook/deliveries/${row.delivery_id}/attempts`, { method: "POST", headers });
+      if (res.ok || res.status === 400 || res.status === 404) {
+        // 400 or 404: GitHub won't redeliver it (too old, or gone).
+        if (!res.ok) console.warn(`redelivery of ${row.guid} (${row.delivery_id}) refused: ${res.status}`);
+        else result.redelivered++;
+        this.sql.exec("DELETE FROM queue WHERE guid = ?", row.guid);
+        this.sql.exec(
+          "INSERT INTO attempts (guid, n, last_at) VALUES (?, 1, ?) ON CONFLICT (guid) DO UPDATE SET n = n + 1, last_at = excluded.last_at",
+          row.guid, now,
+        );
+        continue;
+      }
+      // 422 is GitHub saying "too many", and 5xx is GitHub in trouble:
+      // keep the rest for next run.
+      throw new Error(`redelivering ${row.delivery_id}: GitHub answered ${res.status}`);
+    }
+  }
+
+  private cursor(): number | null {
+    const v = this.getMeta("cursor");
+    return v === null ? null : Number(v);
+  }
+
+  private getMeta(k: string): string | null {
+    return this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v ?? null;
+  }
+
+  private setMeta(k: string, v: string): void {
+    this.sql.exec("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", k, v);
+  }
+
+  private deleteMeta(k: string): void {
+    this.sql.exec("DELETE FROM meta WHERE k = ?", k);
+  }
+}
+
+// The rel="next" URL of a Link header, if it points at GitHub's API.
+export function nextLink(link: string | null): string | null {
+  for (const part of link?.split(",") ?? []) {
+    const m = part.match(/<([^>]+)>\s*;\s*rel="next"/);
+    if (m && m[1].startsWith(`${GITHUB_API_URL}/`)) return m[1];
+  }
+  return null;
+}
