@@ -23,6 +23,7 @@ import {
   repoHubStub,
 } from "./subscriptions";
 import pkg from "../package.json";
+import { image } from "./images";
 import { landingPage, setupPage } from "./pages";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
@@ -74,6 +75,8 @@ export default {
     if (pathname === "/healthz") return new Response("ok");
     if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return landingPage(installUrl(env));
     if (route === "GET /github/setup") return setupPage(url);
+    const img = image(request, pathname);
+    if (img) return img;
     if (route === "GET /v1/meta") return json(meta(env));
     if (route === "POST /github/webhook") return webhook(request, env);
     if (route === "POST /v1/login") return login(request, env);

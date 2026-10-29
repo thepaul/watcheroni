@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/logo/meerkat-dark.svg">
+  <img src="assets/logo/meerkat.svg" alt="" width="96" align="right">
+</picture>
+
 # watcheroni
 
 Wait for, stream, or act on what happens to your GitHub pull requests:

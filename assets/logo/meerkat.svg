@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- badge -->
+  <circle cx="128" cy="128" r="120" fill="#2E3A59"/>
+  <clipPath id="b"><circle cx="128" cy="128" r="120"/></clipPath>
+  <g clip-path="url(#b)">
+    <!-- body: upright sentinel -->
+    <path d="M78 256 C78 190 92 160 128 156 C164 160 178 190 178 256 Z" fill="#D9A866"/>
+    <path d="M104 256 C104 205 112 182 128 180 C144 182 152 205 152 256 Z" fill="#F1D3A3"/>
+    <!-- tucked paws -->
+    <ellipse cx="112" cy="196" rx="11" ry="8" fill="#B88648"/>
+    <ellipse cx="144" cy="196" rx="11" ry="8" fill="#B88648"/>
+  </g>
+  <!-- ears -->
+  <circle cx="72" cy="96" r="12" fill="#3B2A1E"/>
+  <circle cx="184" cy="96" r="12" fill="#3B2A1E"/>
+  <!-- head -->
+  <path d="M128 40 C176 40 190 78 182 110 C176 134 150 160 128 164 C106 160 80 134 74 110 C66 78 80 40 128 40 Z" fill="#D9A866"/>
+  <!-- dark eye patches -->
+  <ellipse cx="100" cy="102" rx="22" ry="24" transform="rotate(25 100 102)" fill="#3B2A1E"/>
+  <ellipse cx="156" cy="102" rx="22" ry="24" transform="rotate(-25 156 102)" fill="#3B2A1E"/>
+  <!-- eyes: wide, pinpoint pupils -->
+  <circle cx="102" cy="98" r="14" fill="#FFFFFF"/>
+  <circle cx="154" cy="98" r="14" fill="#FFFFFF"/>
+  <circle cx="104" cy="98" r="4" fill="#3B2A1E"/>
+  <circle cx="152" cy="98" r="4" fill="#3B2A1E"/>
+  <!-- muzzle -->
+  <path d="M110 126 C114 146 122 160 128 160 C134 160 142 146 146 126 C136 120 120 120 110 126 Z" fill="#F1D3A3"/>
+  <ellipse cx="128" cy="134" rx="8" ry="5.5" fill="#3B2A1E"/>
+  <path d="M121 149 h14" stroke="#3B2A1E" stroke-width="3.5" stroke-linecap="round"/>
+</svg>

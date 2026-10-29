@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- one colour + transparency; change fill (or use currentColor) to recolour -->
+  <mask id="m">
+    <circle cx="128" cy="128" r="120" fill="#fff"/>
+    <!-- body -->
+    <path d="M78 256 C78 190 92 160 128 156 C164 160 178 190 178 256 Z" fill="#000"/>
+    <!-- ears -->
+    <circle cx="72" cy="96" r="12" fill="#000"/>
+    <circle cx="184" cy="96" r="12" fill="#000"/>
+    <!-- head, with a gap separating it from ears and body -->
+    <path d="M128 40 C176 40 190 78 182 110 C176 134 150 160 128 164 C106 160 80 134 74 110 C66 78 80 40 128 40 Z" fill="#000" stroke="#fff" stroke-width="6"/>
+    <!-- eye patches, eyes, pupils -->
+    <ellipse cx="100" cy="102" rx="22" ry="24" transform="rotate(25 100 102)" fill="#fff"/>
+    <ellipse cx="156" cy="102" rx="22" ry="24" transform="rotate(-25 156 102)" fill="#fff"/>
+    <circle cx="102" cy="98" r="14" fill="#000"/>
+    <circle cx="154" cy="98" r="14" fill="#000"/>
+    <circle cx="104" cy="98" r="4" fill="#fff"/>
+    <circle cx="152" cy="98" r="4" fill="#fff"/>
+    <!-- nose + mouth -->
+    <ellipse cx="128" cy="134" rx="8" ry="5.5" fill="#fff"/>
+    <path d="M121 149 h14" stroke="#fff" stroke-width="3.5" stroke-linecap="round"/>
+  </mask>
+  <rect width="256" height="256" fill="#2E3A59" mask="url(#m)"/>
+</svg>
