@@ -104,6 +104,10 @@ export interface SubscriptionRequest {
   repo: string;
   pr?: number;
   kinds?: string[];
+  // Repository-wide subscriptions only: PRs targeting this branch, or
+  // opened by this GitHub login.
+  base?: string;
+  author?: string;
   ignore?: { self?: boolean; bots?: boolean; actors?: string[] };
   ttl_seconds?: number;
 }
@@ -114,6 +118,9 @@ export interface SubscriptionInfo {
   repo: { id: number; full_name: string; private: boolean };
   pr: number | null;
   kinds: string[];
+  // Only when the subscription was made with them.
+  base?: string;
+  author?: string;
   ignore: { self: boolean; bots: boolean; actors: string[] };
   created_at: string;
   expires_at: string;

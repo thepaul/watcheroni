@@ -1,8 +1,8 @@
-import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
+import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import type { ServerConfig } from "./config.ts";
 import { LoginNeeded } from "./github.ts";
-import { targetKey, type Target } from "./targets.ts";
+import { anyKey, isPr, type RepoTarget, type Target } from "./targets.ts";
 
 // Server mode: reading an inbox on a watcheroni server (PROTOCOL.md,
 // "Reading events"), over a WebSocket, or by long-polling when a socket
@@ -64,6 +64,7 @@ export class ServerClient {
       const cause = (e as Error & { cause?: Error }).cause;
       throw new Unreachable(`can't reach ${this.url}: ${cause?.message ?? (e as Error).message}`);
     }
+    if (res.status === 204) return undefined as T;
     if (res.ok) return (await res.json()) as T;
     const problem = (await res.json().catch(() => ({}))) as { code?: string; title?: string; detail?: string };
     const code = problem.code ?? String(res.status);
@@ -107,16 +108,18 @@ export interface SubscribeOptions {
   githubToken?: () => Promise<string | null>;
 }
 
-// Subscribes the inbox to a PR on the server (PROTOCOL.md,
-// "Subscriptions") and returns the subscription's ID. Asks without a
-// GitHub token first; only a private repo needs one, and it's sent only
-// then. Returns null when the server won't watch it (the App isn't
-// installed, no access, unreachable), so the PR is polled from this
+// Subscribes the inbox to a PR, or a whole repository, on the server
+// (PROTOCOL.md, "Subscriptions") and returns the subscription's ID. Asks
+// without a GitHub token first; only a private repo needs one, and it's
+// sent only then. Returns null when the server won't watch it (the App
+// isn't installed, no access, unreachable), so a PR is polled from this
 // machine instead.
-export async function subscribe(client: ServerClient, inbox: string, target: Target, o: SubscribeOptions): Promise<string | null> {
+export async function subscribe(client: ServerClient, inbox: string, target: Target | RepoTarget, o: SubscribeOptions): Promise<string | null> {
   const repo = `${target.owner}/${target.name}`;
   const path = `/v1/inboxes/${inbox}/subscriptions`;
-  const body = { repo, pr: target.number };
+  const body: SubscriptionRequest = isPr(target)
+    ? { repo, pr: target.number }
+    : { repo, kinds: target.kinds, ...(target.base ? { base: target.base } : {}), ...(target.author ? { author: target.author } : {}) };
   try {
     try {
       return (await client.request<SubscriptionInfo>("POST", path, { body })).id;
@@ -137,12 +140,12 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
       } else if (e.code === "github_token_invalid") {
         o.log(`${client.url} didn't accept this machine's GitHub token for ${repo}; run \`watcheroni login\` again`);
       } else {
-        o.log(`${client.url} won't watch ${targetKey(target)}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
+        o.log(`${client.url} won't watch ${anyKey(target)}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
       }
       return null;
     }
     if (e instanceof Unreachable) {
-      o.log(`couldn't subscribe to ${targetKey(target)} (${e.message})`);
+      o.log(`couldn't subscribe to ${anyKey(target)} (${e.message})`);
       return null;
     }
     throw e;

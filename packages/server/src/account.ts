@@ -291,7 +291,7 @@ export class Account extends DurableObject<Env> {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (id) DO UPDATE SET repo_name = excluded.repo_name, expires_at = excluded.expires_at, verified_until = excluded.verified_until`,
       rest.id, rest.inbox, rest.repo.id, rest.repo.full_name, rest.repo.private ? 1 : 0, rest.pr,
-      JSON.stringify({ kinds: rest.kinds, ignore: rest.ignore }),
+      JSON.stringify({ kinds: rest.kinds, ignore: rest.ignore, base: rest.base, author: rest.author }),
       Date.parse(rest.created_at), Date.parse(rest.expires_at),
       rest.verified_until === null ? null : Date.parse(rest.verified_until),
     );
@@ -494,13 +494,15 @@ export class Account extends DurableObject<Env> {
 }
 
 function subscriptionInfo(row: SubscriptionRow): SubscriptionInfo {
-  const spec = JSON.parse(row.spec) as Pick<SubscriptionInfo, "kinds" | "ignore">;
+  const spec = JSON.parse(row.spec) as Pick<SubscriptionInfo, "kinds" | "ignore" | "base" | "author">;
   return {
     id: row.id,
     inbox: row.inbox,
     repo: { id: row.repo_id, full_name: row.repo_name, private: row.private === 1 },
     pr: row.pr,
     kinds: spec.kinds,
+    ...(spec.base === undefined ? {} : { base: spec.base }),
+    ...(spec.author === undefined ? {} : { author: spec.author }),
     ignore: spec.ignore,
     created_at: new Date(row.created_at).toISOString(),
     expires_at: new Date(row.expires_at).toISOString(),

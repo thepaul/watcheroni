@@ -198,6 +198,90 @@ describe("wait against a server", () => {
   });
 });
 
+describe("watching a whole repository", () => {
+  it("subscribes with its filters, wakes on a matching event, and never says it ended", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    const run = cli(["wait", "octo/widgets", "--kinds", "pr.opened", "--base", "main", "--settle", "0"]);
+    await until(() => fake.sockets.size === 1);
+    expect(fake.subscriptions).toEqual([{ id: "sub_1", inbox: "box", repo: "octo/widgets", pr: null, githubToken: null, kinds: ["pr.opened"], base: "main" }]);
+    fake.inject("box", "pr.opened", { head_sha: "4f2e1a9", base: "main", draft: false }, "e1", "sub_1", 12);
+    expect(await run.code, run.stderr()).toBe(0);
+    expect(run.stderr()).toBe("watcheroni: watching octo/widgets (pr.opened; base main) in inbox box\n");
+    expect(run.stdout()).toBe([
+      "octo/widgets#12: 1 new event",
+      "- pr.opened",
+      "",
+      "Still watching octo/widgets (pr.opened; base main). Run `watcheroni wait` again to keep watching.",
+      "",
+    ].join("\n"));
+
+    // Next time it's known, so not subscribed again; with nothing new, a timeout.
+    const again = cli(["wait", "octo/widgets", "--kinds", "pr.opened", "--base", "main", "--timeout", "1s"]);
+    expect(await again.code).toBe(2);
+    expect(fake.subscriptions).toHaveLength(1);
+    const ls = cli(["ls"]);
+    expect(await ls.code).toBe(0);
+    expect(ls.stdout()).toMatch(/^octo\/widgets \(pr\.opened; base main\)  since /);
+  });
+
+  it("keeps waiting after the PRs watched beside it have ended", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    // The repository is subscribed first, as sub_1; the PR is sub_2.
+    fake.inject("box", "pr.merged", {}, "e1", "sub_2");
+    fake.inject("box", "watch.ended", { reason: "merged" }, "e2", "sub_2");
+    const run = cli(["wait", "octo/widgets#7", "octo/widgets", "--kinds", "pr.*", "--author", "paul", "--settle", "0", "--format", "json"]);
+    expect(await run.code, run.stderr()).toBe(0);
+    expect(fake.subscriptions.map((s) => [s.pr, s.author ?? null])).toEqual([[null, "paul"], [7, null]]);
+    expect((JSON.parse(run.stdout()) as { watching: string[] }).watching).toEqual(["octo/widgets (pr.*; author paul)"]);
+  });
+
+  it("stops watching when the server ends the subscription", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    fake.inject("box", "watch.revoked", { reason: "uninstalled" }, "e1", "sub_1", null);
+    const run = cli(["wait", "octo/widgets", "--kinds", "pr.opened", "--settle", "0"]);
+    expect(await run.code, run.stderr()).toBe(3);
+    expect(run.stdout()).toMatch(/^octo\/widgets: 1 new event\n- watch.revoked/);
+    expect(run.stdout()).toMatch(/Nothing is left to watch: the server's watch on the repository has ended.\n$/);
+    const ls = cli(["ls"]);
+    await ls.code;
+    expect(ls.stdout()).toBe("Inbox box is watching nothing.\n");
+  });
+
+  it("unwatches on the server", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    expect(await cli(["watch", "octo/widgets", "--kinds", "pr.opened"]).code).toBe(0);
+    expect(await cli(["watch", "octo/widgets", "--kinds", "check.failed", "--author", "paul"]).code).toBe(0);
+    const run = cli(["unwatch", "octo/widgets"]);
+    expect(await run.code, run.stderr()).toBe(0);
+    expect(fake.deleted).toEqual(["sub_1", "sub_2"]);
+    // Without a server, it says the server's subscription is left.
+    expect(await cli(["watch", "octo/widgets", "--kinds", "pr.opened"]).code).toBe(0);
+    const offline = cli(["unwatch", "octo/widgets"], { WATCHERONI_SERVER: "" });
+    expect(await offline.code).toBe(0);
+    expect(offline.stderr()).toMatch(/stopped watching octo\/widgets \(pr.opened\) here, but with no server configured its subscription there wasn't ended/);
+    expect(fake.deleted).toEqual(["sub_1", "sub_2"]);
+    const ls = cli(["ls"]);
+    await ls.code;
+    expect(ls.stdout()).toBe("Inbox box is watching nothing.\n");
+  });
+
+  it("explains what it needs", async () => {
+    const noKinds = cli(["wait", "octo/widgets"]);
+    expect(await noKinds.code).toBe(1);
+    expect(noKinds.stderr()).toMatch(/needs --kinds/);
+    const noServer = cli(["wait", "octo/widgets", "--kinds", "pr.opened"], { WATCHERONI_SERVER: "" });
+    expect(await noServer.code).toBe(1);
+    expect(noServer.stderr()).toMatch(/needs the watcheroni server.*polling every PR in it/);
+    const stray = cli(["wait", "octo/widgets#7", "--base", "main"]);
+    expect(await stray.code).toBe(1);
+    expect(stray.stderr()).toMatch(/--base and --author are for whole-repository targets/);
+    // Not installed: there's no polling to fall back on.
+    const refused = cli(["wait", "octo/widgets", "--kinds", "pr.opened"]);
+    expect(await refused.code).toBe(1);
+    expect(refused.stderr()).toMatch(/App isn't installed on octo\/widgets.*\n.*can't watch octo\/widgets \(pr.opened\)/);
+  });
+});
+
 describe("stream against a server", () => {
   it("prints each event as a JSON line and acknowledges it", async () => {
     fake.inject("box", "comment.created");
