@@ -16,6 +16,7 @@ const published = {
   types: "./index.d.ts",
   exports: { ".": { types: "./index.d.ts", default: "./index.js" } },
   files: ["index.js", "index.d.ts"],
+  sideEffects: false,
 };
 
 writeFileSync(new URL("package.json", dist), JSON.stringify(published, null, 2) + "\n");

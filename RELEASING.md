@@ -15,8 +15,8 @@ version, which `/v1/meta` reports as `server: "watcheroni/X.Y.Z"`. A
 server deployed from `main` between releases reports the last release.
 
 Releases are published by `.github/workflows/release.yml` when a `vX.Y.Z`
-tag is pushed: it runs the CI checks, checks the tag matches all three
-`package.json` versions, builds, and publishes both packages with
+tag is pushed: it runs the CI checks, checks the tagged commit is on
+`main` and the tag matches all three `package.json` versions, builds, and publishes both packages with
 provenance. Nobody publishes from their own machine.
 
 ## Making a release
@@ -48,23 +48,38 @@ protocol types, bumps the minor version.
 ## Publishing credentials
 
 The workflow publishes with npm trusted publishing (OIDC) when it's set up
-for both packages, and otherwise with the `NPM_TOKEN` repository secret.
+for both packages, and otherwise with the `NPM_TOKEN` secret of the `npm`
+GitHub environment, which the publish job runs in.
 The packages must exist on npm before trusted publishing can be set up,
 so the first release uses a token:
 
 1. On npmjs.com, create a granular access token with read and write
    access to all packages (or the `watcheroni` scope), "bypass two-factor
    authentication" ticked, and a short expiry (a week).
-2. Store it as the repository secret `NPM_TOKEN`
-   (`gh secret set NPM_TOKEN`).
-3. Release as above.
-4. Then, for each of `watcheroni` and `@watcheroni/protocol`, on its
+2. In the repository's Settings, Environments, create the `npm`
+   environment (if a release run hasn't already). Under "Deployment
+   branches and tags", choose "Selected branches and tags" and add the
+   tag rule `v*`, so only release tags can use it.
+3. Store the token as a secret of that environment, not of the
+   repository:
+
+   ```
+   gh secret set NPM_TOKEN --env npm -R thepaul/watcheroni
+   ```
+4. Release as above.
+5. Then, for each of `watcheroni` and `@watcheroni/protocol`, on its
    npmjs.com settings page add a trusted publisher: GitHub Actions,
    repository `thepaul/watcheroni`, workflow `release.yml`, environment
-   `npm`. Delete the `NPM_TOKEN` secret and revoke the token, and set
-   each package to "require two-factor authentication and disallow
-   tokens".
+   `npm`. Delete the `NPM_TOKEN` environment secret
+   (`gh secret delete NPM_TOKEN --env npm -R thepaul/watcheroni`) and
+   revoke the token, and set each package to "require two-factor
+   authentication and disallow tokens".
 
-The publish job runs in the `npm` GitHub environment, so a required
-reviewer can be added there (Settings, Environments) if releases should
-need a second approval.
+Optionally:
+
+- Add a required reviewer to the `npm` environment, so each release
+  needs a second approval.
+- Add a tag ruleset (Settings, Rules, Rulesets, "New tag ruleset")
+  targeting `v*` that restricts creation, updates and deletion to
+  maintainers, so a release tag can't be pushed, moved or deleted by
+  anyone else.

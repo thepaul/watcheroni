@@ -11,7 +11,7 @@ octo/widgets#123: 2 new events
 - check.failed: "test (ubuntu-latest)" (failure) on 4f9c2e1
   gh run view 18342210911 -R octo/widgets --log-failed
 - review.submitted by mona: changes_requested
-  gh api repos/octo/widgets/pulls/123/reviews/3374120415
+  gh api repos/octo/widgets/pulls/123/reviews/3374120415 --jq '.state, .body'
 
 octo/widgets#123 is still open. Run `watcheroni wait` again to keep watching.
 ```
