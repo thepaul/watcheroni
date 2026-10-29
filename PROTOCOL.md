@@ -213,6 +213,12 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
   (or stops matching) from its `pr.base_changed` on. When subscribing, it
   learns the repo's open PRs (the 100 most recently updated; others from
   their next pull request, review or comment event).
+- While any subscription on a repo has `base` or `author`, the server
+  knows the repo's open PRs, so a commit status (which names only a
+  commit) on an open PR's head is delivered once per such PR, with `pr`
+  set. Unfiltered repository-wide subscribers on that repo see these
+  copies too; otherwise only PRs that have their own subscription get
+  one, and a status on no watched PR's head arrives once with `pr` `null`.
 - `kinds`: event kinds or globs (`review.*`). Leaving it out means every
   kind for PR subscriptions.
 - `ignore.self`: drop events caused by the account's own GitHub user.

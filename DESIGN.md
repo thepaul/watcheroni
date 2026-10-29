@@ -232,23 +232,34 @@ earliest due time, or clears it.
   `checks.completed` or `merge.*`.
 - **`base` and `author`** (repository-wide only) are kept in `spec`, so
   they count for idempotence; `author` is lowercased. They match against
-  `prs`, which gained an `author` column (schema 3). While any
-  repo-wide subscription has one, `prs` holds every open PR RepoHub has
-  heard of, not only watched ones (up to 1,000): the Worker lists the
-  repo's open PRs when subscribing (one more installation API call, the
-  100 most recently updated, passed to `subscribe` as `openPrs`), and
-  `pr.opened`, `pr.reopened` and an internal `pr.seen` fact add rows.
-  The normaliser emits `pr.seen` (`head_sha`, `base`, `author`, `state`)
-  after the other events of any payload that describes the PR
-  (`pull_request*`, and `issue_comment` on a PR, which gives only the
-  author); it only fills gaps, since the head and base move with
-  `pr.pushed` and `pr.base_changed`, and it never makes a delivery that
-  would otherwise be skipped reach RepoHub. Closed and merged PRs are
-  dropped as before, and when the last filtering subscription goes, so
-  are rows no PR subscription needs. A filtered subscription gets an
-  event only if its PR is known and matches, so never issue events or
-  statuses on a commit that's no known PR's head. While rows are kept,
-  head-SHA matching (below) also gives such statuses those PRs.
+  `prs`, which gained `author` and `seen_at` columns (schema 4; every
+  migration step is idempotent, since "schema 3" meant `prs.author` on
+  one branch and ticket 003's check tables on another). While any
+  repo-wide subscription has one (a `tracks_all_prs` flag in `meta`, set
+  by `subscribe` and recomputed when a repo-wide subscription goes),
+  `prs` holds every open PR RepoHub has heard of, not only watched ones,
+  up to 1,000; past that, the least recently seen PRs no PR subscription
+  needs are forgotten. Rows come from:
+  - the repo's open PRs, once: the subscription that sets the flag
+    answers `needs_open_prs`, and the Worker then lists the 100 most
+    recently updated (one more installation API call) and passes them to
+    `rememberOpenPrs`, one upsert that leaves rows already right alone.
+    If the list fails, the subscription stands anyway;
+  - `pr.opened`, `pr.reopened`, and an internal `pr.seen` fact, which the
+    normaliser emits (`head_sha`, `base`, `author`, `state`) after the
+    other events of any payload that describes the PR (`pull_request*`,
+    and `issue_comment` on a PR, which gives only the author). `pr.seen`
+    writes only to fill a gap, so most PR webhooks cost no row write; the
+    head and base move with `pr.pushed` and `pr.base_changed`. It never
+    makes a delivery that would otherwise be skipped reach RepoHub.
+
+  Closed and merged PRs are dropped as before, and when the last
+  filtering subscription goes, so are rows no PR subscription needs. A
+  filtered subscription gets an event only if its PR is known and
+  matches, so never issue events or statuses on a commit that's no known
+  PR's head. While rows are kept, head-SHA matching (below) also gives
+  such statuses those PRs, which unfiltered repo-wide subscriptions see
+  too.
 - **Expiry is pulled, not pushed.** There's no `touch`: reading an inbox
   only records `last_read_at` in Account (a WebSocket `hello` counts, and
   so does having a socket open). When a subscription reaches
