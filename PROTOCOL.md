@@ -482,9 +482,12 @@ thread's first comment to see what the thread is about.
 
 `check.failed` arrives as soon as one check fails. `checks.completed` is
 **derived**: it's sent when every check on the PR's current head has
-finished, and again if a re-run changes the result. It is best-effort,
-because GitHub has no event meaning "all checks are done": a check that
-starts late can follow it.
+finished, and again whenever that changes: a re-run changes the result,
+or checks that started late finish (each `checks.completed` covers every
+check seen on the head so far, so the later one supersedes the earlier).
+The server waits about 20 seconds after the checks finish before
+sending it. It is best-effort, because GitHub has no event meaning "all
+checks are done".
 
 **Mergeability** (derived; no GitHub webhook exists for this):
 

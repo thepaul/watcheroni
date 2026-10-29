@@ -4,7 +4,7 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Delivery } from "../src/account";
 import type { UnsequencedEvent, WatchEvent } from "../src/protocol";
-import { REPO_LIMITS, type IngestResult, type RepoHub, type RepoHubStats, type Subscription } from "../src/repo-hub";
+import { REPO_LIMITS, RepoHub as RepoHubClass, type IngestResult, type RepoHub, type RepoHubStats, type Subscription } from "../src/repo-hub";
 import { sign } from "../src/webhook/signature";
 
 type Example = { action?: string; [key: string]: unknown };
@@ -379,17 +379,30 @@ describe("throttling", () => {
 describe("checks.completed", () => {
   const run = (repo: number, kind: "check.started" | "check.completed", id: number, name: string, extra: UnsequencedEvent["data"] = {}) =>
     fact(repo, kind, null, { head_sha: SHA_A, name, check_run_id: id, suite_id: 10, app_id: 15368, ...extra });
-  const status = (repo: number, context: string, state: "pending" | "success" | "failure") =>
+  const status = (repo: number, context: string, state: "pending" | "success" | "failure", sha = SHA_A, id?: number) =>
     state === "pending"
-      ? fact(repo, "check.started", null, { head_sha: SHA_A, name: context, status_context: context, status: "pending" })
-      : fact(repo, "check.completed", null, { head_sha: SHA_A, name: context, status_context: context, conclusion: state });
+      ? fact(repo, "check.started", null, { head_sha: sha, name: context, status_context: context, status: "pending", status_id: id ?? null })
+      : fact(repo, "check.completed", null, { head_sha: sha, name: context, status_context: context, conclusion: state, status_id: id ?? null });
   const suite = (repo: number, id: number, status: string) =>
     fact(repo, "check_suite.updated", null, { head_sha: SHA_A, suite_id: id, app_id: 99, status, conclusion: status === "completed" ? "success" : null });
+  const watch = (repo: number, acct: number, head = SHA_A) =>
+    subscribe(repo, { account: acct, inbox: "i", pr: 7, kinds: ["checks.completed"], baseline: { state: "open", head_sha: head } });
+  const counts = (o: Partial<Record<string, number>>) => ({ success: 0, failure: 0, cancelled: 0, skipped: 0, neutral: 0, ...o });
 
-  it("waits for every suite and status, then reports the result, and again when a re-run changes it", async () => {
+  // Runs the alarm as if the settle delay had passed. Returns whether a
+  // send was pending.
+  async function settle(repo: number): Promise<boolean> {
+    const pending = await runInDurableObject(hub(repo), (_: RepoHub, state) =>
+      state.storage.sql.exec("UPDATE rollups SET settle_at = 1 WHERE settle_at IS NOT NULL").rowsWritten > 0,
+    );
+    await runDurableObjectAlarm(hub(repo));
+    return pending;
+  }
+
+  it("waits for every suite and status, settles, then reports, and again when a re-run changes it", async () => {
     const repo = fresh();
     const acct = fresh();
-    const sub = await subscribe(repo, { account: acct, inbox: "i", pr: 7, kinds: ["checks.completed"], baseline: { state: "open", head_sha: SHA_A } });
+    const sub = await watch(repo, acct);
     const h = hub(repo);
     // Another App's suite that never runs anything is ignored.
     await h.ingest("d1", [suite(repo, 11, "queued")]);
@@ -398,73 +411,187 @@ describe("checks.completed", () => {
     await h.ingest("d4", [run(repo, "check.completed", 1, "build", { conclusion: "success" })]);
     await h.ingest("d5", [run(repo, "check.completed", 2, "test", { conclusion: "failure" })]);
     // Every run is done but the suite may still start more.
-    expect(await inbox(acct, "i")).toEqual([]);
+    expect(await settle(repo)).toBe(false);
     await h.ingest("d6", [suite(repo, 10, "completed")]);
     // The status is still pending.
-    expect(await inbox(acct, "i")).toEqual([]);
+    expect(await settle(repo)).toBe(false);
     await h.ingest("d7", [status(repo, "ci/lint", "success")]);
+    // Finished, but sent only after the settle delay.
+    const [pending] = (await stats(repo)).rollups;
+    expect(pending.settle_at! - Date.now()).toBeGreaterThan(15_000);
+    expect(await inbox(acct, "i")).toEqual([]);
+    expect(await settle(repo)).toBe(true);
 
     const [first] = await inbox(acct, "i");
     expect(first).toMatchObject({
-      id: "d7.checks.pr7",
       sub: sub.id,
       kind: "checks.completed",
       pr: 7,
       actor: null,
       links: { html: "https://github.com/octo/widgets/pull/7", api: "https://api.github.com/repos/octo/widgets/pulls/7" },
     });
-    expect(first.data).toEqual({
-      head_sha: SHA_A,
-      result: "failure",
-      failed: ["test"],
-      counts: { success: 2, failure: 1, cancelled: 0, skipped: 0, neutral: 0 },
-    });
+    expect(first.id).toMatch(new RegExp(`^repo:${repo}\\.pr7\\.checks\\.\\d+$`));
+    expect(first.data).toEqual({ head_sha: SHA_A, result: "failure", failed: ["test"], counts: counts({ success: 2, failure: 1 }) });
 
     // A re-run of the failed job: only the latest run of a name counts.
     await h.ingest("d8", [run(repo, "check.started", 3, "test", { status: "queued" })]);
     await h.ingest("d9", [run(repo, "check.completed", 3, "test", { conclusion: "success" })]);
     // A late `created` for a finished run changes nothing.
     await h.ingest("d10", [run(repo, "check.started", 1, "build", { status: "queued" })]);
+    expect(await settle(repo)).toBe(true);
+    // Nothing new: nothing to send.
+    await h.ingest("d11", [status(repo, "ci/lint", "success")]);
+    expect(await settle(repo)).toBe(false);
     const got = await inbox(acct, "i");
-    expect(got.map((e) => [e.id, e.data.result])).toEqual([["d7.checks.pr7", "failure"], ["d9.checks.pr7", "success"]]);
-    expect(got[1].data.counts).toEqual({ success: 3, failure: 0, cancelled: 0, skipped: 0, neutral: 0 });
-    expect((await stats(repo)).rollups).toEqual([{ head_sha: SHA_A, result: "success" }]);
+    expect(got.map((e) => e.data.result)).toEqual(["failure", "success"]);
+    expect(got[1].data.counts).toEqual(counts({ success: 3 }));
   });
 
-  it("starts again on a new head, counting checks that arrived before the push", async () => {
+  it("reports again when checks that appear later finish", async () => {
     const repo = fresh();
     const acct = fresh();
-    await subscribe(repo, { account: acct, inbox: "i", pr: 7, kinds: ["checks.completed"], baseline: { state: "open", head_sha: SHA_B } });
-    await hub(repo).ingest("d1", [status(repo, "ci/lint", "failure")]);
-    expect(await inbox(acct, "i")).toEqual([]);
+    await watch(repo, acct);
+    // A quick status finishes before Actions has created any runs.
+    await hub(repo).ingest("cla", [status(repo, "cla", "success")]);
+    expect(await settle(repo)).toBe(true);
+    await hub(repo).ingest("r1", [run(repo, "check.started", 1, "build", { status: "queued" })]);
+    await hub(repo).ingest("r2", [run(repo, "check.completed", 1, "build", { conclusion: "success" })]);
+    await hub(repo).ingest("s", [suite(repo, 10, "completed")]);
+    expect(await settle(repo)).toBe(true);
+    expect((await inbox(acct, "i")).map((e) => [e.data.result, e.data.counts])).toEqual([
+      ["success", counts({ success: 1 })],
+      ["success", counts({ success: 2 })],
+    ]);
+  });
+
+  it("doesn't send a rollup that stops being finished before it settles", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await watch(repo, acct);
+    await hub(repo).ingest("cla", [status(repo, "cla", "success")]);
+    await hub(repo).ingest("r1", [run(repo, "check.started", 1, "build", { status: "queued" })]);
+    expect(await settle(repo)).toBe(false);
+    await hub(repo).ingest("r2", [run(repo, "check.completed", 1, "build", { conclusion: "failure" }), suite(repo, 10, "completed")]);
+    expect(await settle(repo)).toBe(true);
+    expect((await inbox(acct, "i")).map((e) => [e.data.result, e.data.counts])).toEqual([["failure", counts({ success: 1, failure: 1 })]]);
+  });
+
+  it("starts again on a new head, counting checks from before the push, and after a force-push back", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await watch(repo, acct, SHA_B);
+    await hub(repo).ingest("a", [status(repo, "ci/lint", "success", SHA_A)]);
+    await hub(repo).ingest("b", [status(repo, "ci/lint", "failure", SHA_B)]);
+    expect(await settle(repo)).toBe(true);
     await hub(repo).ingest("push", [fact(repo, "pr.pushed", 7, { before: SHA_B, after: SHA_A })]);
-    const got = await inbox(acct, "i");
-    expect(got.map((e) => [e.id, e.data.head_sha, e.data.result, e.data.failed])).toEqual([["push.checks.pr7", SHA_A, "failure", ["ci/lint"]]]);
+    expect(await settle(repo)).toBe(true);
+    // Back to the first head: its rollup is news again, as in the CLI.
+    await hub(repo).ingest("back", [fact(repo, "pr.pushed", 7, { before: SHA_A, after: SHA_B })]);
+    expect(await settle(repo)).toBe(true);
+    expect((await inbox(acct, "i")).map((e) => [e.data.head_sha, e.data.result])).toEqual([
+      [SHA_B, "failure"],
+      [SHA_A, "success"],
+      [SHA_B, "failure"],
+    ]);
+  });
+
+  it("keeps the newest of out-of-order facts", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await watch(repo, acct);
+    const at = "2026-10-28T10:00:00Z";
+    const h = hub(repo);
+    // The run's completion arrives before its creation, and the suite's
+    // completion before the run that first names the suite.
+    await h.ingest("d1", [run(repo, "check.completed", 5, "build", { conclusion: "success", suite_id: 20 })]);
+    await h.ingest("d2", [run(repo, "check.started", 5, "build", { status: "queued", suite_id: 20 })]);
+    await h.ingest("d3", [{ ...fact(repo, "check_suite.updated", null, { head_sha: SHA_A, suite_id: 21, status: "completed", conclusion: "success" }), at }]);
+    await h.ingest("d4", [run(repo, "check.completed", 6, "lint", { conclusion: "success", suite_id: 21 })]);
+    await h.ingest("d5", [suite(repo, 20, "completed")]);
+    // A status's success and pending in the same second, the other way
+    // round: the higher ID wins.
+    await h.ingest("d6", [{ ...status(repo, "ci/x", "success", SHA_A, 11), at }]);
+    await h.ingest("d7", [{ ...status(repo, "ci/x", "pending", SHA_A, 10), at }]);
+    expect(await settle(repo)).toBe(true);
+    expect((await inbox(acct, "i")).map((e) => e.data.counts)).toEqual([counts({ success: 3 })]);
+  });
+
+  it("counts a run created already finished, and never a missing conclusion as success", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await watch(repo, acct);
+    const created = example("check_run", "created");
+    Object.assign(created.check_run as object, {
+      id: 601, name: "external", head_sha: SHA_A, status: "completed", conclusion: "failure",
+      pull_requests: [], check_suite: { id: 88 }, app: { id: 7 },
+    });
+    expect((await webhook("check_run", created, repo)).events.map((e) => e.kind)).toEqual(["check.completed", "check.failed"]);
+    await hub(repo).ingest("d1", [run(repo, "check.completed", 602, "odd", { conclusion: null, suite_id: 88 })]);
+    await hub(repo).ingest("d2", [{ ...suite(repo, 88, "completed"), at: new Date(Date.now() + 1000).toISOString() }]);
+    expect(await settle(repo)).toBe(true);
+    expect((await inbox(acct, "i")).map((e) => [e.data.result, e.data.failed, e.data.counts])).toEqual([
+      ["failure", ["external"], counts({ failure: 1, neutral: 1 })],
+    ]);
   });
 
   it("works from GitHub's check_run, check_suite and status webhooks", async () => {
     const repo = fresh();
     const acct = fresh();
-    await subscribe(repo, { account: acct, inbox: "i", pr: 7, kinds: ["checks.completed"], baseline: { state: "open", head_sha: SHA_A } });
+    await watch(repo, acct);
     const created = example("check_run", "created");
     Object.assign(created.check_run as object, { id: 501, head_sha: SHA_A, pull_requests: [], check_suite: { id: 77 }, app: { id: 15368 } });
     const done = example("check_run", "completed");
     Object.assign(done.check_run as object, { id: 501, name: (created.check_run as { name: string }).name, head_sha: SHA_A, conclusion: "success", pull_requests: [], check_suite: { id: 77 }, app: { id: 15368 } });
     const suiteDone = example("check_suite", "completed");
     Object.assign(suiteDone.check_suite as object, { id: 77, head_sha: SHA_A, app: { id: 15368 } });
-    const pending = Object.assign(example("status"), { sha: SHA_A, state: "pending", context: "ci/x", updated_at: "2026-10-28T10:00:00Z" });
-    const success = Object.assign(example("status"), { sha: SHA_A, state: "success", context: "ci/x", updated_at: "2026-10-28T10:01:00Z" });
+    const pending = Object.assign(example("status"), { id: 1, sha: SHA_A, state: "pending", context: "ci/x", updated_at: "2026-10-28T10:00:00Z" });
+    const success = Object.assign(example("status"), { id: 2, sha: SHA_A, state: "success", context: "ci/x", updated_at: "2026-10-28T10:00:00Z" });
 
     expect((await webhook("check_run", created, repo)).events.map((e) => e.kind)).toEqual(["check.started"]);
     expect((await webhook("status", pending, repo)).events.map((e) => e.kind)).toEqual(["check.started"]);
     await webhook("check_run", done, repo);
     expect((await webhook("check_suite", suiteDone, repo)).events.map((e) => e.kind)).toEqual(["check_suite.updated"]);
-    expect(await inbox(acct, "i")).toEqual([]);
-    const last = await webhook("status", success, repo);
-    expect(last.ingest).toMatchObject({ accepted: true, events: 1 });
+    await webhook("status", success, repo);
+    expect(await settle(repo)).toBe(true);
     expect((await inbox(acct, "i")).map((e) => [e.kind, e.data.result, e.data.counts])).toEqual([
-      ["checks.completed", "success", { success: 2, failure: 0, cancelled: 0, skipped: 0, neutral: 0 }],
+      ["checks.completed", "success", counts({ success: 2 })],
     ]);
+  });
+
+  it("doesn't charge deliveries that only start checks to the ingest limit", async () => {
+    const repo = fresh();
+    await watch(repo, fresh());
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("INSERT INTO buckets (name, tokens, updated_at) VALUES ('ingest', 0, ?)", Date.now());
+    });
+    expect(await hub(repo).ingest("d1", [run(repo, "check.started", 1, "build"), suite(repo, 10, "queued")])).toMatchObject({ accepted: true });
+    expect(await hub(repo).ingest("d2", [status(repo, "ci/x", "failure")])).toMatchObject({ accepted: false, reason: "throttled" });
+  });
+});
+
+describe("schema", () => {
+  it("migrates a schema 2 database, and one with an earlier shape of the derived tables", async () => {
+    const repo = fresh();
+    const sub = await subscribe(repo, { account: fresh(), inbox: "i", pr: 7, baseline: { state: "open", head_sha: SHA_A } });
+    const columns = (sql: SqlStorage, t: string) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?)", t).toArray().map((r) => r.name);
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      const { sql } = state.storage;
+      sql.exec("DROP TABLE checks; DROP TABLE rollups; UPDATE meta SET v = '2' WHERE k = 'schema_version'");
+      new RepoHubClass(state, env);
+      expect(columns(sql, "checks")).toContain("seen_at");
+      expect(columns(sql, "rollups")).toContain("settle_at");
+      expect(sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'schema_version'").one().v).toBe("4");
+
+      // A test server's database claiming 3, with the first shape.
+      sql.exec(`DROP TABLE checks; DROP TABLE rollups;
+        CREATE TABLE checks (head_sha TEXT, kind TEXT, key TEXT, updated_at INTEGER, PRIMARY KEY (head_sha, kind, key));
+        CREATE TABLE rollups (head_sha TEXT PRIMARY KEY, result TEXT, updated_at INTEGER);
+        UPDATE meta SET v = '3' WHERE k = 'schema_version'`);
+      new RepoHubClass(state, env);
+      expect(columns(sql, "checks")).toContain("ord");
+      expect(columns(sql, "rollups")).toContain("pr");
+    });
+    expect((await stats(repo)).subscriptions.map((s) => s.id)).toEqual([sub.id]);
   });
 });
 
@@ -473,25 +600,41 @@ describe("mergeability", () => {
     vi.restoreAllMocks();
   });
 
-  // GitHub, answering `mergeable` for PR 7 with whatever `answer` holds.
-  function mockGraphql(answer: { mergeable: string }) {
+  // GitHub: installation tokens (or `tokenStatus`), and GraphQL answering
+  // with `graphql()`.
+  function mockGitHub(graphql: () => Response, tokenStatus = 201) {
     const queries: { auth: string | null; query: string }[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const req = new Request(input, init);
       const url = new URL(req.url);
       const m = url.pathname.match(/^\/app\/installations\/(\d+)\/access_tokens$/);
       if (req.method === "POST" && m) {
+        if (tokenStatus !== 201) return Response.json({ message: "nope" }, { status: tokenStatus });
         return Response.json({ token: `ghs_${m[1]}`, expires_at: new Date(Date.now() + 3600_000).toISOString() }, { status: 201 });
       }
       if (req.method === "POST" && url.pathname === "/graphql") {
         const { query } = (await req.json()) as { query: string };
         queries.push({ auth: req.headers.get("Authorization"), query });
-        return Response.json({ data: { repository: { pr7: { state: "OPEN", mergeable: answer.mergeable, headRefOid: SHA_A, baseRefOid: SHA_B } } } });
+        return graphql();
       }
       throw new Error(`unexpected fetch ${req.method} ${req.url}`);
     });
     return queries;
   }
+
+  // GitHub, answering `mergeable` for PR 7 with whatever `answer` holds.
+  const mockGraphql = (answer: { mergeable: string }) =>
+    mockGitHub(() => Response.json({ data: { repository: { pr7: { state: "OPEN", mergeable: answer.mergeable, headRefOid: SHA_A, baseRefOid: SHA_B } } } }));
+
+  const watchWithInstallation = (repo: number, acct = fresh(), extra: Record<string, unknown> = {}) =>
+    subscribe(repo, {
+      account: acct, inbox: "i", pr: 7, installation_id: fresh(),
+      baseline: { state: "open", head_sha: SHA_A, base_ref: "main", mergeable: "mergeable" }, ...extra,
+    });
+  const apiTokens = (repo: number) =>
+    runInDurableObject(hub(repo), (_: RepoHub, state) =>
+      state.storage.sql.exec<{ tokens: number }>("SELECT tokens FROM buckets WHERE name = 'api'").toArray()[0]?.tokens ?? null,
+    );
 
   const dueNow = (repo: number) =>
     runInDurableObject(hub(repo), (_: RepoHub, state) => {
@@ -595,5 +738,67 @@ describe("mergeability", () => {
     const left = await checkAt(repo);
     expect(left).toBeGreaterThan(25_000);
     expect(left).toBeLessThanOrEqual(30_000);
+  });
+
+  for (const [what, answer] of [
+    ["a GraphQL error", () => Response.json({ data: null, errors: [{ message: "Something went wrong" }] })],
+    ["a non-200 answer", () => new Response("bad gateway", { status: 502 })],
+    ["a body that isn't JSON", () => new Response("<html>", { status: 200 })],
+  ] as const) {
+    it(`retries in a minute after ${what}, keeping the alarm's other work`, async () => {
+      const repo = fresh();
+      const acct = fresh();
+      const queries = mockGitHub(answer);
+      await watchWithInstallation(repo, acct);
+      // The same alarm also ends a subscription whose verification lapsed.
+      await subscribe(repo, { account: acct, inbox: "j", pr: 7, verified_until: Date.now() + 3600_000 });
+      await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+        state.storage.sql.exec("UPDATE subscriptions SET verified_until = 1 WHERE inbox = 'j'");
+      });
+      await dueNow(repo);
+      await runDurableObjectAlarm(hub(repo));
+      expect(queries).toHaveLength(1);
+      expect(kinds(await inbox(acct, "j"))).toEqual(["watch.unverified"]);
+      const left = await checkAt(repo);
+      expect(left).toBeGreaterThan(55_000);
+      expect(left).toBeLessThanOrEqual(60_000);
+    });
+  }
+
+  it("retries in a minute when there's no installation token, without spending the repo's budget", async () => {
+    const repo = fresh();
+    const queries = mockGitHub(() => Response.json({}), 500);
+    await watchWithInstallation(repo);
+    await dueNow(repo);
+    await runDurableObjectAlarm(hub(repo));
+    expect(queries).toEqual([]);
+    expect(await apiTokens(repo)).toBeNull();
+    expect(await checkAt(repo)).toBeGreaterThan(55_000);
+  });
+
+  it("keeps a check asked for while one is waiting on GitHub", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    const queries = mockGraphql({ mergeable: "UNKNOWN" });
+    await watchWithInstallation(repo, acct);
+    const push = fact(repo, "pr.pushed", 7, { before: SHA_A, after: SHA_B });
+    type Hooks = { installationToken?: (id: number, calls: number) => Promise<unknown> };
+    await runInDurableObject(hub(repo), (instance: RepoHub, state) => {
+      state.storage.sql.exec("INSERT INTO meta (k, v) VALUES ('merge_unknown_retries', '2')");
+      // A push arrives while the check waits for its token.
+      (instance as unknown as Hooks).installationToken = async () => {
+        await instance.ingest("push", [push]);
+        return { ok: true, token: "ghs_test" };
+      };
+    });
+    await dueNow(repo);
+    await runDurableObjectAlarm(hub(repo));
+    // The push's check runs next (by itself, as it's due), with its
+    // retries started again.
+    await eventually(async () => {
+      expect(queries).toHaveLength(2);
+      expect((await stats(repo)).meta.merge_unknown_retries).toBe("1");
+    });
+    expect(kinds(await inbox(acct, "i"))).toEqual(["pr.pushed"]);
   });
 });

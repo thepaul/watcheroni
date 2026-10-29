@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Delivery } from "./account";
 import type { TokenResult } from "./installation";
-import { BUCKETS_TABLE, msUntil, take, type BucketSpec } from "./limits";
+import { BUCKETS_TABLE, level, msUntil, take, type BucketSpec } from "./limits";
 import { githubHeaders } from "./app";
 import { GITHUB_API_URL, GITHUB_WEB_URL } from "./github";
 import { DEFAULT_TTL_SECONDS, matchesKind, type UnsequencedEvent } from "./protocol";
@@ -51,10 +51,17 @@ const MERGE_UNKNOWN_RETRY_MS = [10_000, 30_000, 90_000];
 const MERGE_ERROR_RETRY_MS = 60_000;
 // Watched PRs per GraphQL query; each query is one call from the budgets.
 const MERGE_QUERY_PRS = 50;
+// A finished rollup is sent this long after it first finishes, if it's
+// still finished: other Apps' checks can appear after the first ones end.
+const ROLLUP_SETTLE_MS = 20_000;
 
 const FAILED = new Set(["failure", "timed_out", "action_required", "startup_failure"]);
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
+
+// A `prs` row someone watches, as opposed to one only remembered.
+const WATCHED = "EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.pr = prs.number)";
+const OPEN = "(state IS NULL OR state = 'open')";
 // Retrying an expiry check whose Account couldn't be reached.
 const EXPIRY_RETRY_MS = 5 * 60_000;
 
@@ -132,7 +139,7 @@ export interface RepoHubStats {
   subscriptions: Subscription[];
   prs: PrRow[];
   checks: CheckRow[];
-  rollups: { head_sha: string; result: string }[];
+  rollups: RollupRow[];
   outbox: { id: number; account_id: number; attempts: number; next_at: number; items: number }[];
 }
 
@@ -170,8 +177,13 @@ type CheckRow = {
   suite_id: number | null;
   status: string | null; // queued, in_progress, completed; pending for a status
   conclusion: string | null;
-  updated_at: number;
+  // Newest wins: a status's ID, or GitHub's `updated_at` for a suite.
+  ord: number;
+  // When RepoHub last heard of it, for pruning.
+  seen_at: number;
 };
+
+type RollupRow = { pr: number; head_sha: string | null; fingerprint: string | null; settle_at: number | null };
 
 type Rollup = { result: string; failed: string[]; counts: { [key: string]: number } };
 
@@ -199,9 +211,15 @@ export class RepoHub extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)");
     const version = Number(this.getMeta("schema_version") ?? 0);
     if (version >= SCHEMA_VERSION) return;
-    if (version === 1) this.sql.exec("ALTER TABLE subscriptions ADD COLUMN ttl_seconds INTEGER");
     if (version === 0) this.createTables();
-    // Schema 3: the checks rollup.
+    if (version === 1) this.sql.exec("ALTER TABLE subscriptions ADD COLUMN ttl_seconds INTEGER");
+    // Schema 4: derived events. Every step is safe to repeat, since test
+    // servers have had databases claiming schema 3 with an earlier shape
+    // of these tables, which hold nothing that can't be rebuilt.
+    const columns = (table: string) =>
+      this.sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?)", table).toArray().map((r) => r.name);
+    if (columns("checks").length && !columns("checks").includes("seen_at")) this.sql.exec("DROP TABLE checks");
+    if (columns("rollups").length && !columns("rollups").includes("pr")) this.sql.exec("DROP TABLE rollups");
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS checks (
         head_sha TEXT NOT NULL,
@@ -209,10 +227,18 @@ export class RepoHub extends DurableObject<Env> {
         key TEXT NOT NULL,
         name TEXT, app_id INTEGER, suite_id INTEGER,
         status TEXT, conclusion TEXT,
-        updated_at INTEGER NOT NULL,
+        ord INTEGER NOT NULL,
+        seen_at INTEGER NOT NULL,
         PRIMARY KEY (head_sha, kind, key)
       );
-      CREATE TABLE IF NOT EXISTS rollups (head_sha TEXT PRIMARY KEY, result TEXT NOT NULL, updated_at INTEGER NOT NULL);
+      -- Per watched PR: the last checks.completed sent (its head and
+      -- data), and when a finished rollup is due to be sent.
+      CREATE TABLE IF NOT EXISTS rollups (
+        pr INTEGER PRIMARY KEY,
+        head_sha TEXT,
+        fingerprint TEXT,
+        settle_at INTEGER
+      );
     `);
     this.setMeta("schema_version", String(SCHEMA_VERSION));
   }
@@ -391,6 +417,7 @@ export class RepoHub extends DurableObject<Env> {
     const outgoing: Map<number, Delivery[]> = new Map();
     this.endWith(rows, "watch.revoked", reason, `${eventBase}.revoked`, now, outgoing);
     this.sql.exec("DELETE FROM prs");
+    this.sql.exec("DELETE FROM rollups");
     const ids = this.enqueue(outgoing, now);
     await this.deliverRows(ids, now);
     this.scheduleAlarm();
@@ -483,7 +510,7 @@ export class RepoHub extends DurableObject<Env> {
       .map(toSubscription);
     const prs = this.sql.exec<PrRow>("SELECT number, state, draft, head_sha, base_ref, mergeable FROM prs ORDER BY number").toArray();
     const checks = this.sql.exec<CheckRow>("SELECT * FROM checks ORDER BY rowid LIMIT 500").toArray();
-    const rollups = this.sql.exec<{ head_sha: string; result: string }>("SELECT head_sha, result FROM rollups ORDER BY rowid").toArray();
+    const rollups = this.sql.exec<RollupRow>("SELECT * FROM rollups ORDER BY pr").toArray();
     const outbox = this.sql
       .exec<OutboxRow & { next_at: number }>("SELECT * FROM outbox ORDER BY id")
       .toArray()
@@ -522,10 +549,12 @@ export class RepoHub extends DurableObject<Env> {
     this.sql.exec("INSERT INTO deliveries (guid, at) VALUES (?, ?)", delivery, now);
     if (!this.getMeta("prune_at")) this.setMeta("prune_at", String(now + PRUNE_EVERY_MS));
 
-    // 3. The repo's ingest limit.
+    // 3. The repo's ingest limit. Deliveries that only say a check started
+    // or a suite changed can't be delivered to anyone, so they're free.
     const outgoing: Map<number, Delivery[]> = new Map();
     this.endThrottleIfDue(now, outgoing);
-    if (this.throttledUntil() !== null || !take(this.sql, "ingest", REPO_LIMITS.ingest, now)) {
+    const free = facts.every((f) => f.kind === "check.started" || f.kind === "check_suite.updated");
+    if (!free && (this.throttledUntil() !== null || !take(this.sql, "ingest", REPO_LIMITS.ingest, now))) {
       this.throttle(now, outgoing);
       const ids = this.enqueue(outgoing, now);
       result.events = countItems(outgoing);
@@ -545,7 +574,7 @@ export class RepoHub extends DurableObject<Env> {
       this.noteDerived(fact, now, heads);
       if (!INTERNAL_KINDS.has(fact.kind)) events.push(...this.withPrs(fact));
     }
-    events.push(...this.rollUp(heads, delivery, now));
+    this.rollUp(heads, now);
 
     // 5. Match, ending watches on PRs that merged or closed.
     const ended = events.filter((e) => e.pr !== null && (e.kind === "pr.merged" || e.kind === "pr.closed"));
@@ -586,18 +615,17 @@ export class RepoHub extends DurableObject<Env> {
     const outgoing: Map<number, Delivery[]> = new Map();
     this.endThrottleIfDue(now, outgoing);
     await this.expireDue(now, outgoing);
+    this.sendSettledRollups(now, outgoing);
     await this.checkMergeability(now, outgoing);
     const fresh = this.enqueue(outgoing, now);
 
     const pruneAt = Number(this.getMeta("prune_at") ?? 0);
     if (pruneAt && pruneAt <= now) {
       this.sql.exec("DELETE FROM deliveries WHERE at < ?", now - DELIVERIES_KEPT_MS);
-      for (const table of ["checks", "rollups"]) {
-        this.sql.exec(
-          `DELETE FROM ${table} WHERE updated_at < ? AND head_sha NOT IN (SELECT head_sha FROM prs WHERE head_sha IS NOT NULL)`,
-          now - CHECKS_KEPT_MS,
-        );
-      }
+      this.sql.exec(
+        `DELETE FROM checks WHERE seen_at < ? AND head_sha NOT IN (SELECT head_sha FROM prs WHERE head_sha IS NOT NULL AND ${WATCHED})`,
+        now - CHECKS_KEPT_MS,
+      );
       const left = this.sql.exec("SELECT 1 FROM deliveries LIMIT 1").toArray().length;
       if (left) this.setMeta("prune_at", String(now + PRUNE_EVERY_MS));
       else this.deleteMeta("prune_at");
@@ -684,7 +712,7 @@ export class RepoHub extends DurableObject<Env> {
   // for a mergeability check when a watched PR's head or base moves, or a
   // PR is merged into a watched PR's base.
   private noteDerived(e: UnsequencedEvent, now: number, heads: Set<string>): void {
-    const watched = () => e.pr !== null && this.sql.exec("SELECT 1 FROM prs WHERE number = ?", e.pr).toArray().length > 0;
+    const watched = () => e.pr !== null && this.sql.exec("SELECT 1 FROM subscriptions WHERE pr = ? LIMIT 1", e.pr).toArray().length > 0;
     switch (e.kind) {
       case "check.started":
       case "check.completed":
@@ -704,7 +732,7 @@ export class RepoHub extends DurableObject<Env> {
         break;
       case "base.advanced": {
         const open = this.sql
-          .exec("SELECT 1 FROM prs WHERE base_ref = ? AND (state IS NULL OR state = 'open') LIMIT 1", str(e.data.base))
+          .exec(`SELECT 1 FROM prs WHERE base_ref = ? AND ${OPEN} AND ${WATCHED} LIMIT 1`, str(e.data.base))
           .toArray();
         if (open.length) this.requestMergeCheck(now);
         break;
@@ -719,67 +747,96 @@ export class RepoHub extends DurableObject<Env> {
     const d = e.data;
     const sha = str(d.head_sha);
     if (!sha) return null;
-    const at = Date.parse(e.at) || now;
     const num = (v: unknown) => (typeof v === "number" ? v : null);
-    const upsert = (kind: CheckRow["kind"], key: string, status: string | null, conclusion: string | null, when: string) =>
+    // Deliveries can arrive in any order. Suites and statuses keep the
+    // newest (by `ord`), and on a tie the finished one.
+    const newest = "excluded.ord > checks.ord OR (excluded.ord = checks.ord AND excluded.status = 'completed')";
+    const upsert = (kind: CheckRow["kind"], key: string, status: string | null, conclusion: string | null, ord: number, when: string) =>
       this.sql.exec(
-        `INSERT INTO checks (head_sha, kind, key, name, app_id, suite_id, status, conclusion, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO checks (head_sha, kind, key, name, app_id, suite_id, status, conclusion, ord, seen_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (head_sha, kind, key) DO UPDATE SET
-           status = excluded.status, conclusion = excluded.conclusion, updated_at = excluded.updated_at
+           status = excluded.status, conclusion = excluded.conclusion, ord = excluded.ord, seen_at = excluded.seen_at
          WHERE ${when}`,
-        sha, kind, key, str(d.name), num(d.app_id), num(d.suite_id), status, conclusion, at,
+        sha, kind, key, str(d.name), num(d.app_id), num(d.suite_id), status, conclusion, ord, now,
       );
     const suiteId = num(d.suite_id);
     if (e.kind === "check_suite.updated") {
       if (suiteId === null) return null;
-      upsert("suite", String(suiteId), str(d.status), str(d.conclusion), "excluded.updated_at >= checks.updated_at");
+      upsert("suite", String(suiteId), str(d.status), str(d.conclusion), Date.parse(e.at) || 0, newest);
       return sha;
     }
     const done = e.kind === "check.completed";
     const runId = num(d.check_run_id);
     if (runId !== null) {
       // A run's completion is final: a late `created` never undoes it.
-      upsert("run", String(runId), done ? "completed" : (str(d.status) ?? "queued"), done ? str(d.conclusion) : null, "checks.status IS NOT 'completed'");
+      upsert("run", String(runId), done ? "completed" : (str(d.status) ?? "queued"), done ? str(d.conclusion) : null, 0, "checks.status IS NOT 'completed'");
       // GitHub tells only the suite's own App that it was requested, so a
       // suite is mostly first seen through its runs. Until its `completed`
       // arrives it may yet start more (jobs that wait on others).
       if (suiteId !== null) {
         this.sql.exec(
-          "INSERT OR IGNORE INTO checks (head_sha, kind, key, app_id, suite_id, status, updated_at) VALUES (?, 'suite', ?, ?, ?, 'in_progress', 0)",
-          sha, String(suiteId), num(d.app_id), suiteId,
+          "INSERT OR IGNORE INTO checks (head_sha, kind, key, app_id, suite_id, status, ord, seen_at) VALUES (?, 'suite', ?, ?, ?, 'in_progress', 0, ?)",
+          sha, String(suiteId), num(d.app_id), suiteId, now,
         );
       }
       return sha;
     }
     const context = str(d.status_context);
     if (context === null) return null;
-    upsert("status", context, done ? "completed" : "pending", done ? str(d.conclusion) : null, "excluded.updated_at >= checks.updated_at");
+    // Status IDs increase; `updated_at` has only one-second resolution.
+    const ord = num(d.status_id) ?? (Date.parse(e.at) || 0);
+    upsert("status", context, done ? "completed" : "pending", done ? str(d.conclusion) : null, ord, newest);
     return sha;
   }
 
-  // `checks.completed` for each watched PR at one of `heads` whose checks
-  // have all finished with a result other than the last one sent.
-  private rollUp(heads: Set<string>, delivery: string, now: number): UnsequencedEvent[] {
-    const out: UnsequencedEvent[] = [];
+  // Works out the rollup for each open watched PR at one of `heads`. One
+  // that has finished differently from the last one sent (another result
+  // or other checks, or a new head) is sent from the alarm after
+  // ROLLUP_SETTLE_MS if it's still finished then: checks from other Apps
+  // and suites often appear a little later. One that isn't finished
+  // cancels a pending send.
+  private rollUp(heads: Set<string>, now: number): void {
     for (const sha of heads) {
       const prs = this.sql
-        .exec<{ number: number }>("SELECT number FROM prs WHERE head_sha = ? AND (state IS NULL OR state = 'open') ORDER BY number", sha)
+        .exec<{ number: number }>(`SELECT number FROM prs WHERE head_sha = ? AND ${OPEN} AND ${WATCHED} ORDER BY number`, sha)
         .toArray();
       if (!prs.length) continue;
       const rollup = this.rollupOf(sha);
-      if (!rollup) continue;
-      const last = this.sql.exec<{ result: string }>("SELECT result FROM rollups WHERE head_sha = ?", sha).toArray()[0];
-      if (last?.result === rollup.result) continue;
-      this.sql.exec(
-        "INSERT INTO rollups (head_sha, result, updated_at) VALUES (?, ?, ?) ON CONFLICT (head_sha) DO UPDATE SET result = excluded.result, updated_at = excluded.updated_at",
-        sha, rollup.result, now,
-      );
       for (const { number } of prs) {
-        out.push(this.derived("checks.completed", `${delivery}.checks.pr${number}`, number, { head_sha: sha, ...rollup }, now));
+        const row = this.sql.exec<RollupRow>("SELECT * FROM rollups WHERE pr = ?", number).toArray()[0];
+        const changed = rollup !== null && (row?.head_sha !== sha || row.fingerprint !== JSON.stringify(rollup));
+        if (changed && row?.settle_at) continue;
+        const settleAt = changed ? now + ROLLUP_SETTLE_MS : null;
+        if (!row && settleAt === null) continue;
+        this.sql.exec(
+          "INSERT INTO rollups (pr, settle_at) VALUES (?, ?) ON CONFLICT (pr) DO UPDATE SET settle_at = excluded.settle_at",
+          number, settleAt,
+        );
       }
     }
-    return out;
+  }
+
+  // From the alarm: `checks.completed` for each PR whose rollup has been
+  // finished, and different from the last one sent, for long enough.
+  private sendSettledRollups(now: number, out: Map<number, Delivery[]>): void {
+    const due = this.sql
+      .exec<RollupRow & { current: string | null }>(
+        "SELECT r.*, p.head_sha AS current FROM rollups r JOIN prs p ON p.number = r.pr WHERE r.settle_at <= ? AND (p.state IS NULL OR p.state = 'open')",
+        now,
+      )
+      .toArray();
+    this.sql.exec("UPDATE rollups SET settle_at = NULL WHERE settle_at <= ?", now);
+    const repoId = this.getMeta("repo_id");
+    for (const row of due) {
+      const rollup = row.current ? this.rollupOf(row.current) : null;
+      if (!rollup) continue;
+      const fingerprint = JSON.stringify(rollup);
+      if (row.head_sha === row.current && row.fingerprint === fingerprint) continue;
+      this.sql.exec("UPDATE rollups SET head_sha = ?, fingerprint = ? WHERE pr = ?", row.current, fingerprint, row.pr);
+      const event = this.derived("checks.completed", `repo:${repoId}.pr${row.pr}.checks.${now}`, row.pr, { head_sha: row.current, ...rollup }, now);
+      this.match([event], out);
+    }
   }
 
   // The rollup for a commit, or null while anything is still running. The
@@ -814,8 +871,10 @@ export class RepoHub extends DurableObject<Env> {
         failed.push(c.name ?? c.key);
       } else if (c.conclusion === "cancelled") counts.cancelled++;
       else if (c.conclusion === "skipped" || c.conclusion === "stale") counts.skipped++;
-      else if (c.conclusion === "neutral") counts.neutral++;
-      else counts.success++;
+      else if (c.conclusion === "success") counts.success++;
+      // Neutral, and a finished run with no conclusion, which GitHub
+      // shouldn't send: never a success.
+      else counts.neutral++;
     }
     const result = counts.failure ? "failure" : counts.cancelled ? "cancelled" : "success";
     return { result, failed: failed.slice(0, 20), counts };
@@ -827,23 +886,40 @@ export class RepoHub extends DurableObject<Env> {
     if (!due || at < due) this.setMeta("merge_check_at", String(at));
     // Something changed, so an UNKNOWN answer gets its retries again.
     this.deleteMeta("merge_unknown_retries");
+    // Counted, so a check already waiting on GitHub sees it was asked for.
+    this.setMeta("merge_requests", String(Number(this.getMeta("merge_requests") ?? 0) + 1));
   }
 
   // From the alarm: one GraphQL query for the watched PRs (DESIGN.md,
   // "Merge conflicts"), emitting `merge.conflict` or `merge.clean` when a
-  // PR moves between mergeable and conflicting.
+  // PR moves between mergeable and conflicting. Never throws, so the rest
+  // of the alarm's work is kept.
   private async checkMergeability(now: number, out: Map<number, Delivery[]>): Promise<void> {
-    const due = Number(this.getMeta("merge_check_at") ?? 0);
-    if (!due || due > now) return;
+    const due = this.getMeta("merge_check_at");
+    if (!due || Number(due) > now) return;
+    // A check asked for while this one waits on GitHub (a push, say) wins:
+    // its time (no later than the request) and its reset retries are kept.
+    const requests = this.getMeta("merge_requests");
+    const asked = () => this.getMeta("merge_requests") !== requests;
+    const next = (ms: number) => {
+      if (!asked()) this.setMeta("merge_check_at", String(now + ms));
+    };
+    try {
+      await this.queryAndCompare(now, out, next, asked);
+    } catch (e) {
+      console.error("mergeability check failed", e);
+      next(MERGE_ERROR_RETRY_MS);
+    }
+  }
+
+  private async queryAndCompare(now: number, out: Map<number, Delivery[]>, next: (ms: number) => void, asked: () => boolean): Promise<void> {
     const prs = this.sql
-      .exec<PrRow>("SELECT * FROM prs WHERE state IS NULL OR state = 'open' ORDER BY number")
+      .exec<PrRow>(`SELECT * FROM prs WHERE ${OPEN} AND ${WATCHED} ORDER BY number`)
       .toArray();
     if (!prs.length) {
-      this.deleteMeta("merge_check_at");
-      this.deleteMeta("merge_unknown_retries");
+      for (const k of ["merge_check_at", "merge_unknown_retries", "merge_requests"]) this.deleteMeta(k);
       return;
     }
-    const next = (ms: number) => this.setMeta("merge_check_at", String(now + ms));
     const installation = Number(this.getMeta("installation_id") ?? 0);
     const [owner, name] = (this.getMeta("full_name") ?? "").split("/");
     // Only subscriptions made through /debug lack an installation.
@@ -852,21 +928,17 @@ export class RepoHub extends DurableObject<Env> {
     const chunks: PrRow[][] = [];
     for (let i = 0; i < prs.length; i += MERGE_QUERY_PRS) chunks.push(prs.slice(i, i + MERGE_QUERY_PRS));
     // The repo's API budget, then the installation's: when either is
-    // spent, the check waits and `merge.*` arrives late.
-    if (!take(this.sql, "api", REPO_LIMITS.api, now, chunks.length)) {
+    // spent, the check waits and `merge.*` arrives late. The repo's is
+    // taken only once there's a token to spend it with.
+    if (level(this.sql, "api", REPO_LIMITS.api, now) < chunks.length) {
       return next(Math.max(msUntil(this.sql, "api", REPO_LIMITS.api, now, chunks.length), 1000));
     }
-    let token;
-    try {
-      token = await this.installationToken(installation, chunks.length);
-    } catch (e) {
-      console.error(`mergeability: no token for installation ${installation}`, e);
-      return next(MERGE_ERROR_RETRY_MS);
-    }
+    const token = await this.installationToken(installation, chunks.length);
     if (!token.ok) {
       if (token.reason === "rate_limited") return next(Math.max(token.retry_after * 1000, 1000));
       return next(token.reason === "not_installed" ? MERGE_EVERY_MS : MERGE_ERROR_RETRY_MS);
     }
+    take(this.sql, "api", REPO_LIMITS.api, this.now(), chunks.length);
 
     let failed = false;
     let unknown = false;
@@ -884,12 +956,14 @@ export class RepoHub extends DurableObject<Env> {
           continue;
         }
         const conflicting = a.mergeable === "CONFLICTING";
-        const was = pr.mergeable === "conflicting";
+        // Read again: the row may have changed while GitHub answered.
+        const was = this.sql.exec<{ mergeable: string | null }>("SELECT mergeable FROM prs WHERE number = ?", pr.number).toArray()[0];
+        if (!was) continue;
         this.sql.exec(
           "UPDATE prs SET mergeable = ?, mergeable_checked_at = ? WHERE number = ?",
           conflicting ? "conflicting" : "mergeable", now, pr.number,
         );
-        if (conflicting === was) continue;
+        if (conflicting === (was.mergeable === "conflicting")) continue;
         const kind = conflicting ? "merge.conflict" : "merge.clean";
         const repoId = this.getMeta("repo_id");
         const event = this.derived(kind, `repo:${repoId}.pr${pr.number}.${kind.slice(6)}.${now}`, pr.number, {
@@ -899,8 +973,9 @@ export class RepoHub extends DurableObject<Env> {
       }
     }
 
-    const retries = Number(this.getMeta("merge_unknown_retries") ?? 0);
     if (failed) return next(MERGE_ERROR_RETRY_MS);
+    if (asked()) return;
+    const retries = Number(this.getMeta("merge_unknown_retries") ?? 0);
     if (unknown && retries < MERGE_UNKNOWN_RETRY_MS.length) {
       this.setMeta("merge_unknown_retries", String(retries + 1));
       return next(MERGE_UNKNOWN_RETRY_MS[retries]);
@@ -1086,6 +1161,7 @@ export class RepoHub extends DurableObject<Env> {
       this.throttledUntil(),
       Number(this.getMeta("prune_at") ?? 0) || null,
       Number(this.getMeta("merge_check_at") ?? 0) || null,
+      this.sql.exec<{ t: number | null }>("SELECT MIN(settle_at) AS t FROM rollups").one().t,
     ].filter((t): t is number => t !== null);
     if (times.length) void this.ctx.storage.setAlarm(Math.min(...times));
     else void this.ctx.storage.deleteAlarm();
@@ -1093,6 +1169,7 @@ export class RepoHub extends DurableObject<Env> {
 
   private forgetPrIfUnwatched(pr: number): void {
     this.sql.exec("DELETE FROM prs WHERE number = ? AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE pr = ?)", pr, pr);
+    this.sql.exec("DELETE FROM rollups WHERE pr = ? AND NOT EXISTS (SELECT 1 FROM prs WHERE number = ?)", pr, pr);
   }
 
   private getMeta(k: string): string | null {
@@ -1100,7 +1177,9 @@ export class RepoHub extends DurableObject<Env> {
   }
 
   private setMeta(k: string, v: string): void {
-    this.sql.exec("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", k, v);
+    // Writes nothing when the value is unchanged (ingest sets the repo's
+    // name and installation on every delivery).
+    this.sql.exec("INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE meta.v IS NOT excluded.v", k, v);
   }
 
   private deleteMeta(k: string): void {

@@ -232,7 +232,7 @@ earliest due time, or clears it.
   the mergeability check, is the `merge_check_at` meta row, as pruning is
   `prune_at`); the `base` and `author` filters for repository-wide
   subscriptions (`/v1` answers 400 to them).
-- **Derived events** (schema 3) are described under "As built" in
+- **Derived events** (schema 4) are described under "As built" in
   "Derived events".
 - **Expiry is pulled, not pushed.** There's no `touch`: reading an inbox
   only records `last_read_at` in Account (a WebSocket `hello` counts, and
@@ -678,23 +678,41 @@ against the repo's and the installation's GitHub API budgets.
 
 ### As built in the prototype
 
-In `packages/server/src/repo-hub.ts` (schema 3: the `checks` and
-`rollups` tables), fed by internal kinds from
+In `packages/server/src/repo-hub.ts` (schema 4: the `checks` and
+`rollups` tables, created idempotently, since test servers have had an
+earlier shape of them under schema 3), fed by internal kinds from
 `src/webhook/normalise.ts`. The `data` of both kinds is the CLI's
 (`packages/cli/src/diff.ts`). Where it differs from the above:
 
 - **Facts.** `check_run.created` gives `check.started` (run ID, name,
-  suite ID, App ID), `check_run.completed` the existing `check.completed`
-  (now with suite and App IDs), a `pending` status `check.started`, and
-  `check_suite` `requested`, `rerequested` and `completed` give
-  `check_suite.updated`. So `check_run.created` and pending statuses now
-  reach RepoHub and count against the repo's ingest limit: a push with
-  20 jobs costs about 40 deliveries.
+  suite ID, App ID), or `check.completed` for a run created already
+  finished; `check_run.completed` gives the existing `check.completed`
+  (now with suite and App IDs); a `pending` status gives `check.started`
+  (statuses carry their GitHub ID); and `check_suite` `requested`,
+  `rerequested` and `completed` give `check_suite.updated`.
+- **Cost.** `check_run.created`, pending statuses and `check_suite` now
+  reach RepoHub, for unwatched repos too: one Durable Object request
+  each, answered without writes. A delivery made only of `check.started`
+  and `check_suite.updated` doesn't count against the repo's ingest
+  limit, since nothing in it can be delivered. The Worker could skip
+  those requests for unwatched repos by caching, per isolate, RepoHub's
+  `no_subscriptions` answers for a minute; not built. Meta rows are
+  written only when their value changes, so the repo name and
+  installation set on each delivery cost nothing after the first.
 - **Which checks are kept.** Every check fact for a repo with any
   subscription, not only watched heads, because a push's first checks
   can arrive before the `synchronize` webhook; rows for SHAs that are no
-  longer a watched head are pruned once a day old. A `pr.pushed`
-  computes the new head's rollup straight away.
+  longer a watched head are pruned a day after RepoHub last heard of
+  them (`seen_at`, its own clock). A `pr.pushed` works out the new
+  head's rollup straight away.
+- **Sending.** A finished rollup is sent from the alarm 20 seconds after
+  it finishes (`rollups.settle_at`), if it's still finished then; a new
+  check starting meanwhile cancels it. It's sent when it differs from the
+  last one sent to that PR (`rollups.head_sha` and `fingerprint`, the
+  whole `data`): another result, more checks counted, or a new head,
+  including a force-push back to an earlier one, as the CLI does. So a
+  quick status that finishes before Actions creates its runs gives an
+  early `checks.completed`, and the full one follows.
 - **Suites are mostly seen through their runs.** GitHub sends
   `check_suite.requested` only to the suite's own App, so the queued,
   never-run suites the rule ignores rarely appear at all. A suite first
@@ -702,15 +720,16 @@ In `packages/server/src/repo-hub.ts` (schema 3: the `checks` and
   `check_suite.completed` arrives, which keeps a workflow whose later
   jobs wait on earlier ones (their runs are created late) from finishing
   early. A run's completion is final (a late `created` doesn't undo it);
-  suites and statuses take the newest by GitHub's `updated_at`.
+  suites take the newest by GitHub's `updated_at`, and statuses by their
+  increasing ID; on a tie the finished one wins. A finished run with no
+  conclusion counts as neutral, never as a success.
 - **Re-runs.** Only the latest run (highest ID) of each name within a
   suite counts, as in the CLI's `statusCheckRollup`. A re-run of a job in
   a suite that has already completed can make the rollup finish before
   any jobs that wait on it are created; best-effort, as PROTOCOL.md says.
-- **IDs.** `checks.completed` is `<delivery>.checks.pr<N>`, for each open
-  watched PR at that head. `merge.conflict` and `merge.clean` are
-  `repo:<id>.pr<N>.conflict.<ms>` and `.clean.<ms>`, the time of the
-  check. `actor` is null; `links` are the PR's.
+- **IDs.** `checks.completed` is `repo:<id>.pr<N>.checks.<ms>`, and
+  `merge.conflict` and `merge.clean` are `repo:<id>.pr<N>.conflict.<ms>`
+  and `.clean.<ms>`, the time of the alarm that sent them. `actor` is null; `links` are the PR's.
 - **No baseline for checks.** A subscription starts with no rollup, so if
   a check is re-run on a head whose checks finished before the watch
   began, the rollup covers only the checks seen since (the CLI would know
@@ -720,9 +739,14 @@ In `packages/server/src/repo-hub.ts` (schema 3: the `checks` and
   branch) when an open watched PR has that base, make the check due at
   once and give `UNKNOWN` its three retries again. A subscription makes
   it due in 15 minutes, or 10 seconds if the baseline wasn't definite.
-  After a check, the next is 15 minutes on (60 s if GitHub failed). Up
-  to 50 PRs go in one query; each query is one call from the repo's
-  bucket (`REPO_LIMITS.api`, 120 an hour) and the installation's
+  After a check, the next is 15 minutes on (60 s if GitHub failed, gave
+  no token, or answered with errors or a body that isn't JSON; a failure
+  never loses the rest of the alarm's work). A check asked for while one
+  is waiting on GitHub is kept, with its retries reset
+  (`merge_requests` counts the requests). Only PRs with a subscription
+  are checked. Up to 50 PRs go in one query; each query is one call from
+  the repo's bucket (`REPO_LIMITS.api`, 120 an hour, taken only once the
+  token is in hand) and the installation's
   (`Installation.token(id, calls)`). Out of budget, the check waits until
   the bucket has the calls, or for the installation's `retry_after`.
 - **The installation** is the `installation_id` meta row, set by `/v1`

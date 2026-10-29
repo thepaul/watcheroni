@@ -78,7 +78,8 @@ interface Payload {
     updated_at?: string;
     app?: { id: number };
   };
-  // `status` events.
+  // `status` events. `id` increases with each status on a commit.
+  id?: number;
   sha?: string;
   state?: string;
   context?: string;
@@ -241,13 +242,15 @@ export function normalise(
       if (!run) break;
       const links = { html: run.html_url, api: run.url };
       const suite = { suite_id: run.check_suite?.id ?? null, app_id: run.app?.id ?? null };
-      if (action === "created") {
+      // Apps can create a run that has already finished; that counts as
+      // its completion.
+      if (action === "created" && run.status !== "completed") {
         emit("check.started", null, {
           head_sha: run.head_sha, name: run.name, check_run_id: run.id, status: run.status, ...suite,
         }, null, links);
         break;
       }
-      if (action !== "completed") break;
+      if (action !== "completed" && action !== "created") break;
       // A check run can belong to several PRs (or none, if it ran on a
       // branch without one; RepoHub then matches on head_sha).
       const prs = run.pull_requests?.length ? run.pull_requests.map((p) => p.number) : [null];
@@ -280,13 +283,14 @@ export function normalise(
       if (payload.state === "pending") {
         emit("check.started", null, {
           head_sha: payload.sha, name: payload.context, status_context: payload.context, status: "pending",
+          status_id: payload.id ?? null,
         }, payload.updated_at, payload.target_url ? { html: payload.target_url } : {});
         break;
       }
       const conclusion = payload.state === "success" ? "success" : "failure";
       const base = { head_sha: payload.sha, name: payload.context, status_context: payload.context, conclusion };
       const links = payload.target_url ? { html: payload.target_url } : {};
-      emit("check.completed", null, base, payload.updated_at, links);
+      emit("check.completed", null, { ...base, status_id: payload.id ?? null }, payload.updated_at, links);
       if (conclusion === "failure") emit("check.failed", null, base, payload.updated_at, links);
       break;
     }
