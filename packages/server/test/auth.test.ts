@@ -2,6 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { newTicketPayload, parseApiKey, signTicket, verifyTicket } from "../src/auth";
+import { landingPage } from "../src/pages";
 import type { KeysResponse, LoginResponse, Meta, TicketResponse } from "../src/protocol";
 
 const BASE = "https://watcheroni.test";
@@ -141,6 +142,8 @@ describe("meta", () => {
     expect(html).not.toMatch(/<script|src="http/);
     expect((await call("/", { method: "HEAD" })).status).toBe(200);
     expect((await call("/", { method: "POST" })).status).toBe(401);
+    // A server with no App yet (GITHUB_APP_SLUG empty) links nowhere.
+    expect(await landingPage(undefined).text()).not.toContain("/installations/new");
   });
 
   it("has a page for GitHub to send people to after installing", async () => {

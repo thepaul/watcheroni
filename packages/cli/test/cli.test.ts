@@ -38,9 +38,9 @@ interface Run {
 }
 
 // `null` in extraEnv leaves that variable out.
-function cli(args: string[], extraEnv: Record<string, string | null> = {}): Run {
+function cli(args: string[], extraEnv: Record<string, string | null> = {}, dir = cwd): Run {
   const merged = Object.entries({ ...env, ...extraEnv }).filter((kv): kv is [string, string] => kv[1] !== null);
-  const child = spawn(process.execPath, [MAIN, ...args], { cwd, env: Object.fromEntries(merged) });
+  const child = spawn(process.execPath, [MAIN, ...args], { cwd: dir, env: Object.fromEntries(merged) });
   let stdout = "";
   let stderr = "";
   child.stdout.on("data", (d) => (stdout += d));
@@ -309,6 +309,20 @@ describe("exec against a server", () => {
     run.kill();
     await run.code;
     expect(readFileSync(log, "utf8")).toBe("comment.created\ncheck.failed\n");
+  });
+});
+
+describe("selfhost", () => {
+  it("runs the clone's script with the arguments it was given", async () => {
+    const run = cli(["selfhost", "--help"], {}, join(import.meta.dirname, "..", "..", "server"));
+    expect(await run.code).toBe(0);
+    expect(run.stdout()).toContain("watcheroni selfhost [options]");
+  });
+
+  it("says to clone the repository when run elsewhere", async () => {
+    const run = cli(["selfhost"]);
+    expect(await run.code).toBe(1);
+    expect(run.stderr()).toContain("git clone https://github.com/thepaul/watcheroni");
   });
 });
 

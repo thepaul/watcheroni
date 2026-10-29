@@ -10,6 +10,8 @@ const appKey = generateKeyPairSync("rsa", {
 });
 
 export default defineConfig({
+  // selfhost/ has its own tests, which run in Node.
+  test: { include: ["test/**/*.test.ts"] },
   plugins: [
     cloudflareTest({
       wrangler: { configPath: "./wrangler.jsonc" },

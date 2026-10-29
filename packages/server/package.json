@@ -9,14 +9,16 @@
     "deploy": "wrangler deploy",
     "deploy:production": "wrangler deploy --env production",
     "types": "wrangler types src/worker-configuration.d.ts --strict-vars=false --env-file=.dev.vars.example",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p test",
-    "test": "vitest run",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test && tsc --noEmit -p selfhost",
+    "test": "vitest run && vitest run -c selfhost/vitest.config.ts",
     "probe": "node scripts/probe.mjs",
-    "usage": "node scripts/do-usage.mjs"
+    "usage": "node scripts/do-usage.mjs",
+    "selfhost": "node selfhost/run.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.4.8",
     "@octokit/webhooks-examples": "^7.6.1",
+    "@types/node": "^24.19.2",
     "typescript": "^5.9.3",
     "vitest": "^4.1.12",
     "wrangler": "^4.153.0"

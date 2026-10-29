@@ -29,7 +29,10 @@
     "GITHUB_APP_ID": "5490181",
     // The GitHub App's client ID (public). Empty until the App is
     // registered; sign-in answers 503 until then.
-    "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt"
+    "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt",
+    // The App's URL name, for its install page
+    // (https://github.com/apps/<slug>/installations/new).
+    "GITHUB_APP_SLUG": "watcheroni"
   },
   // Secrets, not in this file (wrangler secret put, or .dev.vars for
   // wrangler dev): GITHUB_APP_PRIVATE_KEY (PKCS#8 PEM), GITHUB_CLIENT_SECRET,
@@ -59,7 +62,8 @@
       "triggers": { "crons": ["*/10 * * * *"] },
       "vars": {
         "GITHUB_APP_ID": "5490181",
-        "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt"
+        "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt",
+        "GITHUB_APP_SLUG": "watcheroni"
       }
     }
   }

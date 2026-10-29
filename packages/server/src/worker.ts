@@ -13,8 +13,7 @@ import { GITHUB_API_URL, GITHUB_WEB_URL, checkUserToken, refreshUserToken } from
 import type { InstallationFact } from "./installation";
 import type { Control } from "./control";
 import {
-  INSTALL_URL,
-  APP_SLUG,
+  installUrl,
   createSubscription,
   deleteSubscription,
   verifySubscription,
@@ -73,7 +72,7 @@ export default {
     const route = `${request.method} ${pathname}`;
 
     if (pathname === "/healthz") return new Response("ok");
-    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return landingPage(INSTALL_URL);
+    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return landingPage(installUrl(env));
     if (route === "GET /github/setup") return setupPage(url);
     if (route === "GET /v1/meta") return json(meta(env));
     if (route === "POST /github/webhook") return webhook(request, env);
@@ -193,8 +192,7 @@ function meta(env: Env): Meta {
             client_id: env.GITHUB_CLIENT_ID,
             web_url: GITHUB_WEB_URL,
             api_url: GITHUB_API_URL,
-            app_slug: APP_SLUG,
-            install_url: INSTALL_URL,
+            ...(env.GITHUB_APP_SLUG ? { app_slug: env.GITHUB_APP_SLUG, install_url: installUrl(env) } : {}),
           },
         }
       : {}),

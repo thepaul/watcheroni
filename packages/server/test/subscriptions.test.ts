@@ -4,6 +4,7 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { appJwt } from "../src/app";
 import { Installation } from "../src/installation";
+import { installUrl } from "../src/subscriptions";
 import type { LoginResponse, Meta, SubscriptionInfo, SubscriptionsResponse, WatchEvent } from "../src/protocol";
 import type { RepoHubStats } from "../src/repo-hub";
 import { sign } from "../src/webhook/signature";
@@ -205,6 +206,11 @@ describe("meta", () => {
     expect(meta.github?.install_url).toBe("https://github.com/apps/watcheroni/installations/new");
     expect(meta.limits.max_ttl_seconds).toBe(30 * 24 * 3600);
     expect(meta.limits.private_verify_seconds).toBe(7 * 24 * 3600);
+  });
+
+  it("builds the install URL from GITHUB_APP_SLUG, for self-hosted Apps", () => {
+    expect(installUrl({ GITHUB_APP_SLUG: "watcheroni-acme" })).toBe("https://github.com/apps/watcheroni-acme/installations/new");
+    expect(installUrl({ GITHUB_APP_SLUG: "" })).toBeUndefined();
   });
 });
 
