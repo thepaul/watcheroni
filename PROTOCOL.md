@@ -219,6 +219,9 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
   set. Unfiltered repository-wide subscribers on that repo see these
   copies too; otherwise only PRs that have their own subscription get
   one, and a status on no watched PR's head arrives once with `pr` `null`.
+- The derived kinds (`checks.completed`, `merge.conflict`, `merge.clean`)
+  are worked out only for PRs that have a PR subscription of their own, so
+  a repository-wide subscription gets them only for those PRs.
 - `kinds`: event kinds or globs (`review.*`). Leaving it out means every
   kind for PR subscriptions.
 - `ignore.self`: drop events caused by the account's own GitHub user.
