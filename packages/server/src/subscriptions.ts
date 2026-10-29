@@ -63,10 +63,8 @@ export async function createSubscription(
       : unavailable("Couldn't ask GitHub about the repository");
   }
   const installation = installationStub(env, found.id);
-  // Spending a call each for the repo and the PR (or the open PRs, for a
-  // filtered repo-wide subscription), made with the token.
-  const filtered = parsed.base !== undefined || parsed.author !== undefined;
-  const minted = await installation.token(found.id, parsed.pr !== undefined || filtered ? 2 : 1);
+  // Spending a call each for the repo and the PR, made with the token.
+  const minted = await installation.token(found.id, parsed.pr === undefined ? 1 : 2);
   if (!minted.ok) {
     if (minted.reason === "not_installed") return notInstalled(parsed.repo);
     if (minted.reason === "rate_limited") {
@@ -100,23 +98,6 @@ export async function createSubscription(
     baseline = toBaseline((await prRes.json()) as PullBody);
   }
 
-  // The open PRs, so ones opened before a `base` or `author` filter can
-  // match it. The 100 most recently updated; others are learnt from their
-  // next event.
-  let openPrs: OpenPr[] | undefined;
-  if (filtered) {
-    const listRes = await githubGet(minted.token, `/repos/${repo.full_name}/pulls?state=open&sort=updated&direction=desc&per_page=100`);
-    if (!listRes) return unavailable("Couldn't reach GitHub");
-    if (!listRes.ok) return unavailable(`GitHub answered ${listRes.status} for the repository's pull requests`);
-    openPrs = ((await listRes.json()) as (PullBody & { number: number })[]).map((pr) => ({
-      number: pr.number,
-      head_sha: pr.head?.sha ?? null,
-      base_ref: pr.base?.ref ?? null,
-      author: pr.user?.login ?? null,
-      draft: !!pr.draft,
-    }));
-  }
-
   // 3. Quotas: the account's here, the repo's in RepoHub.
   const room = await account.checkSubscription(inbox);
   if (!room.ok) return problem(room.status, room.code, room.detail);
@@ -135,7 +116,6 @@ export async function createSubscription(
     },
     repo,
     baseline,
-    openPrs,
   );
   if (!result.ok) {
     const res = problem(result.status, result.code, result.detail);
@@ -158,6 +138,7 @@ export async function createSubscription(
   };
   await account.saveSubscription(info);
   await installation.addRepo(repo.id);
+  if (result.needs_open_prs) await rememberOpenPrs(env, installation, found.id, repo.full_name, repo.id);
   if (baseline) {
     info.baseline = { state: baseline.state, head_sha: baseline.head_sha, mergeable: baseline.mergeable ?? "unknown" };
   }
@@ -213,6 +194,43 @@ export async function deleteSubscription(env: Env, account: AccountStub, inbox: 
   return new Response(null, { status: 204 });
 }
 
+// The repo's first `base` or `author` filter: RepoHub learns its open PRs
+// (the 100 most recently updated; others from their next event), so PRs
+// opened before can match. Best effort: the subscription stands anyway.
+async function rememberOpenPrs(
+  env: Env,
+  installation: DurableObjectStub<Installation>,
+  installationId: number,
+  fullName: string,
+  repoId: number,
+): Promise<void> {
+  try {
+    const minted = await installation.token(installationId, 1);
+    if (!minted.ok) return;
+    const res = await githubGet(minted.token, `/repos/${fullName}/pulls?state=open&sort=updated&direction=desc&per_page=100`);
+    if (!res?.ok) {
+      console.error(`listing ${fullName}'s open PRs: ${res ? res.status : "unreachable"}`);
+      return;
+    }
+    const open: OpenPr[] = ((await res.json()) as (PullBody & { number: number })[]).map((pr) => ({
+      number: pr.number,
+      head_sha: pr.head?.sha ?? null,
+      base_ref: pr.base?.ref ?? null,
+      author: pr.user?.login ?? null,
+      draft: !!pr.draft,
+    }));
+    await repoHubStub(env, repoId).rememberOpenPrs(open);
+  } catch (e) {
+    console.error(`remembering ${fullName}'s open PRs failed`, e);
+  }
+}
+
+// A branch name git would take, roughly: see git-check-ref-format.
+function isBranchName(s: string): boolean {
+  return BRANCH_NAME.test(s) && !s.startsWith("-") && !s.startsWith("/") && !s.endsWith("/") && !s.endsWith(".")
+    && !s.endsWith(".lock") && !s.includes("..") && !s.includes("@{") && !s.includes("//");
+}
+
 // Checks the body's shape. Returns the request, or what's wrong with it.
 function parseRequest(body: Record<string, unknown> | null): SubscriptionRequest | string {
   if (!body || typeof body !== "object") return "Body must be a JSON object";
@@ -229,7 +247,7 @@ function parseRequest(body: Record<string, unknown> | null): SubscriptionRequest
   }
   if (base !== undefined || author !== undefined) {
     if (pr !== undefined && pr !== null) return "base and author are for repository-wide subscriptions; leave out pr";
-    if (base !== undefined && !(typeof base === "string" && BRANCH_NAME.test(base))) return "base must be a branch name";
+    if (base !== undefined && !(typeof base === "string" && isBranchName(base))) return "base must be a branch name";
     if (author !== undefined && !(typeof author === "string" && LOGIN.test(author))) return "author must be a GitHub login";
   }
   let parsedIgnore: SubscriptionRequest["ignore"];

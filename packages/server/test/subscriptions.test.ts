@@ -47,6 +47,8 @@ interface FakeRepo {
   prs: Record<number, { state?: "open" | "closed"; merged?: boolean; mergeable?: boolean | null; base?: string; author?: string }>;
   // User IDs whose tokens can read it (private repos).
   readers?: number[];
+  // Listing its open PRs fails.
+  listFails?: boolean;
 }
 
 interface FakeGitHub {
@@ -111,6 +113,7 @@ function mockGitHub(gh: FakeGitHub): Seen[] {
     if (rest === "") return Response.json({ id: repo.id, full_name: fullName(repo), private: !!repo.private });
     if (rest === "/pulls") {
       if (url.searchParams.get("state") !== "open") throw new Error(`unexpected list ${req.url}`);
+      if (repo.listFails) return Response.json({ message: "Server Error" }, { status: 502 });
       return Response.json(Object.entries(repo.prs).filter(([, pr]) => (pr.state ?? "open") === "open").map(([n, pr]) => ({
         number: Number(n),
         state: "open",
@@ -364,6 +367,7 @@ describe("subscribing to a public repo", () => {
       { repo: "o/r", kinds: ["pr.*"], base: "has space" },
       { repo: "o/r", kinds: ["pr.*"], author: "not/a/login" },
       { repo: "o/r", kinds: ["pr.*"], author: 5 },
+      ...["-main", "a..b", "x.lock", "main/", "a@{1}"].map((base) => ({ repo: "o/r", kinds: ["pr.*"], base })),
     ]) {
       const res = await subscribe(user.auth, body);
       expect(res.status, JSON.stringify(body)).toBe(400);
@@ -394,8 +398,13 @@ describe("subscribing to a public repo", () => {
     expect(seen.map((s) => `${s.method} ${s.path}`).slice(2)).toEqual([`GET /repos/${fullName(repo)}`, `GET /repos/${fullName(repo)}/pulls`]);
     expect((await hubStats(repo.id)).prs.map((p) => [p.number, p.base_ref, p.author])).toEqual([[7, "main", "Paul"], [8, "dev", "paul"]]);
     expect((await list(user.auth)).map((s) => [s.id, s.base, s.author])).toEqual([[sub.id, "main", "paul"]]);
-    // The same again is the same subscription.
+    // The same again is the same subscription, and the open PRs aren't
+    // listed again; nor for another filter on a repo already tracking.
+    const before = seen.length;
     expect((await subscribe(user.auth, { repo: fullName(repo), kinds: ["pr.opened", "check.failed"], base: "main", author: "paul" })).status).toBe(200);
+    expect((await subscribe(user.auth, { repo: fullName(repo), kinds: ["pr.closed"], base: "dev" })).status).toBe(201);
+    expect(seen.slice(before).filter((s) => s.path.endsWith("/pulls"))).toEqual([]);
+    await call(`/v1/inboxes/box/subscriptions/${(await list(user.auth))[1].id}`, { method: "DELETE", headers: user.auth });
 
     // A check failing on an open PR against main by paul, and new PRs.
     const run = example("check_run", "completed") as { repository: { id: number; full_name: string }; check_run: Record<string, unknown> };
@@ -416,6 +425,16 @@ describe("subscribing to a public repo", () => {
       ["check.failed", 7, sub.id],
       ["pr.opened", 20, sub.id],
     ]);
+  });
+
+  it("subscribes anyway when the open PRs can't be listed", async () => {
+    const user = await signedIn();
+    const repo = newRepo({ listFails: true });
+    const seen = mockGitHub({ repos: [repo] });
+    const res = await subscribe(user.auth, { repo: fullName(repo), kinds: ["pr.opened"], author: "paul" });
+    expect(res.status).toBe(201);
+    expect(seen.some((s) => s.path.endsWith("/pulls"))).toBe(true);
+    expect((await hubStats(repo.id)).prs).toEqual([]);
   });
 
   it("enforces the account's subscription quota", async () => {

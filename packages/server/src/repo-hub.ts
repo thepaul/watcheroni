@@ -38,7 +38,10 @@ const PRUNE_EVERY_MS = 24 * 3600_000;
 // base, author and state for the `base` and `author` filters.
 const INTERNAL_KINDS = new Set(["check.completed", "pr.seen"]);
 
-const SCHEMA_VERSION = 3;
+// 2 added subscriptions.ttl_seconds; 4 added prs.author and prs.seen_at.
+// (3 was used by two branches for different things, so 4 checks columns
+// rather than trusting the number.)
+const SCHEMA_VERSION = 4;
 // Retrying an expiry check whose Account couldn't be reached.
 const EXPIRY_RETRY_MS = 5 * 60_000;
 
@@ -111,7 +114,9 @@ export interface Subscription {
 }
 
 export type SubscribeResult =
-  | { ok: true; created: boolean; subscription: Subscription }
+  // `needs_open_prs`: this made the repo's first `base` or `author`
+  // filter, so the caller should list the open PRs for `rememberOpenPrs`.
+  | { ok: true; created: boolean; subscription: Subscription; needs_open_prs?: boolean }
   | { ok: false; status: number; code: string; detail: string; retry_after?: number };
 
 export interface IngestResult {
@@ -171,50 +176,59 @@ export class RepoHub extends DurableObject<Env> {
     this.migrate();
   }
 
+  // Every step is idempotent: tables are created if missing and columns
+  // added if missing, so any earlier version (whatever it meant) ends up
+  // with the current schema.
   private migrate(): void {
     this.sql.exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)");
     const version = Number(this.getMeta("schema_version") ?? 0);
     if (version >= SCHEMA_VERSION) return;
-    if (version > 0) {
-      if (version < 2) this.sql.exec("ALTER TABLE subscriptions ADD COLUMN ttl_seconds INTEGER");
-      if (version < 3) this.sql.exec("ALTER TABLE prs ADD COLUMN author TEXT");
+    this.ctx.storage.transactionSync(() => {
+      this.sql.exec(`
+        CREATE TABLE IF NOT EXISTS subscriptions (
+          id TEXT PRIMARY KEY,
+          account_id INTEGER NOT NULL,
+          inbox TEXT NOT NULL,
+          pr INTEGER,
+          spec TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          verified_until INTEGER,
+          ttl_seconds INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS subscriptions_pr ON subscriptions (pr);
+        CREATE TABLE IF NOT EXISTS prs (
+          number INTEGER PRIMARY KEY,
+          state TEXT, draft INTEGER,
+          head_sha TEXT, base_ref TEXT,
+          mergeable TEXT,
+          mergeable_checked_at INTEGER,
+          author TEXT,
+          seen_at INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS prs_head ON prs (head_sha);
+        CREATE TABLE IF NOT EXISTS deliveries (guid TEXT PRIMARY KEY, at INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS outbox (
+          id INTEGER PRIMARY KEY,
+          account_id INTEGER NOT NULL,
+          payload TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          created_at INTEGER NOT NULL,
+          next_at INTEGER NOT NULL
+        );
+        ${BUCKETS_TABLE}
+      `);
+      this.addColumn("subscriptions", "ttl_seconds", "INTEGER");
+      this.addColumn("prs", "author", "TEXT");
+      this.addColumn("prs", "seen_at", "INTEGER");
+      this.refreshTracking();
       this.setMeta("schema_version", String(SCHEMA_VERSION));
-      return;
-    }
-    this.sql.exec(`
-      CREATE TABLE IF NOT EXISTS subscriptions (
-        id TEXT PRIMARY KEY,
-        account_id INTEGER NOT NULL,
-        inbox TEXT NOT NULL,
-        pr INTEGER,
-        spec TEXT NOT NULL,
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        verified_until INTEGER,
-        ttl_seconds INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS subscriptions_pr ON subscriptions (pr);
-      CREATE TABLE IF NOT EXISTS prs (
-        number INTEGER PRIMARY KEY,
-        state TEXT, draft INTEGER,
-        head_sha TEXT, base_ref TEXT,
-        mergeable TEXT,
-        mergeable_checked_at INTEGER,
-        author TEXT
-      );
-      CREATE INDEX IF NOT EXISTS prs_head ON prs (head_sha);
-      CREATE TABLE IF NOT EXISTS deliveries (guid TEXT PRIMARY KEY, at INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS outbox (
-        id INTEGER PRIMARY KEY,
-        account_id INTEGER NOT NULL,
-        payload TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        created_at INTEGER NOT NULL,
-        next_at INTEGER NOT NULL
-      );
-      ${BUCKETS_TABLE}
-    `);
-    this.setMeta("schema_version", String(SCHEMA_VERSION));
+    });
+  }
+
+  private addColumn(table: string, column: string, type: string): void {
+    const has = this.sql.exec("SELECT 1 FROM pragma_table_info(?) WHERE name = ?", table, column).toArray().length;
+    if (!has) this.sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
   }
 
   // The clock, separate so tests can move it.
@@ -224,7 +238,7 @@ export class RepoHub extends DurableObject<Env> {
 
   // ---- RPC: subscriptions --------------------------------------------
 
-  subscribe(sub: NewSubscription, repo: RepoInfo, baseline?: PrBaseline, openPrs?: OpenPr[]): SubscribeResult {
+  subscribe(sub: NewSubscription, repo: RepoInfo, baseline?: PrBaseline): SubscribeResult {
     const now = this.now();
     const invalid = (detail: string): SubscribeResult => ({ ok: false, status: 400, code: "invalid_request", detail });
     if (!Number.isSafeInteger(sub.account)) return invalid("account must be a GitHub user id");
@@ -273,7 +287,6 @@ export class RepoHub extends DurableObject<Env> {
         this.sql.exec("UPDATE subscriptions SET verified_until = ? WHERE id = ?", sub.verified_until, existing.id);
         existing.verified_until = sub.verified_until;
       }
-      if (filtered && openPrs) this.rememberOpenPrs(openPrs);
       return { ok: true, created: false, subscription: toSubscription(existing) };
     }
 
@@ -316,9 +329,10 @@ export class RepoHub extends DurableObject<Env> {
         );
       }
     }
-    if (filtered && openPrs) this.rememberOpenPrs(openPrs);
+    const startsTracking = filtered && !this.tracksAllPrs();
+    if (startsTracking) this.setMeta("tracks_all_prs", "1");
     this.scheduleAlarm();
-    return { ok: true, created: true, subscription: toSubscription(row) };
+    return { ok: true, created: true, subscription: toSubscription(row), ...(startsTracking ? { needs_open_prs: true } : {}) };
   }
 
   // RPC: a private repo's access was checked again (POST .../verify).
@@ -349,7 +363,7 @@ export class RepoHub extends DurableObject<Env> {
     if (!row) return false;
     this.sql.exec("DELETE FROM subscriptions WHERE id = ?", subId);
     if (row.pr !== null) this.forgetPrIfUnwatched(row.pr);
-    else this.forgetUntrackedPrs();
+    else this.refreshTracking();
     return true;
   }
 
@@ -364,6 +378,7 @@ export class RepoHub extends DurableObject<Env> {
     const outgoing: Map<number, Delivery[]> = new Map();
     this.endWith(rows, "watch.revoked", reason, `${eventBase}.revoked`, now, outgoing);
     this.sql.exec("DELETE FROM prs");
+    this.deleteMeta("tracks_all_prs");
     const ids = this.enqueue(outgoing, now);
     await this.deliverRows(ids, now);
     this.scheduleAlarm();
@@ -395,7 +410,7 @@ export class RepoHub extends DurableObject<Env> {
       this.sql.exec("DELETE FROM subscriptions WHERE id = ?", row.id);
       if (row.pr !== null) this.forgetPrIfUnwatched(row.pr);
     }
-    if (rows.some((r) => r.pr === null)) this.forgetUntrackedPrs();
+    if (rows.some((r) => r.pr === null)) this.refreshTracking();
   }
 
   // Subscriptions past `verified_until` end with `watch.unverified`. Those
@@ -578,27 +593,35 @@ export class RepoHub extends DurableObject<Env> {
     if (e.pr === null || !e.kind.startsWith("pr.")) return;
     const d = e.data;
     const opens = e.kind === "pr.opened" || e.kind === "pr.reopened" || (e.kind === "pr.seen" && d.state === "open");
-    if (tracking && opens) this.trackPr(e.pr);
+    const now = this.now();
+    if (tracking && opens) this.trackPr(e.pr, now);
     switch (e.kind) {
-      case "pr.seen":
+      case "pr.seen": {
+        // Fills gaps only: deliveries can arrive out of order, and the head
+        // and base move only with `pr.pushed` and `pr.base_changed`. Most
+        // PR webhooks carry one, so a row with nothing to fill isn't
+        // written at all.
+        const [head, base, author, state] = [str(d.head_sha), str(d.base), str(d.author), str(d.state)];
         this.sql.exec(
-          // Fills gaps only: deliveries can arrive out of order, and the
-          // head and base move only with `pr.pushed` and `pr.base_changed`.
-          "UPDATE prs SET head_sha = COALESCE(head_sha, ?), base_ref = COALESCE(base_ref, ?), author = COALESCE(author, ?) WHERE number = ?",
-          str(d.head_sha), str(d.base), str(d.author), e.pr,
+          `UPDATE prs SET head_sha = COALESCE(head_sha, ?1), base_ref = COALESCE(base_ref, ?2), author = COALESCE(author, ?3),
+             state = COALESCE(state, ?4), seen_at = ?5
+           WHERE number = ?6 AND ((head_sha IS NULL AND ?1 IS NOT NULL) OR (base_ref IS NULL AND ?2 IS NOT NULL)
+             OR (author IS NULL AND ?3 IS NOT NULL) OR (state IS NULL AND ?4 IS NOT NULL))`,
+          head, base, author, state, now, e.pr,
         );
         break;
+      }
       case "pr.opened":
         this.sql.exec(
-          "UPDATE prs SET state = 'open', draft = ?, head_sha = ?, base_ref = ? WHERE number = ?",
-          d.draft ? 1 : 0, str(d.head_sha), str(d.base), e.pr,
+          "UPDATE prs SET state = 'open', draft = ?, head_sha = ?, base_ref = ?, seen_at = ? WHERE number = ?",
+          d.draft ? 1 : 0, str(d.head_sha), str(d.base), now, e.pr,
         );
         break;
       case "pr.pushed":
-        if (str(d.after)) this.sql.exec("UPDATE prs SET head_sha = ? WHERE number = ?", str(d.after), e.pr);
+        if (str(d.after)) this.sql.exec("UPDATE prs SET head_sha = ?, seen_at = ? WHERE number = ?", str(d.after), now, e.pr);
         break;
       case "pr.reopened":
-        this.sql.exec("UPDATE prs SET state = 'open' WHERE number = ?", e.pr);
+        this.sql.exec("UPDATE prs SET state = 'open', seen_at = ? WHERE number = ?", now, e.pr);
         break;
       case "pr.ready_for_review":
       case "pr.converted_to_draft":
@@ -788,37 +811,79 @@ export class RepoHub extends DurableObject<Env> {
     this.sql.exec(`DELETE FROM prs WHERE number = ?${keepOpen} AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE pr = ?)`, pr, pr);
   }
 
-  // Once no repo-wide subscription filters on base or author, only
-  // watched PRs are kept.
-  private forgetUntrackedPrs(): void {
-    if (this.tracksAllPrs()) return;
-    this.sql.exec("DELETE FROM prs WHERE number NOT IN (SELECT pr FROM subscriptions WHERE pr IS NOT NULL)");
-  }
-
-  private tracksAllPrs(): boolean {
-    return this.sql
+  // Whether a repo-wide subscription filters on base or author, kept in
+  // `meta` so ingest needn't scan the subscriptions. Recomputed when a
+  // repo-wide subscription goes; once none is left, only watched PRs are
+  // kept.
+  private refreshTracking(): void {
+    const tracking = this.sql
       .exec(
         "SELECT 1 FROM subscriptions WHERE pr IS NULL AND (json_extract(spec, '$.base') IS NOT NULL OR json_extract(spec, '$.author') IS NOT NULL) LIMIT 1",
       )
       .toArray().length > 0;
+    if (tracking) {
+      this.setMeta("tracks_all_prs", "1");
+      return;
+    }
+    this.deleteMeta("tracks_all_prs");
+    this.sql.exec("DELETE FROM prs WHERE number NOT IN (SELECT pr FROM subscriptions WHERE pr IS NOT NULL)");
   }
 
-  // A row for the PR, unless that would pass the limit.
-  private trackPr(pr: number): boolean {
-    if (this.sql.exec("SELECT 1 FROM prs WHERE number = ?", pr).toArray().length) return true;
-    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM prs").one().n >= REPO_LIMITS.trackedPrs) return false;
-    this.sql.exec("INSERT INTO prs (number) VALUES (?)", pr);
-    return true;
+  private tracksAllPrs(): boolean {
+    return this.getMeta("tracks_all_prs") === "1";
   }
 
-  private rememberOpenPrs(open: OpenPr[]): void {
-    for (const pr of open) {
-      if (!Number.isSafeInteger(pr.number) || !this.trackPr(pr.number)) continue;
+  // Makes room for `n` more rows under the limit by forgetting the PRs
+  // least recently written that no PR subscription watches. Returns how
+  // many rows there's room for.
+  private roomForPrs(n: number): number {
+    const count = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM prs").one().n;
+    const over = count + n - REPO_LIMITS.trackedPrs;
+    if (over > 0) {
       this.sql.exec(
-        "UPDATE prs SET state = 'open', draft = ?, head_sha = ?, base_ref = ?, author = ? WHERE number = ?",
-        pr.draft ? 1 : 0, pr.head_sha, pr.base_ref, pr.author, pr.number,
+        `DELETE FROM prs WHERE number IN (
+           SELECT number FROM prs WHERE number NOT IN (SELECT pr FROM subscriptions WHERE pr IS NOT NULL)
+           ORDER BY COALESCE(seen_at, 0), number LIMIT ?)`,
+        over,
       );
     }
+    return REPO_LIMITS.trackedPrs - this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM prs").one().n;
+  }
+
+  // A row for an open PR, if there isn't one.
+  private trackPr(pr: number, now: number): void {
+    if (this.sql.exec("SELECT 1 FROM prs WHERE number = ?", pr).toArray().length) return;
+    if (this.roomForPrs(1) < 1) return;
+    this.sql.exec("INSERT INTO prs (number, state, seen_at) VALUES (?, 'open', ?)", pr, now);
+  }
+
+  // RPC: the repo's open PRs, listed by the Worker after `subscribe`
+  // answered `needs_open_prs`, so PRs opened before the filter can match.
+  // One statement; rows already right aren't rewritten.
+  rememberOpenPrs(open: OpenPr[]): void {
+    if (!this.tracksAllPrs()) return;
+    const prs = open.filter((p) => Number.isSafeInteger(p.number) && p.number > 0).slice(0, 100);
+    const known = new Set(this.sql
+      .exec<{ number: number }>("SELECT number FROM prs WHERE number IN (SELECT value FROM json_each(?))", JSON.stringify(prs.map((p) => p.number)))
+      .toArray()
+      .map((r) => r.number));
+    const fresh = prs.filter((p) => !known.has(p.number));
+    const room = fresh.length ? this.roomForPrs(fresh.length) : 0;
+    const rows = [...prs.filter((p) => known.has(p.number)), ...fresh.slice(0, Math.max(room, 0))].map((p) => ({
+      number: p.number, draft: p.draft ? 1 : 0, head_sha: p.head_sha, base_ref: p.base_ref, author: p.author,
+    }));
+    if (!rows.length) return;
+    this.sql.exec(
+      `INSERT INTO prs (number, state, draft, head_sha, base_ref, author, seen_at)
+       SELECT json_extract(value, '$.number'), 'open', json_extract(value, '$.draft'), json_extract(value, '$.head_sha'),
+         json_extract(value, '$.base_ref'), json_extract(value, '$.author'), ?
+       FROM json_each(?) WHERE true
+       ON CONFLICT (number) DO UPDATE SET state = 'open', draft = excluded.draft, head_sha = excluded.head_sha,
+         base_ref = excluded.base_ref, author = excluded.author, seen_at = excluded.seen_at
+       WHERE prs.state IS NOT 'open' OR prs.draft IS NOT excluded.draft OR prs.head_sha IS NOT excluded.head_sha
+         OR prs.base_ref IS NOT excluded.base_ref OR prs.author IS NOT excluded.author`,
+      this.now(), JSON.stringify(rows),
+    );
   }
 
   private getMeta(k: string): string | null {
