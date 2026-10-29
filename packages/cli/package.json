@@ -1,6 +1,6 @@
 {
   "name": "watcheroni",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Wait for, stream, or act on what happens to GitHub pull requests",
   "license": "MIT",
   "author": "paul cannon",

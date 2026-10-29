@@ -21,7 +21,7 @@
 
 # watcheroni-plugin-wrapper
 # Kept equal to plugin.json's version (see RELEASING.md).
-cli="watcheroni@^0.2.0"
+cli="watcheroni@^0.2.1"
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
