@@ -63,6 +63,11 @@ installed one keeps working); it's fixed once the publish finishes.
 If the release workflow fails, fix it quickly, or revert the plugin's
 version on `main`.
 
+A new marketplace install gets `main` as it is, straight away, without
+waiting for a release. So a change to `plugin/` that needs CLI features
+not yet on npm breaks new installs until the release that has them:
+land such changes with, or just before, that release.
+
 ## Publishing credentials
 
 The workflow publishes with npm trusted publishing (OIDC) when it's set up

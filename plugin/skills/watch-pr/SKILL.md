@@ -38,7 +38,7 @@ is running; to add a PR, stop the running one, then
 | 2 | Timed out, nothing happened | Start `watcheroni wait` again |
 | 3 | Every watched PR was merged or closed | Read any final events, tell the user, and stop |
 | 4 | No GitHub login | Ask the user to run `gh auth login` (it's interactive), then start again |
-| 1 | Error | Read the message. "in use by process" means a `wait` is already running for this session: leave it be |
+| 1 | Error | Read the message. An `npm error` means the CLI couldn't be fetched: see "Installing". "in use by process" means a `wait` is already running for this session: leave it be |
 | 127 | CLI not found | See "Installing" below |
 
 Events wait in the inbox until a `wait` prints them, so nothing is lost
@@ -98,8 +98,10 @@ the watcheroni repository when the plugin runs from that clone, or
 `npx --yes watcheroni@^0.1.0`. npx needs the npm registry the first time.
 
 If it exits 127, none of those worked (npx is missing, or it's turned off
-with `WATCHERONI_NO_NPX`). Ask the user to run
-`npm install -g watcheroni@^0.1.0`; it needs Node.js 22 or later.
+with `WATCHERONI_NO_NPX`). If it exits 1 with an `npm error` (no network,
+`ETARGET`, `ENOTCACHED`), npx couldn't get the CLI. Either way, ask the
+user to run `npm install -g watcheroni@^0.1.0`, which needs Node.js 22 or
+later, then start again.
 
 Local mode needs a GitHub login: `gh auth login`, or `GH_TOKEN` /
 `GITHUB_TOKEN` in the environment. The token stays on this machine.

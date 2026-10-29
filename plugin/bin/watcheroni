@@ -4,7 +4,10 @@
 # say `watcheroni`. It looks for the real CLI in this order:
 #
 #   1. $WATCHERONI_CLI, a path to watcheroni.mjs
-#   2. another `watcheroni` on PATH (npm install -g watcheroni)
+#   2. another `watcheroni` on PATH (npm install -g watcheroni), skipping
+#      copies of this wrapper (other installs of the plugin), which carry
+#      the marker line below. WATCHERONI_WRAPPER, set before running one,
+#      stops older copies without the marker from looping back here.
 #   3. this repository's build, packages/cli/dist/watcheroni.mjs, when the
 #      plugin runs in place from a clone of the repository
 #      (claude --plugin-dir plugin, after npm run build -w watcheroni).
@@ -12,10 +15,11 @@
 #   4. npx --yes watcheroni@^X.Y.Z, the CLI version this plugin version
 #      goes with, unless WATCHERONI_NO_NPX is set. With
 #      WATCHERONI_NPX_OFFLINE set, only a copy npx already has in its cache
-#      is used, so it never waits on the registry.
+#      is used, so it doesn't wait on the registry.
 #
 # Exits 127 if none of them is available.
 
+# watcheroni-plugin-wrapper
 # Kept equal to plugin.json's version (see RELEASING.md).
 cli="watcheroni@^0.1.0"
 
@@ -25,17 +29,19 @@ if [ -n "$WATCHERONI_CLI" ]; then
   exec node "$WATCHERONI_CLI" "$@"
 fi
 
-old_ifs=$IFS
-IFS=:
-for dir in $PATH; do
-  [ -n "$dir" ] || continue
-  [ "$(CDPATH= cd -- "$dir" 2>/dev/null && pwd)" = "$here" ] && continue
-  if [ -x "$dir/watcheroni" ]; then
+if [ -z "$WATCHERONI_WRAPPER" ]; then
+  old_ifs=$IFS
+  IFS=:
+  for dir in $PATH; do
+    [ -n "$dir" ] || continue
+    [ "$(CDPATH= cd -- "$dir" 2>/dev/null && pwd)" = "$here" ] && continue
+    [ -x "$dir/watcheroni" ] || continue
+    grep -qx '# watcheroni-plugin-wrapper' "$dir/watcheroni" 2>/dev/null && continue
     IFS=$old_ifs
-    exec "$dir/watcheroni" "$@"
-  fi
-done
-IFS=$old_ifs
+    WATCHERONI_WRAPPER=1 exec "$dir/watcheroni" "$@"
+  done
+  IFS=$old_ifs
+fi
 
 build="$here/../../packages/cli/dist/watcheroni.mjs"
 if [ -f "$build" ]; then

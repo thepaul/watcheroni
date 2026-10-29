@@ -5,6 +5,7 @@
 // never fails the session start.
 
 import { execFile } from "node:child_process";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const cli = fileURLToPath(new URL("../bin/watcheroni", import.meta.url));
@@ -27,7 +28,9 @@ execFile(
   // npx only from its cache: a registry lookup on every session start is
   // too slow, and with no network it can take minutes. A session that has
   // watched anything through npx has the CLI in that cache.
-  { env: { ...process.env, WATCHERONI_NPX_OFFLINE: "1" }, timeout: 15_000 },
+  // Run from the home directory, not the project: npx would prefer a
+  // watcheroni in the project's node_modules, which the project controls.
+  { cwd: homedir(), env: { ...process.env, WATCHERONI_NPX_OFFLINE: "1" }, timeout: 15_000 },
   (err, stdout) => {
     // Unread events count too: a wait would print them.
     if (err || !stdout.trim() || /^Inbox \S+ is watching nothing\.$/.test(stdout.trim())) process.exit(0);

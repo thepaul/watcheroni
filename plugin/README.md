@@ -36,7 +36,7 @@ npm install -g watcheroni@^0.1.0
 ```
 
 Plugin version X.Y.Z goes with CLI X.Y.Z; through npx it uses the latest
-CLI with the same minor version. `claude plugin update watcheroni@watcheroni`
+compatible CLI (`watcheroni@^X.Y.Z`). `claude plugin update watcheroni@watcheroni`
 updates the plugin (restart Claude Code after).
 
 Then either:

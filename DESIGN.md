@@ -1007,8 +1007,8 @@ marketplace:
   plugin has the CLI's version (`scripts/plugin-version.mjs` keeps them in
   step, and a test checks), so it runs the CLI it was released with. The
   SessionStart hook lets npx use only its cache, which a session that
-  watched anything through npx has filled, so it never waits on the
-  registry.
+  watched anything through npx has filled, so it doesn't wait on the
+  registry (npm's update notifier may still check it in the background).
 
 Because the cursor lives on the server, a `wait` killed by an app restart
 loses nothing; the next one gets everything since the last
