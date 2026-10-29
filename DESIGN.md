@@ -228,8 +228,11 @@ earliest due time, or clears it.
 `packages/server/src/repo-hub.ts`, with the buckets in `src/limits.ts`
 (migration tag `v2`). Where it differs from the above:
 
-- **Not built yet:** the `checks`, `rollups` and `jobs` tables, so no
-  `checks.completed` or `merge.*`.
+- **Not built yet:** the `jobs` table (the alarm's one periodic job,
+  the mergeability check, is the `merge_check_at` meta row, as pruning is
+  `prune_at`).
+- **Derived events** (schema 5) are described under "As built" in
+  "Derived events".
 - **`base` and `author`** (repository-wide only) are kept in `spec`, so
   they count for idempotence; `author` is lowercased. They match against
   `prs`, which gained `author` and `seen_at` columns (schema 4; every
@@ -280,7 +283,8 @@ earliest due time, or clears it.
   `not_verified`). The CLI renews private subscriptions due within two
   days, when it starts and every six hours while it runs.
 - **The alarm** covers outbox retries, the end of a throttle, the next
-  `expires_at` or `verified_until`, and pruning `deliveries`.
+  `expires_at` or `verified_until`, mergeability checks, and pruning
+  `deliveries` and old `checks` and `rollups`.
 - **`subscribe`** takes `{account, inbox, pr, kinds, ignore, ttl_seconds,
   verified_until}`, the repo, and an optional baseline (`{state, head_sha,
   base_ref, draft, mergeable}`); subscribing again with a later
@@ -301,11 +305,13 @@ earliest due time, or clears it.
   ID as the base, `data.reason` `uninstalled`, `suspended` or `removed`)
   through the outbox, and deletes all subscriptions and `prs` rows.
 - **The Worker skips RepoHub** when a delivery normalises to no events
-  (labels, edits, `check_run.created` and so on). Those cost no Durable
+  (labels, edits and so on). Those cost no Durable
   Object request and don't count against the repo's ingest limit or get
   recorded for dedupe. The webhook response lists the events and what
   `ingest` returned.
-- **Matching.** `check.completed` is dropped before matching. An event
+- **Matching.** The normaliser's internal kinds (`check.completed`,
+  `check.started`, `check_suite.updated`, `base.advanced`; see "Derived
+  events") are used and dropped before matching. An event
   with no PR but a `data.head_sha` (statuses, check runs on branches
   without a PR) is copied once per watched PR whose `prs.head_sha`
   matches, each copy with ID `<event id>.pr<N>`. `pr.opened`,
@@ -788,6 +794,109 @@ retries after 10, 30 and 90 seconds. An event is emitted only when the
 answer changes between `MERGEABLE` and `CONFLICTING`. Each query counts
 against the repo's and the installation's GitHub API budgets.
 
+### As built in the prototype
+
+In `packages/server/src/repo-hub.ts` (schema 5: the `checks` and
+`rollups` tables, which are caches, so a database from before 5 has
+them dropped and made afresh; test servers had an earlier shape of them
+under "3"), fed by internal kinds from `src/webhook/normalise.ts`, which
+come after a payload's delivered events so those keep their IDs. The
+`data` of both kinds is the CLI's (`packages/cli/src/diff.ts`). Where it
+differs from the above:
+
+- **Watched** means having a PR subscription. Since `prs` also holds PRs
+  kept only for repository-wide `base` and `author` filters, rollups,
+  mergeability checks, `base.advanced` and check pruning all look for a
+  subscription, not just a row.
+
+- **Facts.** `check_run.created` gives `check.started` (run ID, name,
+  suite ID, App ID), or `check.completed` for a run created already
+  finished; `check_run.completed` gives the existing `check.completed`
+  (now with suite and App IDs); a `pending` status gives `check.started`
+  (statuses carry their GitHub ID); and `check_suite` `requested`,
+  `rerequested` and `completed` give `check_suite.updated`.
+- **Cost.** `check_run.created`, pending statuses and `check_suite` now
+  reach RepoHub, for unwatched repos too: one Durable Object request
+  each, answered without writes. A delivery made only of `check.started`
+  and `check_suite.updated` doesn't count against the repo's ingest
+  limit, since nothing in it can be delivered. The Worker could skip
+  those requests for unwatched repos by caching, per isolate, RepoHub's
+  `no_subscriptions` answers for a minute; not built. Meta rows are
+  written only when their value changes, so the repo name and
+  installation set on each delivery cost nothing after the first.
+- **Which checks are kept.** Every check fact for a repo with any
+  subscription, not only watched heads, because a push's first checks
+  can arrive before the `synchronize` webhook; rows for SHAs that are no
+  longer a watched head are pruned a day after RepoHub last heard of
+  them (`seen_at`, its own clock). A `pr.pushed` works out the new
+  head's rollup straight away.
+- **Sending.** A finished rollup is sent from the alarm once it has
+  stayed finished and unchanged for 20 seconds (`rollups.settle_at`,
+  moved on by every change); a new check starting meanwhile cancels it. It's sent when it differs from the
+  last one sent to that PR (`rollups.head_sha` and `fingerprint`, the
+  whole `data`): another result, more checks counted, or a new head,
+  including a force-push back to an earlier one, as the CLI does. So a
+  quick status that finishes before Actions creates its runs gives an
+  early `checks.completed`, and the full one follows. The CLI's local
+  mode re-sends on the same changes (`Memory.rollup.data`).
+- **While throttled** a webhook's events aren't delivered, but PR facts
+  (a push, a base change, a merge) and check facts are still recorded
+  and rolled up, so a push or a run that finishes during a throttle
+  doesn't leave a head stale or its rollup open. A merge or close still
+  ends its PR's watches: each of the PR's subscriptions gets the
+  `pr.merged` or `pr.closed` (if its kinds take it) and `watch.ended`,
+  and repository-wide ones get nothing. Settled `checks.completed` and
+  `merge.*` come from the alarm, so they are delivered even while the
+  repo is throttled.
+- **`check.failed` once per run.** A run created already finished gives
+  `check.completed` and `check.failed` from its `created` webhook; if
+  GitHub also sends `completed` for it, RepoHub delivers `check.failed`
+  only for the delivery that recorded the run as finished, for the
+  first time or with a new conclusion.
+- **Suites are mostly seen through their runs.** GitHub sends
+  `check_suite.requested` only to the suite's own App, so the queued,
+  never-run suites the rule ignores rarely appear at all. A suite first
+  seen through one of its runs counts as running until its
+  `check_suite.completed` arrives, which keeps a workflow whose later
+  jobs wait on earlier ones (their runs are created late) from finishing
+  early. A late `created` doesn't undo a run's completion, but a run
+  completed again with another conclusion (Apps can update their runs)
+  replaces it if its `completed_at` is no older, and sends
+  `check.failed` again if it failed;
+  suites take the newest by GitHub's `updated_at`, and statuses by their
+  increasing ID; on a tie the finished one wins. A finished run with no
+  conclusion counts as neutral, never as a success.
+- **Re-runs.** Only the latest run (highest ID) of each name within a
+  suite counts, as in the CLI's `statusCheckRollup`. A re-run of a job in
+  a suite that has already completed can make the rollup finish before
+  any jobs that wait on it are created; best-effort, as PROTOCOL.md says.
+- **IDs.** `checks.completed` is `repo:<id>.pr<N>.checks.<ms>`, and
+  `merge.conflict` and `merge.clean` are `repo:<id>.pr<N>.conflict.<ms>`
+  and `.clean.<ms>`, the time of the alarm that sent them. `actor` is null; `links` are the PR's.
+- **No baseline for checks.** A subscription starts with no rollup, so if
+  a check is re-run on a head whose checks finished before the watch
+  began, the rollup covers only the checks seen since (the CLI would know
+  all of them). The mergeability baseline is the subscription's.
+- **Mergeability triggers.** `pr.pushed` and `pr.base_changed` on a
+  watched PR, and `base.advanced` (from a merged PR, with its base
+  branch) when an open watched PR has that base, make the check due at
+  once and give `UNKNOWN` its three retries again. A subscription makes
+  it due in 15 minutes, or 10 seconds if the baseline wasn't definite.
+  After a check, the next is 15 minutes on (60 s if GitHub failed, gave
+  no token, or answered with errors or a body that isn't JSON; a failure
+  never loses the rest of the alarm's work). A check asked for while one
+  is waiting on GitHub is kept, with its retries reset
+  (`merge_requests` counts the requests). Only PRs with a subscription
+  are checked. Up to 50 PRs go in one query; each query is one call from
+  the repo's bucket (`REPO_LIMITS.api`, 120 an hour, taken only once the
+  token is in hand) and the installation's
+  (`Installation.token(id, calls)`). Out of budget, the check waits until
+  the bucket has the calls, or for the installation's `retry_after`.
+- **The installation** is the `installation_id` meta row, set by `/v1`
+  subscribing and by every webhook's `installation.id` (passed to
+  `ingest`). Without one (subscriptions made through `/debug` without
+  `installation_id`), no mergeability check runs.
+
 ## Limits
 
 All limits are token buckets kept in SQLite (`buckets` tables), refilled
@@ -1140,6 +1249,10 @@ It runs on the deployer's own Cloudflare account, free plan included.
    has been checked live on production with a private repo
    (thepaul/shinycode-website); all of it is deployed there.
 4. **Derived events** (checks rollup, mergeability), limits, redelivery.
+   *Derived events built on 2026-10-28* (see "As built" under "Derived
+   events"), tested with GitHub stubbed. The rollup was checked on the
+   test Worker with signed webhooks; mergeability against real GitHub
+   still needs an open PR on a repo with the App installed.
 5. **Publish:** the hosted App, `watcheroni` and `@watcheroni/protocol` on
    npm, the Claude Code plugin, `selfhost`.
 6. Repo-wide subscriptions; recipes for `exec` (desktop notifications,

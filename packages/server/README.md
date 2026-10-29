@@ -29,7 +29,7 @@ What's here, compared with the full design:
   `/debug/repos/{id}/subscriptions` subscribes without the GitHub checks,
   and `/debug/{accounts,repos,installations}/{id}` show what an object is
   doing (see "Worker routes" in DESIGN.md).
-- **Not yet:** Control, derived events, re-verifying private
+- **Not yet:** Control, re-verifying private
   subscriptions (`/verify`), expiring subscriptions, the per-IP limit on
   `/v1/login` and `/v1/github/refresh`, revoking keys on the
   `github_app_authorization` webhook (`Account.revokeAllKeys` is ready for

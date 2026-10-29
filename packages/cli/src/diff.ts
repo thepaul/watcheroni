@@ -6,9 +6,11 @@ import type { Actor, Check, Snapshot } from "./snapshot.ts";
 //
 // What it remembers beyond the last snapshot, for the derived kinds.
 export interface Memory {
-  // The last checks.completed reported, so a re-run that changes the
-  // result is reported again but an unchanged one isn't.
-  rollup: { head: string; result: string } | null;
+  // The last checks.completed reported, so a rollup whose data changes
+  // (a re-run with another result, or checks that started late) is
+  // reported again but an unchanged one isn't. `data` is its JSON; state
+  // saved by older versions lacks it, and then only the result counts.
+  rollup: { head: string; result: string; data?: string } | null;
   conflict: boolean;
 }
 
@@ -16,7 +18,7 @@ export function initialMemory(s: Snapshot): Memory {
   // The first snapshot is the starting point: what is already true when
   // watching starts isn't reported, as with a server subscription.
   const rollup = rollupOf(s);
-  return { rollup: rollup ? { head: s.head, result: rollup.result } : null, conflict: s.mergeable === "CONFLICTING" };
+  return { rollup: rollup ? { head: s.head, result: rollup.result, data: JSON.stringify(rollup) } : null, conflict: s.mergeable === "CONFLICTING" };
 }
 
 const FAILED = new Set(["failure", "timed_out", "action_required", "startup_failure"]);
@@ -116,9 +118,10 @@ export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: 
   }
   let { rollup } = memory;
   const now = rollupOf(next);
-  if (now && (rollup?.head !== next.head || rollup.result !== now.result)) {
-    emit("checks.completed", `${next.head}:${now.result}`, { head_sha: next.head, ...now }, prLinks);
-    rollup = { head: next.head, result: now.result };
+  const data = now && JSON.stringify(now);
+  if (now && (rollup?.head !== next.head || rollup.result !== now.result || (rollup.data !== undefined && rollup.data !== data))) {
+    emit("checks.completed", `${next.head}:${now.result}:${next.fetchedAt}`, { head_sha: next.head, ...now }, prLinks);
+    rollup = { head: next.head, result: now.result, data: data! };
   }
 
   // Mergeability. UNKNOWN means GitHub is still working it out.
