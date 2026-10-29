@@ -10,13 +10,20 @@
     "bindings": [
       { "name": "ACCOUNT", "class_name": "Account" },
       { "name": "REPO_HUB", "class_name": "RepoHub" },
-      { "name": "INSTALLATION", "class_name": "Installation" }
+      { "name": "INSTALLATION", "class_name": "Installation" },
+      { "name": "CONTROL", "class_name": "Control" }
     ]
   },
+  // The redelivery cron runs on production only: both Workers use the same
+  // GitHub App, whose webhooks go to production, so a second cron on the
+  // test server would only redeliver the same failures twice. On the test
+  // server, POST /debug/control/redeliver runs it by hand.
+  "triggers": { "crons": [] },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["Account"] },
     { "tag": "v2", "new_sqlite_classes": ["RepoHub"] },
-    { "tag": "v3", "new_sqlite_classes": ["Installation"] }
+    { "tag": "v3", "new_sqlite_classes": ["Installation"] },
+    { "tag": "v4", "new_sqlite_classes": ["Control"] }
   ],
   "vars": {
     "GITHUB_APP_ID": "5490181",
@@ -44,9 +51,12 @@
         "bindings": [
           { "name": "ACCOUNT", "class_name": "Account" },
           { "name": "REPO_HUB", "class_name": "RepoHub" },
-          { "name": "INSTALLATION", "class_name": "Installation" }
+          { "name": "INSTALLATION", "class_name": "Installation" },
+          { "name": "CONTROL", "class_name": "Control" }
         ]
       },
+      // Every 10 minutes: Control redelivers webhooks that failed.
+      "triggers": { "crons": ["*/10 * * * *"] },
       "vars": {
         "GITHUB_APP_ID": "5490181",
         "GITHUB_CLIENT_ID": "Iv23li1qpgDkOHqZsdtt"

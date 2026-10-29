@@ -1,0 +1,12 @@
+{
+  // `npm run build`: JS and .d.ts for the npm package, in dist/. The
+  // workspace itself keeps importing src/index.ts (see package.json).
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "es2022",
+    "noEmit": false,
+    "declaration": true,
+    "rootDir": "src",
+    "outDir": "dist"
+  }
+}

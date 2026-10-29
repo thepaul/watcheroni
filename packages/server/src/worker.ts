@@ -3,13 +3,15 @@
 // with a GitHub user token, API keys, WebSocket tickets), and RepoHub.
 // GitHub webhooks are verified, normalised and sent to RepoHub, or to
 // Installation for installation events; /v1 subscriptions check access
-// with GitHub and subscribe RepoHub.
+// with GitHub and subscribe RepoHub. A cron trigger has Control redeliver
+// webhooks that failed.
 
 import type { Account, AuthResult, Delivery, RateState } from "./account";
 import { bearer, newApiKey, newKeyId, newTicketPayload, parseApiKey, secretsEqual, signTicket, verifyTicket } from "./auth";
 import type { NewSubscription, PrBaseline } from "./repo-hub";
 import { GITHUB_API_URL, GITHUB_WEB_URL, checkUserToken, refreshUserToken } from "./github";
 import type { InstallationFact } from "./installation";
+import type { Control } from "./control";
 import {
   INSTALL_URL,
   APP_SLUG,
@@ -48,6 +50,7 @@ import {
 export { Account } from "./account";
 export { RepoHub } from "./repo-hub";
 export { Installation } from "./installation";
+export { Control } from "./control";
 
 const MAX_WEBHOOK_BYTES = 2 * 1024 * 1024;
 // Where a browser visiting the server's root is sent, until there's a
@@ -59,6 +62,10 @@ type AccountStub = DurableObjectStub<Account>;
 
 function accountStub(env: Env, id: number): AccountStub {
   return env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
+}
+
+function controlStub(env: Env): DurableObjectStub<Control> {
+  return env.CONTROL.get(env.CONTROL.idFromName("control"));
 }
 
 export default {
@@ -97,6 +104,14 @@ export default {
     const rest = (inboxMatch?.[2] ?? "") + (itemId === null ? "" : "/{id}") + (inboxMatch?.[4] ?? "");
     const res = await api(request, url, env, caller, inbox, rest, itemId);
     return withRateHeaders(res, auth.rate);
+  },
+
+  // Every 10 minutes (production only; see wrangler.jsonc): redeliver
+  // webhooks that failed. The work happens in Control, whose CPU limit is
+  // far above a cron invocation's 10 ms.
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    const run = await controlStub(env).redeliver();
+    console.log(`redelivery: ${JSON.stringify(run)}`);
   },
 } satisfies ExportedHandler<Env>;
 
@@ -260,8 +275,8 @@ function connect(
 // /debug: development routes behind DEBUG_TOKEN, and off when it isn't set.
 // They stand in for login (minting a key without GitHub), for /v1
 // subscriptions without the GitHub checks, and for RepoHub (injecting
-// events), and show what Account, RepoHub and Installation objects are
-// doing.
+// events), and show what Account, RepoHub, Installation and Control
+// objects are doing.
 async function debug(request: Request, url: URL, env: Env): Promise<Response> {
   const given = bearer(request);
   if (!env.DEBUG_TOKEN || !given || !(await secretsEqual(given, env.DEBUG_TOKEN))) {
@@ -271,6 +286,16 @@ async function debug(request: Request, url: URL, env: Env): Promise<Response> {
   if (repoRoute) return debugRepo(request, env, Number(repoRoute[1]), repoRoute[0].includes("/subscriptions"), repoRoute[2]);
   const instRoute = url.pathname.match(/^\/debug\/installations\/(\d+)$/);
   if (instRoute && request.method === "GET") return json(await installationStub(env, Number(instRoute[1])).stats());
+  if (url.pathname === "/debug/control" && request.method === "GET") return json(await controlStub(env).stats());
+  // One run of the redelivery cron job, now. It lists the App's
+  // deliveries, wherever they went, and redelivers to the App's webhook
+  // URL, which is production's even on the test server. So by default
+  // it's a dry run, listing what it would redeliver; ?confirm=production
+  // redelivers.
+  if (url.pathname === "/debug/control/redeliver" && request.method === "POST") {
+    const dryRun = url.searchParams.get("confirm") !== "production";
+    return json(await controlStub(env).redeliver({ dryRun }));
+  }
 
   const m = url.pathname.match(/^\/debug\/accounts\/(\d{1,15})(\/.*)$/);
   if (!m) return problem(404, "not_found", "No such endpoint");
