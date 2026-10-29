@@ -232,8 +232,9 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
 The server checks, in order:
 
 1. The App is installed on the repo. If not: `409 app_not_installed`,
-   with `install_url` when the server knows its App's slug. Clients SHOULD fall back to polling GitHub
-   themselves (see "Clients without the server" below).
+   with `install_url` when the server knows its App's slug. Clients
+   SHOULD fall back to polling GitHub themselves (see "Clients without
+   the server" below).
 2. For a **private** repo: `X-GitHub-Token` is present, was issued to this
    App for the same GitHub user as the API key, and can read the repo.
    Otherwise `401 github_token_required` or `403 repo_access_denied`. The
