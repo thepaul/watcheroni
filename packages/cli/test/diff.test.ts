@@ -14,11 +14,11 @@ describe("diff", () => {
   it("reviews, review comments and issue comments", () => {
     const prev = snap();
     const next = snap({
-      reviews: [{ id: 10, state: "CHANGES_REQUESTED", at: "2026-10-27T00:01:00Z", url: "https://x/r10", author: alice }],
+      reviews: [{ id: 10, state: "CHANGES_REQUESTED", empty: true, at: "2026-10-27T00:01:00Z", url: "https://x/r10", author: alice }],
       reviewComments: [
         { id: 20, reviewId: 10, inReplyTo: null, path: "a.ts", line: 3, at: "2026-10-27T00:01:00Z", url: "https://x/c20", author: alice },
       ],
-      threads: [{ id: "T1", resolved: false }],
+      threads: [{ id: "T1", resolved: false, path: "a.ts", line: 3, commentId: 20 }],
       comments: [{ id: 30, at: "2026-10-27T00:01:00Z", url: "https://x/c30", author: alice }],
     });
     const { events } = diff(prev, next, initialMemory(prev));
@@ -32,10 +32,34 @@ describe("diff", () => {
     });
     expect(events[1].data).toEqual({ comment_id: 20, review_id: 10, path: "a.ts", line: 3, in_reply_to: null });
 
-    const resolved = diff(next, { ...next, threads: [{ id: "T1", resolved: true }] }, initialMemory(next));
+    const resolved = diff(next, { ...next, threads: [{ ...next.threads[0], resolved: true }] }, initialMemory(next));
     expect(kinds(resolved.events)).toEqual(["thread.resolved"]);
+    expect(resolved.events[0]).toMatchObject({
+      data: { thread_node_id: "T1", path: "a.ts", line: 3, comment_id: 20 },
+      links: { api: "https://api.github.com/repos/octo/widgets/pulls/comments/20" },
+    });
     const dismissed = diff(next, { ...next, reviews: [{ ...next.reviews[0], state: "DISMISSED" }] }, initialMemory(next));
     expect(kinds(dismissed.events)).toEqual(["review.dismissed"]);
+  });
+
+  it("every review is reported, saying whether it has text", () => {
+    const prev = snap();
+    const reply = (id: number, reviewId: number) => ({
+      id, reviewId, inReplyTo: 20, path: "a.ts", line: 3, at: "2026-10-27T00:01:00Z", url: `https://x/c${id}`, author: alice,
+    });
+    const next = snap({
+      reviews: [
+        { id: 11, state: "COMMENTED", empty: true, at: "2026-10-27T00:01:00Z", url: "https://x/r11", author: alice },
+        { id: 12, state: "COMMENTED", empty: false, at: "2026-10-27T00:01:00Z", url: "https://x/r12", author: alice },
+        { id: 13, state: "APPROVED", empty: true, at: "2026-10-27T00:01:00Z", url: "https://x/r13", author: alice },
+      ],
+      reviewComments: [reply(21, 11), reply(22, 12)],
+    });
+    const { events } = diff(prev, next, initialMemory(prev));
+    expect(events.map((e) => [e.kind, e.data.review_id, e.data.has_body])).toEqual([
+      ["review.submitted", 11, false], ["review.submitted", 12, true], ["review.submitted", 13, false],
+      ["review_comment.created", 11, undefined], ["review_comment.created", 12, undefined],
+    ]);
   });
 
   it("checks: failures, workflow runs and the rollup", () => {
