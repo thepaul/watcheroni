@@ -39,7 +39,7 @@ interface Payload {
   requested_reviewer?: User;
   requested_team?: { slug: string };
   changes?: { base?: { ref?: { from: string } } };
-  review?: { id: number; state: string; html_url?: string; submitted_at?: string };
+  review?: { id: number; state: string; body?: string | null; html_url?: string; submitted_at?: string };
   comment?: {
     id: number;
     html_url?: string;
@@ -48,9 +48,13 @@ interface Payload {
     pull_request_review_id?: number | null;
     path?: string;
     line?: number | null;
+    original_line?: number | null;
     in_reply_to_id?: number;
   };
-  thread?: { node_id: string };
+  thread?: {
+    node_id: string;
+    comments?: { id: number; url?: string; path?: string; line?: number | null; original_line?: number | null }[];
+  };
   issue?: { number: number; html_url?: string; url?: string; updated_at?: string; pull_request?: object };
   label?: { name: string };
   check_run?: {
@@ -175,7 +179,9 @@ export function normalise(
       if (!review || !pr) break;
       const links = { html: review.html_url, api: `${pr.url}/reviews/${review.id}` };
       if (action === "submitted") {
-        emit("review.submitted", pr.number, { review_id: review.id, state: review.state.toLowerCase() }, review.submitted_at, links);
+        emit("review.submitted", pr.number, {
+          review_id: review.id, state: review.state.toLowerCase(), has_body: !!review.body?.trim(),
+        }, review.submitted_at, links);
       } else if (action === "dismissed") {
         emit("review.dismissed", pr.number, { review_id: review.id }, null, links);
       }
@@ -189,7 +195,7 @@ export function normalise(
         comment_id: comment.id,
         review_id: comment.pull_request_review_id ?? null,
         path: comment.path ?? null,
-        line: comment.line ?? null,
+        line: comment.line ?? comment.original_line ?? null,
         in_reply_to: comment.in_reply_to_id ?? null,
       }, comment.created_at, { html: comment.html_url, api: comment.url });
       break;
@@ -198,7 +204,13 @@ export function normalise(
     case "pull_request_review_thread": {
       const { thread, pull_request: pr } = payload;
       if (!thread || !pr || (action !== "resolved" && action !== "unresolved")) break;
-      emit(`thread.${action}`, pr.number, { thread_node_id: thread.node_id }, null, { html: pr.html_url });
+      const first = thread.comments?.[0];
+      emit(`thread.${action}`, pr.number, {
+        thread_node_id: thread.node_id,
+        path: first?.path ?? null,
+        line: first?.line ?? first?.original_line ?? null,
+        comment_id: first?.id ?? null,
+      }, null, { html: pr.html_url, api: first?.url });
       break;
     }
 
