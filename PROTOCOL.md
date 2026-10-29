@@ -454,13 +454,22 @@ changing the protocol version.
 | `review.submitted` | `review_id`, `state` (`approved`, `changes_requested`, `commented`) |
 | `review.dismissed` | `review_id` |
 | `review_comment.created` | `comment_id`, `review_id`, `path`, `line`, `in_reply_to` |
-| `thread.resolved` | `thread_node_id` |
-| `thread.unresolved` | `thread_node_id` |
+| `thread.resolved` | `thread_node_id`, `path`, `line`, `comment_id` (the thread's first comment) |
+| `thread.unresolved` | `thread_node_id`, `path`, `line`, `comment_id` |
 | `comment.created` | `comment_id` |
 
 A review with several comments produces one `review.submitted` and one
 `review_comment.created` per comment. Clients that wake an agent SHOULD
 debounce, since these arrive together.
+
+A `commented` review with no text of its own produces no
+`review.submitted`, only its `review_comment.created` events (which name
+it in `review_id`). GitHub makes every reply in a review thread such a
+review, holding the one reply, so a reply is one event, not two.
+
+A thread's `line` is its original line once the code under it has
+changed (`null` for a comment on the whole file). Fetch the first comment
+to see what the thread is about.
 
 **Checks** (from `check_run`, `check_suite`, `status`, `workflow_run`):
 

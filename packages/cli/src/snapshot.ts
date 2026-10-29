@@ -38,7 +38,8 @@ export interface Snapshot {
   requested: string[];
   // Pending (unsubmitted) reviews and their comments are left out: only
   // their author can see them, and they appear once submitted.
-  reviews: { id: number; state: string; at: string | null; url: string; author: Actor | null }[];
+  // `empty`: the review has no text of its own, only its comments.
+  reviews: { id: number; state: string; empty: boolean; at: string | null; url: string; author: Actor | null }[];
   reviewComments: {
     id: number;
     reviewId: number | null;
@@ -49,7 +50,9 @@ export interface Snapshot {
     url: string;
     author: Actor | null;
   }[];
-  threads: { id: string; resolved: boolean }[];
+  // `line` falls back to the original line once the thread is outdated;
+  // `commentId` is its first comment's.
+  threads: { id: string; resolved: boolean; path: string | null; line: number | null; commentId: number | null }[];
   comments: { id: number; at: string; url: string; author: Actor | null }[];
   // Checks on the head commit only.
   checks: Check[];
@@ -65,8 +68,8 @@ query($owner: String!, $name: String!, $number: Int!) {
       headRefOid baseRefName baseRefOid
       mergeCommit { oid }
       reviewRequests(first: 50) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } ... on Team { slug } } } }
-      reviews(last: 100) { nodes { databaseId state submittedAt url author { ...actor } } }
-      reviewThreads(last: 100) { nodes { id isResolved comments(last: 100) { nodes {
+      reviews(last: 100) { nodes { databaseId state body submittedAt url author { ...actor } } }
+      reviewThreads(last: 100) { nodes { id isResolved path line originalLine first: comments(first: 1) { nodes { databaseId } } comments(last: 100) { nodes {
         databaseId path line createdAt url replyTo { databaseId } pullRequestReview { databaseId state } author { ...actor }
       } } } }
       comments(last: 100) { nodes { databaseId createdAt url author { ...actor } } }
@@ -107,8 +110,15 @@ interface RawPr {
   baseRefOid: string;
   mergeCommit: { oid: string } | null;
   reviewRequests: { nodes: { requestedReviewer: { __typename: string; login?: string; slug?: string } | null }[] };
-  reviews: { nodes: { databaseId: number; state: string; submittedAt: string | null; url: string; author: RawActor | null }[] };
-  reviewThreads: { nodes: { id: string; isResolved: boolean; comments: { nodes: {
+  reviews: { nodes: { databaseId: number; state: string; body: string; submittedAt: string | null; url: string; author: RawActor | null }[] };
+  reviewThreads: { nodes: {
+    id: string;
+    isResolved: boolean;
+    path: string | null;
+    line: number | null;
+    originalLine: number | null;
+    first: { nodes: { databaseId: number }[] };
+    comments: { nodes: {
     databaseId: number;
     path: string | null;
     line: number | null;
@@ -151,7 +161,9 @@ export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedA
       !r ? [] : r.__typename === "Team" ? [`team:${r.slug}`] : r.login ? [r.login] : []),
     reviews: pr.reviews.nodes
       .filter((r) => r.state !== "PENDING")
-      .map((r) => ({ id: r.databaseId, state: r.state, at: r.submittedAt, url: r.url, author: actor(r.author) })),
+      .map((r) => ({
+        id: r.databaseId, state: r.state, empty: !r.body.trim(), at: r.submittedAt, url: r.url, author: actor(r.author),
+      })),
     reviewComments: pr.reviewThreads.nodes.flatMap((t) => t.comments.nodes)
       .filter((c) => c.pullRequestReview?.state !== "PENDING")
       .map((c) => ({
@@ -164,7 +176,9 @@ export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedA
         url: c.url,
         author: actor(c.author),
       })),
-    threads: pr.reviewThreads.nodes.map((t) => ({ id: t.id, resolved: t.isResolved })),
+    threads: pr.reviewThreads.nodes.map((t) => ({
+      id: t.id, resolved: t.isResolved, path: t.path, line: t.line ?? t.originalLine, commentId: t.first.nodes[0]?.databaseId ?? null,
+    })),
     comments: pr.comments.nodes.map((c) => ({ id: c.databaseId, at: c.createdAt, url: c.url, author: actor(c.author) })),
     checks: contexts.map(toCheck),
   };

@@ -65,7 +65,10 @@ export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: 
   for (const r of next.reviews) {
     const before = prevReviews.get(r.id);
     const links = { actor: r.author, at: r.at, html: r.url, api: `${api}/pulls/${next.number}/reviews/${r.id}` };
-    if (!before && r.state !== "DISMISSED") {
+    // A "commented" review with no text is only a wrapper for its
+    // comments (a reply in a thread is one), which are reported
+    // themselves (PROTOCOL.md, "Kinds").
+    if (!before && r.state !== "DISMISSED" && !(r.state === "COMMENTED" && r.empty)) {
       emit("review.submitted", String(r.id), { review_id: r.id, state: r.state.toLowerCase() }, links);
     } else if (before && before.state !== "DISMISSED" && r.state === "DISMISSED") {
       emit("review.dismissed", String(r.id), { review_id: r.id }, { ...links, actor: null, at: null });
@@ -83,7 +86,9 @@ export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: 
     const was = prevThreads.get(t.id);
     if (was === undefined || was === t.resolved) continue;
     const kind = t.resolved ? "thread.resolved" : "thread.unresolved";
-    emit(kind, `${t.id}:${next.fetchedAt}`, { thread_node_id: t.id }, { html: next.url });
+    emit(kind, `${t.id}:${next.fetchedAt}`, {
+      thread_node_id: t.id, path: t.path, line: t.line, comment_id: t.commentId,
+    }, { html: next.url, api: t.commentId !== null ? `${api}/pulls/comments/${t.commentId}` : undefined });
   }
   const prevIssueComments = new Set(prev.comments.map((c) => c.id));
   for (const c of next.comments) {

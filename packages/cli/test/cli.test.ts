@@ -62,9 +62,9 @@ describe("wait against a server", () => {
     expect(run.stdout()).toBe([
       "octo/widgets#7: 2 new events",
       "- review.submitted: approved",
-      "  gh api repos/octo/widgets/pulls/7/reviews/5",
+      "  gh api repos/octo/widgets/pulls/7/reviews/5 --jq '.state, .body'",
       "- comment.created",
-      "  gh api repos/octo/widgets/issues/comments/9",
+      "  gh api repos/octo/widgets/issues/comments/9 --jq .body",
       "",
       "Still reading inbox box. Run `watcheroni wait` again to keep watching.",
       "",

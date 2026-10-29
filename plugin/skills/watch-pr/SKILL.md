@@ -54,7 +54,7 @@ octo/widgets#123: 2 new events
 - check.failed: "lint" (failure) on 4f2e1a9
   gh run view 555 -R octo/widgets --log-failed
 - review.submitted by alice: changes_requested
-  gh api repos/octo/widgets/pulls/123/reviews/987654
+  gh api repos/octo/widgets/pulls/123/reviews/987654 --jq '.state, .body'
 ```
 
 Run those commands to see what happened, then do what the user asked for
