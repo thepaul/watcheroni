@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { INBOX_NAME, type UnsequencedEvent, type WatchEvent } from "@watcheroni/protocol";
 import type { Memory } from "./diff.ts";
 import type { Snapshot } from "./snapshot.ts";
-import { UsageError, type Target } from "./targets.ts";
+import { UsageError, type RepoTarget, type Target } from "./targets.ts";
 
 // Local mode's stand-in for a server inbox: one JSON file per inbox under
 // ~/.local/state/watcheroni/inboxes/, holding what is watched, the last
@@ -24,6 +24,13 @@ export interface Watched {
   subTriedAt?: string;
 }
 
+// A whole repository, watched by a server subscription only.
+export interface RepoWatched {
+  target: RepoTarget;
+  addedAt: string;
+  sub: string;
+}
+
 interface State {
   version: 1;
   seq: number;
@@ -32,6 +39,8 @@ interface State {
   // IDs of recent events, to drop repeats.
   seen: string[];
   watched: Record<string, Watched>;
+  // Added after version 1's first release; missing in older files.
+  repos?: Record<string, RepoWatched>;
 }
 
 const SEEN_KEPT = 2000;
@@ -68,9 +77,9 @@ export class Inbox {
   }
 
   // Reads an inbox without locking it, for `ls`.
-  static peek(name: string): { watched: Watched[]; pending: number } {
+  static peek(name: string): { watched: Watched[]; repos: RepoWatched[]; pending: number } {
     const inbox = new Inbox(name, join(stateDir(), "inboxes"));
-    return { watched: inbox.watched(), pending: inbox.state.events.length };
+    return { watched: inbox.watched(), repos: inbox.repoWatches(), pending: inbox.state.events.length };
   }
 
   close(): void {
@@ -83,6 +92,27 @@ export class Inbox {
 
   watched(): Watched[] {
     return Object.values(this.state.watched);
+  }
+
+  repoWatches(): RepoWatched[] {
+    return Object.values(this.state.repos ?? {});
+  }
+
+  // Records (or updates) a repository-wide watch. False if it's new.
+  watchRepo(key: string, target: RepoTarget, sub: string): boolean {
+    const repos = (this.state.repos ??= {});
+    const known = !!repos[key];
+    repos[key] = { target, addedAt: repos[key]?.addedAt ?? new Date().toISOString(), sub };
+    this.save();
+    return known;
+  }
+
+  // Forgets every repository-wide watch on `owner/name`, returning them.
+  unwatchRepo(owner: string, name: string): RepoWatched[] {
+    const gone = Object.entries(this.state.repos ?? {}).filter(([, r]) => r.target.owner === owner && r.target.name === name);
+    for (const [key] of gone) delete this.state.repos![key];
+    if (gone.length) this.save();
+    return gone.map(([, r]) => r);
   }
 
   watch(key: string, target: Target, sub: string | null = null): boolean {
@@ -115,14 +145,22 @@ export class Inbox {
   // The server ended a subscription with a `watch.*` event. A PR that
   // merged, closed or expired is no longer watched; one whose watch was
   // revoked (the App uninstalled, say) or not re-verified is polled from
-  // here instead.
-  subscriptionEnded(sub: string, kind: string): void {
+  // here instead. Returns "repo" when it was a repository-wide watch.
+  subscriptionEnded(sub: string, kind: string): "repo" | "pr" | null {
+    // A repository-wide watch can't be polled from here, so it's simply over.
+    const repo = Object.entries(this.state.repos ?? {}).find(([, r]) => r.sub === sub);
+    if (repo) {
+      delete this.state.repos![repo[0]];
+      this.save();
+      return "repo";
+    }
     const entry = Object.entries(this.state.watched).find(([, w]) => w.sub === sub);
-    if (!entry) return;
+    if (!entry) return null;
     const [key, w] = entry;
     if (kind === "watch.revoked" || kind === "watch.unverified" || kind === "watch.expired") delete w.sub;
     else delete this.state.watched[key];
     this.save();
+    return "pr";
   }
 
   update(key: string, snapshot: Snapshot, memory: Memory): void {

@@ -7,7 +7,9 @@ import type { DataValue, UnsequencedEvent } from "../protocol";
 //
 // Besides protocol kinds this emits `check.completed` for every finished
 // check, failed or not. RepoHub needs those to derive `checks.completed`;
-// it doesn't deliver them.
+// it doesn't deliver them. Likewise `pr.seen`, last, after any other
+// event from a payload that describes the PR (its head, base, author and
+// state), for repository-wide subscriptions' `base` and `author` filters.
 
 // Only the fields read below. Everything is optional because GitHub's
 // payloads vary by event, action and age.
@@ -15,6 +17,8 @@ interface User { id: number; login: string; type?: string }
 interface Repository { id: number; full_name: string; html_url?: string; url?: string }
 interface PullRequest {
   number: number;
+  state?: string;
+  user?: User;
   html_url?: string;
   url?: string;
   draft?: boolean;
@@ -51,7 +55,7 @@ interface Payload {
     node_id: string;
     comments?: { id: number; url?: string; path?: string; line?: number | null; original_line?: number | null }[];
   };
-  issue?: { number: number; html_url?: string; url?: string; updated_at?: string; pull_request?: object };
+  issue?: { number: number; html_url?: string; url?: string; updated_at?: string; pull_request?: object; state?: string; user?: User };
   label?: { name: string };
   check_run?: {
     id: number;
@@ -256,6 +260,23 @@ export function normalise(
         }, run.updated_at, { html: run.html_url, api: run.url });
       }
       break;
+    }
+  }
+
+  // Only alongside other events, so a delivery that's otherwise ignored
+  // still never reaches RepoHub.
+  if (out.length) {
+    const pr = payload.pull_request;
+    const issue = payload.issue;
+    if (pr && typeof pr.number === "number") {
+      emit("pr.seen", pr.number, {
+        head_sha: pr.head?.sha ?? null,
+        base: pr.base?.ref ?? null,
+        author: pr.user?.login ?? null,
+        state: pr.state ?? null,
+      }, null);
+    } else if (eventName === "issue_comment" && issue?.pull_request) {
+      emit("pr.seen", issue.number, { author: issue.user?.login ?? null, state: issue.state ?? null }, null);
     }
   }
   return out;

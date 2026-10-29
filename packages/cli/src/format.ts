@@ -9,7 +9,8 @@ const BODY = "--jq .body";
 
 // `reading` names a server inbox that is still being read although no PR
 // is known to be watched (see Feed.ended).
-export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string): string {
+// `repoEnded`: the server ended a whole-repository watch.
+export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string, repoEnded = false): string {
   const groups = new Map<string, WatchEvent[]>();
   for (const e of events) {
     const key = e.repo ? (e.pr !== null ? `${e.repo.full_name}#${e.pr}` : e.repo.full_name) : "other";
@@ -21,14 +22,16 @@ export function formatText(events: WatchEvent[], stillWatching: string[], readin
     lines.push(...describeAll(list));
     lines.push("");
   }
-  lines.push(footer(stillWatching, reading));
+  lines.push(footer(stillWatching, reading, repoEnded));
   return lines.join("\n");
 }
 
-export function footer(stillWatching: string[], reading?: string): string {
+export function footer(stillWatching: string[], reading?: string, repoEnded = false): string {
   if (!stillWatching.length && reading) return `Still reading inbox ${reading}. Run \`watcheroni wait\` again to keep watching.`;
+  if (!stillWatching.length && repoEnded) return "Nothing is left to watch: the server's watch on the repository has ended.";
   if (!stillWatching.length) return "Nothing is left to watch: every watched PR has been merged or closed.";
-  const what = stillWatching.length === 1 ? `${stillWatching[0]} is still open` : `Still watching ${stillWatching.join(", ")}`;
+  // A single PR "is still open"; a whole repository is just watched.
+  const what = stillWatching.length === 1 && stillWatching[0].includes("#") ? `${stillWatching[0]} is still open` : `Still watching ${stillWatching.join(", ")}`;
   return `${what}. Run \`watcheroni wait\` again to keep watching.`;
 }
 
@@ -116,12 +119,15 @@ function describe(e: WatchEvent): [string, string | null] {
       return [`pr.merged as ${short(d.merge_sha)}`, null];
     case "watch.ended":
       return [`watch.ended: the PR was ${d.reason}`, null];
+    // A repository-wide watch (no PR) isn't polled from here when it ends.
     case "watch.expired":
-      return ["watch.expired: the server stopped watching after a week with nobody reading the inbox; watching it from this machine now", null];
+      return [e.pr === null
+        ? "watch.expired: the server stopped watching after a week with nobody reading the inbox; name the repository again to keep watching"
+        : "watch.expired: the server stopped watching after a week with nobody reading the inbox; watching it from this machine now", null];
     case "watch.unverified":
       return [d.reason === "access_denied"
         ? "watch.unverified: your GitHub login can no longer read this repo"
-        : "watch.unverified: the server's access check lapsed; run `watcheroni login`, then name the PR again", null];
+        : `watch.unverified: the server's access check lapsed; run \`watcheroni login\`, then name the ${e.pr === null ? "repository" : "PR"} again`, null];
     case "watch.revoked":
       return ["watch.revoked: the watcheroni App lost access to this repo", null];
     case "inbox.gap":
