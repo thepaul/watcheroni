@@ -135,11 +135,15 @@ async function main(argv: string[]): Promise<number> {
       targets.push(await currentBranchPr());
     } catch (e) {
       // Fine if the inbox already watches something, e.g. after the
-      // branch's PR was merged, or still holds events, such as the
-      // `watch.ended` of a PR that ended before anything read it, or is a
-      // server inbox, which subscriptions made elsewhere may feed.
+      // branch's PR was merged, or is a server inbox, which subscriptions
+      // made elsewhere may feed. Reading also goes on while the inbox
+      // still holds events, such as the `watch.ended` of a PR that ended
+      // before anything read it.
       if (!(e instanceof UsageError || (client && e instanceof LoginNeeded))) throw e;
-      if (!inbox.watched().length && !inbox.pending().length && !client) throw e;
+      if (!inbox.watched().length && !client) {
+        if (verb === "watch" || !inbox.pending().length) throw e;
+        log(`${(e as Error).message}; reading the events left in inbox ${inboxName}`);
+      }
     }
   }
   for (const t of targets) {

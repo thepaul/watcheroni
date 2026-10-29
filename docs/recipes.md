@@ -75,7 +75,10 @@ the channel, and save this as `watcheroni-slack` somewhere on your `PATH`
 ```sh
 #!/bin/sh
 # Posts a batch of watcheroni events to a Slack incoming webhook.
-payload=$(jq -c '{text: map("\(.kind) on <\(.links.html)|\(.repo.full_name)#\(.pr)>") | join("\n")}') || exit 1
+payload=$(jq -c '{text: map(
+  (if .repo then .repo.full_name + (if .pr then "#\(.pr)" else "" end) else "the inbox" end) as $where
+  | "\(.kind) on " + (if (.links.html // "") != "" then "<\(.links.html)|\($where)>" else $where end)
+) | join("\n")}') || exit 1
 curl -fsS -o /dev/null -H 'Content-Type: application/json' --data-binary "$payload" "$SLACK_WEBHOOK_URL"
 ```
 
@@ -149,9 +152,11 @@ Only one process at a time can use an inbox, so to add PRs later, stop
 the service, run `watcheroni watch --inbox notify ...` again, and start it
 again. The service stops by itself once every PR it watches has been
 merged or closed (exit 3), and the service managers below are told not to
-restart it then, nor after a usage error such as an inbox with nothing to
-watch (exit 1; see the log). Anything else, such as no GitHub login
-(exit 4), restarts it after 30 seconds.
+restart it then. Nor do they after exit 1, which covers every error but a
+missing GitHub login: an inbox with nothing to watch or in use by another
+process, a server that refuses the inbox or keeps erroring, a crash.
+Restarting won't fix those, so see the log. No GitHub login (exit 4)
+restarts it after 30 seconds, in case the keychain was still locked.
 
 ### macOS: launchd
 
@@ -170,7 +175,7 @@ watcheroni`):
   <array>
     <string>/bin/sh</string>
     <string>-c</string>
-    <!-- Don't restart after exit 1 (a usage error) or 3 (every PR has ended). -->
+    <!-- Don't restart after exit 1 (an error; see the log) or 3 (every PR has ended). -->
     <string>watcheroni exec --inbox notify -- "$HOME/bin/watcheroni-ntfy" || [ $? -le 3 ]</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -207,16 +212,14 @@ Save as `~/.config/systemd/user/watcheroni-notify.service`, with
 ```ini
 [Unit]
 Description=watcheroni: pull request events to ntfy
-Wants=network-online.target
-After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/watcheroni exec --inbox notify -- %h/bin/watcheroni-ntfy
 Restart=on-failure
 RestartSec=30
-# 3: every PR in the inbox has been merged or closed.
-SuccessExitStatus=3
-# 1: a usage error, such as an inbox with nothing to watch.
+# 3: every PR in the inbox has been merged or closed. 143: stopped.
+SuccessExitStatus=3 143
+# 1: an error restarting won't fix; see the log.
 RestartPreventExitStatus=1
 
 [Install]
