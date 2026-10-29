@@ -173,7 +173,7 @@ function meta(env: Env): Meta {
   return {
     protocol: 1,
     server: `watcheroni/${pkg.version}`,
-    features: ["ws", "longpoll"],
+    features: ["ws", "longpoll", "repo_scope"],
     ...(env.GITHUB_CLIENT_ID
       ? {
           github: {
@@ -448,7 +448,7 @@ function installationFact(payload: {
 // Subscriptions straight into RepoHub, with no GitHub checks, for tests
 // and for poking at a RepoHub:
 //   GET    /debug/repos/{id}                     RepoHub's state
-//   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, ignore?, full_name?, baseline?}
+//   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, base?, author?, ignore?, full_name?, baseline?}
 //   DELETE /debug/repos/{id}/subscriptions/{sub}
 async function debugRepo(request: Request, env: Env, repoId: number, subs: boolean, subId?: string): Promise<Response> {
   const hub = repoHubStub(env, repoId);

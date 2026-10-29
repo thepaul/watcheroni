@@ -207,6 +207,115 @@ describe("matching", () => {
   });
 });
 
+describe("repo-wide base and author filters", () => {
+  // A pull_request webhook for PR `n` against `base`, opened by `author`.
+  function prEvent(action: string, n: number, base: string, author: string): Example {
+    const payload = example("pull_request", action);
+    Object.assign(payload, { number: n });
+    const pr = payload.pull_request as { number: number; base: { ref: string }; user: { login: string }; state: string };
+    Object.assign(pr, { number: n, state: action === "closed" ? "closed" : "open" });
+    pr.base.ref = base;
+    pr.user.login = author;
+    return payload;
+  }
+
+  it("match PRs by the branch they target and who opened them", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    const toMain = await subscribe(repo, { account: acct, inbox: "main", pr: null, kinds: ["pr.*", "review.*"], base: "main" });
+    const byAlice = await subscribe(repo, { account: acct, inbox: "alice", pr: null, kinds: ["pr.*", "review.*", "issue.*"], author: "Alice" });
+    await subscribe(repo, { account: acct, inbox: "both", pr: null, kinds: ["pr.opened"], base: "main", author: "bob" });
+    await subscribe(repo, { account: acct, inbox: "all", pr: null, kinds: ["pr.opened", "review.*"] });
+    // Logins are compared without case.
+    expect(byAlice.author).toBe("alice");
+
+    await webhook("pull_request", prEvent("opened", 11, "main", "alice"), repo);
+    await webhook("pull_request", prEvent("opened", 12, "dev", "alice"), repo);
+    await webhook("pull_request", prEvent("opened", 13, "main", "bob"), repo);
+    await hub(repo).ingest("d1", [
+      fact(repo, "review.submitted", 12, { review_id: 1, state: "approved" }),
+      // A PR nobody here has heard of matches no filter.
+      fact(repo, "review.submitted", 99, { review_id: 2, state: "approved" }),
+      fact(repo, "issue.opened", null, { issue: 5 }),
+    ]);
+
+    const got = async (name: string) => (await inbox(acct, name)).map((e) => [e.kind, e.pr]);
+    expect(await got("main")).toEqual([["pr.opened", 11], ["pr.opened", 13]]);
+    expect((await inbox(acct, "main"))[0].sub).toBe(toMain.id);
+    expect(await got("alice")).toEqual([["pr.opened", 11], ["pr.opened", 12], ["review.submitted", 12]]);
+    expect(await got("both")).toEqual([["pr.opened", 13]]);
+    expect(await got("all")).toEqual([["pr.opened", 11], ["pr.opened", 12], ["pr.opened", 13], ["review.submitted", 12], ["review.submitted", 99]]);
+    // pr.seen stays inside RepoHub.
+    expect((await inbox(acct, "all")).some((e) => e.kind === "pr.seen")).toBe(false);
+    expect((await stats(repo)).prs.map((p) => [p.number, p.base_ref, p.author])).toEqual([
+      [11, "main", "alice"], [12, "dev", "alice"], [13, "main", "bob"],
+    ]);
+  });
+
+  it("follow a PR moved to another base", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.*", "comment.created"], base: "main" });
+    await webhook("pull_request", prEvent("opened", 4, "dev", "alice"), repo);
+    await hub(repo).ingest("d1", [fact(repo, "pr.base_changed", 4, { from: "dev", to: "main" })]);
+    await hub(repo).ingest("d2", [fact(repo, "comment.created", 4, { comment_id: 1 })]);
+    expect(kinds(await inbox(acct, "i"))).toEqual(["pr.base_changed", "comment.created"]);
+  });
+
+  it("know the PRs open when subscribing, and only while a filter needs them", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "pr", pr: 2, baseline: { state: "open", head_sha: SHA_B, base_ref: "main" } });
+    const open = [
+      { number: 1, head_sha: SHA_A, base_ref: "main", author: "Carol", draft: false },
+      { number: 2, head_sha: SHA_B, base_ref: "main", author: "dave", draft: true },
+    ];
+    const result = await hub(repo).subscribe(
+      { account: acct, inbox: "wide", pr: null, kinds: ["check.failed", "pr.closed"], author: "carol" },
+      { id: repo, full_name: "octo/widgets" },
+      undefined,
+      open,
+    );
+    if (!result.ok) throw new Error(result.detail);
+    expect((await stats(repo)).prs.map((p) => [p.number, p.author, p.head_sha])).toEqual([[1, "Carol", SHA_A], [2, "dave", SHA_B]]);
+
+    // A status carries only a head SHA; it's matched to the PR at that head.
+    const status = Object.assign(example("status"), { sha: SHA_A, state: "failure", context: "ci" });
+    await webhook("status", status, repo);
+    expect((await inbox(acct, "wide")).map((e) => [e.kind, e.pr])).toEqual([["check.failed", 1]]);
+
+    // A closed PR is forgotten once nothing watches it.
+    await hub(repo).ingest("d1", [fact(repo, "pr.closed", 1)]);
+    expect(kinds(await inbox(acct, "wide"))).toEqual(["check.failed", "pr.closed"]);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2]);
+
+    // So is every PR no PR subscription watches, once the filter goes.
+    await webhook("pull_request", prEvent("opened", 3, "main", "carol"), repo);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2, 3]);
+    expect(await hub(repo).unsubscribe(result.subscription.id)).toBe(true);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2]);
+    // And new PRs aren't remembered without one.
+    await webhook("pull_request", prEvent("opened", 4, "main", "carol"), repo);
+    expect((await stats(repo)).prs.map((p) => p.number)).toEqual([2]);
+  });
+
+  it("are part of what makes a subscription the same", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    const plain = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"] });
+    const main = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], base: "main" });
+    const again = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], base: "main" }, 200);
+    const paul = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], author: "Paul" });
+    const paulAgain = await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], author: "paul" }, 200);
+    expect(new Set([plain.id, main.id, paul.id]).size).toBe(3);
+    expect([again.id, paulAgain.id]).toEqual([main.id, paul.id]);
+    expect(plain).not.toHaveProperty("base");
+    expect(main.base).toBe("main");
+    await subscribe(repo, { account: acct, inbox: "i", pr: 1, base: "main" }, 400);
+    await subscribe(repo, { account: acct, inbox: "i", pr: null, kinds: ["pr.opened"], author: "" }, 400);
+  });
+});
+
 describe("subscriptions", () => {
   it("are idempotent and validated", async () => {
     const repo = fresh();

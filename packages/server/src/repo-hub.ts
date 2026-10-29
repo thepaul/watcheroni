@@ -18,6 +18,8 @@ export const REPO_LIMITS = {
   subscriptions: 200,
   repoWideSubscriptions: 20,
   accounts: 100,
+  // PRs remembered for repo-wide `base` and `author` filters.
+  trackedPrs: 1000,
 };
 
 // Accounts called straight from `ingest`, and from each alarm run; the
@@ -32,10 +34,11 @@ const DELIVERIES_KEPT_MS = 3 * 24 * 3600_000;
 const PRUNE_EVERY_MS = 24 * 3600_000;
 
 // Kinds the normaliser produces for RepoHub's own use, never delivered.
-// `check.completed` will feed the checks rollup.
-const INTERNAL_KINDS = new Set(["check.completed"]);
+// `check.completed` will feed the checks rollup; `pr.seen` carries a PR's
+// base, author and state for the `base` and `author` filters.
+const INTERNAL_KINDS = new Set(["check.completed", "pr.seen"]);
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 // Retrying an expiry check whose Account couldn't be reached.
 const EXPIRY_RETRY_MS = 5 * 60_000;
 
@@ -50,6 +53,9 @@ export interface NewSubscription {
   inbox: string;
   pr: number | null;
   kinds?: string[];
+  // Repo-wide only: PRs targeting this branch, or opened by this login.
+  base?: string;
+  author?: string;
   ignore?: Partial<Ignore>;
   ttl_seconds?: number;
   // Private repos: when access must next be re-checked (ms).
@@ -80,12 +86,24 @@ export interface PrBaseline {
   mergeable?: "mergeable" | "conflicting" | "unknown";
 }
 
+// An open PR, listed by the caller when a repo-wide subscription filters
+// on `base` or `author`, so PRs opened before it can match.
+export interface OpenPr {
+  number: number;
+  head_sha: string | null;
+  base_ref: string | null;
+  author: string | null;
+  draft: boolean;
+}
+
 export interface Subscription {
   id: string;
   account: number;
   inbox: string;
   pr: number | null;
   kinds: string[];
+  base?: string;
+  author?: string;
   ignore: Ignore;
   created_at: number;
   expires_at: number;
@@ -133,6 +151,7 @@ type PrRow = {
   draft: number | null;
   head_sha: string | null;
   base_ref: string | null;
+  author: string | null;
 };
 
 type OutboxRow = {
@@ -156,8 +175,9 @@ export class RepoHub extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)");
     const version = Number(this.getMeta("schema_version") ?? 0);
     if (version >= SCHEMA_VERSION) return;
-    if (version === 1) {
-      this.sql.exec("ALTER TABLE subscriptions ADD COLUMN ttl_seconds INTEGER");
+    if (version > 0) {
+      if (version < 2) this.sql.exec("ALTER TABLE subscriptions ADD COLUMN ttl_seconds INTEGER");
+      if (version < 3) this.sql.exec("ALTER TABLE prs ADD COLUMN author TEXT");
       this.setMeta("schema_version", String(SCHEMA_VERSION));
       return;
     }
@@ -179,7 +199,8 @@ export class RepoHub extends DurableObject<Env> {
         state TEXT, draft INTEGER,
         head_sha TEXT, base_ref TEXT,
         mergeable TEXT,
-        mergeable_checked_at INTEGER
+        mergeable_checked_at INTEGER,
+        author TEXT
       );
       CREATE INDEX IF NOT EXISTS prs_head ON prs (head_sha);
       CREATE TABLE IF NOT EXISTS deliveries (guid TEXT PRIMARY KEY, at INTEGER NOT NULL);
@@ -203,13 +224,19 @@ export class RepoHub extends DurableObject<Env> {
 
   // ---- RPC: subscriptions --------------------------------------------
 
-  subscribe(sub: NewSubscription, repo: RepoInfo, baseline?: PrBaseline): SubscribeResult {
+  subscribe(sub: NewSubscription, repo: RepoInfo, baseline?: PrBaseline, openPrs?: OpenPr[]): SubscribeResult {
     const now = this.now();
     const invalid = (detail: string): SubscribeResult => ({ ok: false, status: 400, code: "invalid_request", detail });
     if (!Number.isSafeInteger(sub.account)) return invalid("account must be a GitHub user id");
     if (sub.pr !== null && !(Number.isSafeInteger(sub.pr) && sub.pr > 0)) return invalid("pr must be a PR number or null");
     const kinds = [...new Set(sub.kinds ?? [])].sort();
     if (sub.pr === null && !kinds.length) return invalid("a repository-wide subscription must name at least one kind");
+    if (sub.pr !== null && (sub.base !== undefined || sub.author !== undefined)) {
+      return invalid("base and author are for repository-wide subscriptions");
+    }
+    if ((sub.base !== undefined && (typeof sub.base !== "string" || !sub.base)) || (sub.author !== undefined && (typeof sub.author !== "string" || !sub.author))) {
+      return invalid("base and author must be non-empty strings");
+    }
     if (baseline && baseline.state !== "open") {
       return { ok: false, status: 409, code: "pr_not_open", detail: `PR #${sub.pr} is ${baseline.state}` };
     }
@@ -227,7 +254,11 @@ export class RepoHub extends DurableObject<Env> {
       bots: !!sub.ignore?.bots,
       actors: [...new Set(sub.ignore?.actors ?? [])].sort(),
     };
-    const spec = JSON.stringify({ kinds, ignore });
+    // Logins are case-insensitive. Left out when unset, so specs from
+    // before the filters existed still compare equal.
+    const filter = { base: sub.base, author: sub.author?.toLowerCase() };
+    const spec = JSON.stringify({ kinds, ignore, ...filter });
+    const filtered = filter.base !== undefined || filter.author !== undefined;
 
     // Idempotent: the same inbox, PR and filter is the same subscription.
     const existing = this.sql
@@ -242,6 +273,7 @@ export class RepoHub extends DurableObject<Env> {
         this.sql.exec("UPDATE subscriptions SET verified_until = ? WHERE id = ?", sub.verified_until, existing.id);
         existing.verified_until = sub.verified_until;
       }
+      if (filtered && openPrs) this.rememberOpenPrs(openPrs);
       return { ok: true, created: false, subscription: toSubscription(existing) };
     }
 
@@ -284,6 +316,7 @@ export class RepoHub extends DurableObject<Env> {
         );
       }
     }
+    if (filtered && openPrs) this.rememberOpenPrs(openPrs);
     this.scheduleAlarm();
     return { ok: true, created: true, subscription: toSubscription(row) };
   }
@@ -316,6 +349,7 @@ export class RepoHub extends DurableObject<Env> {
     if (!row) return false;
     this.sql.exec("DELETE FROM subscriptions WHERE id = ?", subId);
     if (row.pr !== null) this.forgetPrIfUnwatched(row.pr);
+    else this.forgetUntrackedPrs();
     return true;
   }
 
@@ -361,6 +395,7 @@ export class RepoHub extends DurableObject<Env> {
       this.sql.exec("DELETE FROM subscriptions WHERE id = ?", row.id);
       if (row.pr !== null) this.forgetPrIfUnwatched(row.pr);
     }
+    if (rows.some((r) => r.pr === null)) this.forgetUntrackedPrs();
   }
 
   // Subscriptions past `verified_until` end with `watch.unverified`. Those
@@ -420,7 +455,7 @@ export class RepoHub extends DurableObject<Env> {
       .exec<SubRow>("SELECT * FROM subscriptions ORDER BY rowid")
       .toArray()
       .map(toSubscription);
-    const prs = this.sql.exec<PrRow>("SELECT number, state, draft, head_sha, base_ref FROM prs ORDER BY number").toArray();
+    const prs = this.sql.exec<PrRow>("SELECT number, state, draft, head_sha, base_ref, author FROM prs ORDER BY number").toArray();
     const outbox = this.sql
       .exec<OutboxRow & { next_at: number }>("SELECT * FROM outbox ORDER BY id")
       .toArray()
@@ -472,8 +507,9 @@ export class RepoHub extends DurableObject<Env> {
     // 4. Update what's known about watched PRs, and give events that carry
     // only a head SHA (statuses, checks on branches) the PRs at that head.
     const events: UnsequencedEvent[] = [];
+    const tracking = this.tracksAllPrs();
     for (const fact of facts) {
-      this.updatePr(fact);
+      this.updatePr(fact, tracking);
       events.push(...this.withPrs(fact));
     }
 
@@ -536,10 +572,22 @@ export class RepoHub extends DurableObject<Env> {
 
   // ---- Matching ------------------------------------------------------
 
-  private updatePr(e: UnsequencedEvent): void {
+  // `tracking`: a repo-wide subscription filters on base or author, so
+  // every open PR is remembered, not just watched ones.
+  private updatePr(e: UnsequencedEvent, tracking: boolean): void {
     if (e.pr === null || !e.kind.startsWith("pr.")) return;
     const d = e.data;
+    const opens = e.kind === "pr.opened" || e.kind === "pr.reopened" || (e.kind === "pr.seen" && d.state === "open");
+    if (tracking && opens) this.trackPr(e.pr);
     switch (e.kind) {
+      case "pr.seen":
+        this.sql.exec(
+          // Fills gaps only: deliveries can arrive out of order, and the
+          // head and base move only with `pr.pushed` and `pr.base_changed`.
+          "UPDATE prs SET head_sha = COALESCE(head_sha, ?), base_ref = COALESCE(base_ref, ?), author = COALESCE(author, ?) WHERE number = ?",
+          str(d.head_sha), str(d.base), str(d.author), e.pr,
+        );
+        break;
       case "pr.opened":
         this.sql.exec(
           "UPDATE prs SET state = 'open', draft = ?, head_sha = ?, base_ref = ? WHERE number = ?",
@@ -588,10 +636,18 @@ export class RepoHub extends DurableObject<Env> {
       )
       .toArray()
       .map(toSubscription);
+    // What's known of each PR, for repo-wide `base` and `author` filters.
+    const known = subs.some((s) => s.base !== undefined || s.author !== undefined)
+      ? new Map(this.sql
+        .exec<PrRow>("SELECT * FROM prs WHERE number IN (SELECT value FROM json_each(?))", JSON.stringify(prs))
+        .toArray()
+        .map((r) => [r.number, r]))
+      : new Map<number, PrRow>();
     for (const event of events) {
       const inboxes = new Set<string>();
       for (const sub of subs) {
         if (sub.pr === null ? event.kind.startsWith("watch.") : sub.pr !== event.pr) continue;
+        if (sub.pr === null && !filterMatches(sub, event.pr === null ? undefined : known.get(event.pr))) continue;
         if (!matchesKind(sub.kinds, event.kind) || ignored(sub, event)) continue;
         const key = `${sub.account}\u0000${sub.inbox}`;
         if (inboxes.has(key)) continue;
@@ -725,8 +781,44 @@ export class RepoHub extends DurableObject<Env> {
     else void this.ctx.storage.deleteAlarm();
   }
 
+  // While a repo-wide subscription filters on base or author, open PRs
+  // are kept for it.
   private forgetPrIfUnwatched(pr: number): void {
-    this.sql.exec("DELETE FROM prs WHERE number = ? AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE pr = ?)", pr, pr);
+    const keepOpen = this.tracksAllPrs() ? " AND state IS NOT 'open'" : "";
+    this.sql.exec(`DELETE FROM prs WHERE number = ?${keepOpen} AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE pr = ?)`, pr, pr);
+  }
+
+  // Once no repo-wide subscription filters on base or author, only
+  // watched PRs are kept.
+  private forgetUntrackedPrs(): void {
+    if (this.tracksAllPrs()) return;
+    this.sql.exec("DELETE FROM prs WHERE number NOT IN (SELECT pr FROM subscriptions WHERE pr IS NOT NULL)");
+  }
+
+  private tracksAllPrs(): boolean {
+    return this.sql
+      .exec(
+        "SELECT 1 FROM subscriptions WHERE pr IS NULL AND (json_extract(spec, '$.base') IS NOT NULL OR json_extract(spec, '$.author') IS NOT NULL) LIMIT 1",
+      )
+      .toArray().length > 0;
+  }
+
+  // A row for the PR, unless that would pass the limit.
+  private trackPr(pr: number): boolean {
+    if (this.sql.exec("SELECT 1 FROM prs WHERE number = ?", pr).toArray().length) return true;
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM prs").one().n >= REPO_LIMITS.trackedPrs) return false;
+    this.sql.exec("INSERT INTO prs (number) VALUES (?)", pr);
+    return true;
+  }
+
+  private rememberOpenPrs(open: OpenPr[]): void {
+    for (const pr of open) {
+      if (!Number.isSafeInteger(pr.number) || !this.trackPr(pr.number)) continue;
+      this.sql.exec(
+        "UPDATE prs SET state = 'open', draft = ?, head_sha = ?, base_ref = ?, author = ? WHERE number = ?",
+        pr.draft ? 1 : 0, pr.head_sha, pr.base_ref, pr.author, pr.number,
+      );
+    }
   }
 
   private getMeta(k: string): string | null {
@@ -743,18 +835,28 @@ export class RepoHub extends DurableObject<Env> {
 }
 
 function toSubscription(row: SubRow): Subscription {
-  const spec = JSON.parse(row.spec) as { kinds: string[]; ignore: Ignore };
+  const spec = JSON.parse(row.spec) as { kinds: string[]; ignore: Ignore; base?: string; author?: string };
   return {
     id: row.id,
     account: row.account_id,
     inbox: row.inbox,
     pr: row.pr,
     kinds: spec.kinds,
+    ...(spec.base === undefined ? {} : { base: spec.base }),
+    ...(spec.author === undefined ? {} : { author: spec.author }),
     ignore: spec.ignore,
     created_at: row.created_at,
     expires_at: row.expires_at,
     verified_until: row.verified_until ?? null,
   };
+}
+
+// A repo-wide subscription's `base` and `author`: the event must be about
+// a PR known to target that branch, or to be by that login.
+function filterMatches(sub: Subscription, pr: PrRow | undefined): boolean {
+  if (sub.base === undefined && sub.author === undefined) return true;
+  if (!pr) return false;
+  return (sub.base === undefined || pr.base_ref === sub.base) && (sub.author === undefined || pr.author?.toLowerCase() === sub.author);
 }
 
 function ignored(sub: Subscription, e: UnsequencedEvent): boolean {
