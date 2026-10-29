@@ -333,6 +333,17 @@ describe("reading with no server", () => {
     expect(Inbox.peek("box").pending).toBe(0);
   });
 
+  it("doesn't wait on a repository-wide watch, which only a server feeds", async () => {
+    leaveWatchEnded();
+    const inbox = Inbox.open("box");
+    inbox.watchRepo("octo/widgets (pr.opened)", { owner: "octo", name: "widgets", kinds: ["pr.opened"] }, "sub_1");
+    inbox.close();
+    const run = cli(["exec", "--", "sh", "-c", 'echo "$WATCHERONI_KIND"'], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(3);
+    expect(run.stdout()).toBe("watch.ended\n");
+    expect(Inbox.peek("box").pending).toBe(0);
+  });
+
   it("still needs a PR to watch, whatever the inbox holds", async () => {
     leaveWatchEnded();
     const run = cli(["watch"], { WATCHERONI_SERVER: "" });

@@ -157,6 +157,9 @@ missing GitHub login: an inbox with nothing to watch or in use by another
 process, a server that refuses the inbox or keeps erroring, a crash.
 Restarting won't fix those, so see the log. No GitHub login (exit 4)
 restarts it after 30 seconds, in case the keychain was still locked.
+An inbox with a repository-wide watch (`watcheroni watch --inbox notify
+octo/widgets --kinds ...`, through the server) never exits 3, as that
+watch has no end; stopping by itself is for inboxes of PRs only.
 
 ### macOS: launchd
 
