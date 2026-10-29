@@ -14,13 +14,6 @@ const example = (event: string, action?: string): Example => {
   if (!found) throw new Error(`no ${event}.${action} example`);
   return structuredClone(found);
 };
-// GitHub's review examples are "commented" with no text, which produce no
-// event of their own (PROTOCOL.md, "Kinds").
-const approved = (): Example => {
-  const payload = example("pull_request_review", "submitted");
-  (payload.review as { state: string }).state = "approved";
-  return payload;
-};
 
 const BASE = "https://watcheroni.test";
 const AUTH = { Authorization: "Bearer test-debug-token" };
@@ -95,7 +88,7 @@ describe("ingest from GitHub's examples", () => {
   it("delivers a review to the PR's subscriber", async () => {
     const repo = fresh();
     const acct = fresh();
-    const payload = approved();
+    const payload = example("pull_request_review", "submitted");
     const pr = (payload.pull_request as { number: number }).number;
     const sub = await subscribe(repo, { account: acct, inbox: "i", pr });
 
@@ -129,9 +122,7 @@ describe("ingest from GitHub's examples", () => {
     }
     for (const e of await inbox(acct, "all")) seen.add(e.kind);
     expect(seen).not.toContain("check.completed");
-    // GitHub's review.submitted examples are all "commented" with no text,
-    // which is no event of its own.
-    for (const k of ["pr.opened", "pr.closed", "review.dismissed", "review_comment.created", "comment.created", "workflow.completed", "issue.opened"]) {
+    for (const k of ["pr.opened", "pr.closed", "review.submitted", "review_comment.created", "comment.created", "workflow.completed", "issue.opened"]) {
       expect(seen).toContain(k);
     }
   });
@@ -249,7 +240,7 @@ describe("dedupe", () => {
   it("drops a redelivered webhook by its delivery ID", async () => {
     const repo = fresh();
     const acct = fresh();
-    const payload = approved();
+    const payload = example("pull_request_review", "submitted");
     await subscribe(repo, { account: acct, inbox: "i", pr: (payload.pull_request as { number: number }).number });
     const first = await webhook("pull_request_review", structuredClone(payload), repo, "same-guid");
     const again = await webhook("pull_request_review", structuredClone(payload), repo, "same-guid");

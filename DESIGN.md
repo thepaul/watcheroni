@@ -977,10 +977,11 @@ It runs on the deployer's own Cloudflare account, free plan included.
    "commented" `review.submitted` plus a `review_comment.created`, so
    three replies make six lines; `thread.resolved` doesn't say which
    thread; and the printed `gh api` commands return whole JSON objects
-   where a `--jq` filter for the body would do (all three fixed since: a
-   reply is one `review_comment.created`, threads carry `path`, `line`
-   and their first `comment_id`, and the commands filter with `--jq`;
-   see PROTOCOL.md "Kinds"). A failed
+   where a `--jq` filter for the body would do (all three fixed since:
+   `wait` prints a reply's body-less review only when its replies are
+   filtered out, threads carry `path`, `line` and their first
+   `comment_id`, and the commands filter with `--jq`; see PROTOCOL.md
+   "Kinds"). A failed
    `checks.completed` now prints `gh pr checks`, since its individual
    `check.failed` events may predate the watch.
 2. **CLI in local mode only** (`wait`, `stream`, `exec` polling GitHub).

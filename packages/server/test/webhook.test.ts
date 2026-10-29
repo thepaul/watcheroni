@@ -73,16 +73,19 @@ describe("normalising", () => {
   });
 
   it("reviews, comments and threads", async () => {
-    const submitted = example("pull_request_review", "submitted") as Example & { review: { state: string; body: string | null } };
-    // GitHub's examples are all "commented" with no text: only a wrapper
-    // for comments, which come as their own events.
-    expect(await events("pull_request_review", submitted)).toEqual([]);
-    const review = await events("pull_request_review", { ...submitted, review: { ...submitted.review, body: "Some notes" } });
-    expect(review[0]).toMatchObject({ kind: "review.submitted", data: { review_id: expect.any(Number), state: "commented" } });
-    const approved = await events("pull_request_review", { ...submitted, review: { ...submitted.review, state: "approved" } });
-    expect(approved[0]).toMatchObject({ kind: "review.submitted", data: { state: "approved" } });
-    const comment = await events("pull_request_review_comment", example("pull_request_review_comment", "created"));
+    const submitted = example("pull_request_review", "submitted") as Example & { review: { body: string | null } };
+    const review = await events("pull_request_review", submitted);
+    expect(review[0]).toMatchObject({
+      kind: "review.submitted", data: { review_id: expect.any(Number), state: expect.stringMatching(/^[a-z_]+$/), has_body: false },
+    });
+    const withBody = await events("pull_request_review", { ...submitted, review: { ...submitted.review, body: "Some notes" } });
+    expect(withBody[0].data.has_body).toBe(true);
+    const created = example("pull_request_review_comment", "created") as Example & { comment: { line: number | null; original_line: number } };
+    const comment = await events("pull_request_review_comment", created);
     expect(comment[0]).toMatchObject({ kind: "review_comment.created", data: { comment_id: expect.any(Number), path: expect.any(String) } });
+    // An outdated comment keeps its original line.
+    const outdated = await events("pull_request_review_comment", { ...created, comment: { ...created.comment, line: null, original_line: 4 } });
+    expect(outdated[0].data.line).toBe(4);
     const thread = await events("pull_request_review_thread", example("pull_request_review_thread", "resolved"));
     expect(thread[0]).toMatchObject({
       kind: "thread.resolved",

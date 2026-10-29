@@ -65,11 +65,8 @@ export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: 
   for (const r of next.reviews) {
     const before = prevReviews.get(r.id);
     const links = { actor: r.author, at: r.at, html: r.url, api: `${api}/pulls/${next.number}/reviews/${r.id}` };
-    // A "commented" review with no text is only a wrapper for its
-    // comments (a reply in a thread is one), which are reported
-    // themselves (PROTOCOL.md, "Kinds").
-    if (!before && r.state !== "DISMISSED" && !(r.state === "COMMENTED" && r.empty)) {
-      emit("review.submitted", String(r.id), { review_id: r.id, state: r.state.toLowerCase() }, links);
+    if (!before && r.state !== "DISMISSED") {
+      emit("review.submitted", String(r.id), { review_id: r.id, state: r.state.toLowerCase(), has_body: !r.empty }, links);
     } else if (before && before.state !== "DISMISSED" && r.state === "DISMISSED") {
       emit("review.dismissed", String(r.id), { review_id: r.id }, { ...links, actor: null, at: null });
     }

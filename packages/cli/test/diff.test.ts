@@ -42,7 +42,7 @@ describe("diff", () => {
     expect(kinds(dismissed.events)).toEqual(["review.dismissed"]);
   });
 
-  it("a \"commented\" review with no text is just its comments", () => {
+  it("every review is reported, saying whether it has text", () => {
     const prev = snap();
     const reply = (id: number, reviewId: number) => ({
       id, reviewId, inReplyTo: 20, path: "a.ts", line: 3, at: "2026-10-27T00:01:00Z", url: `https://x/c${id}`, author: alice,
@@ -56,8 +56,9 @@ describe("diff", () => {
       reviewComments: [reply(21, 11), reply(22, 12)],
     });
     const { events } = diff(prev, next, initialMemory(prev));
-    expect(events.map((e) => [e.kind, e.data.review_id])).toEqual([
-      ["review.submitted", 12], ["review.submitted", 13], ["review_comment.created", 11], ["review_comment.created", 12],
+    expect(events.map((e) => [e.kind, e.data.review_id, e.data.has_body])).toEqual([
+      ["review.submitted", 11, false], ["review.submitted", 12, true], ["review.submitted", 13, false],
+      ["review_comment.created", 11, undefined], ["review_comment.created", 12, undefined],
     ]);
   });
 

@@ -52,8 +52,14 @@ function describeAll(events: WatchEvent[]): string[] {
       const where = comments.map((c) => location(c.data) || "?");
       lines.push(`- ${comments.length} review comments${by(e)} on ${where.join(", ")}`);
       // The review's own comments endpoint leaves out the lines.
-      lines.push(`  gh api ${repoPath(e)}/pulls/${e.pr}/comments --paginate --jq '.[] | select(.pull_request_review_id == ${reviewId}) | "\\(.path):\\(.line // .original_line) \\(.body)"'`);
+      lines.push(`  gh api ${repoPath(e)}/pulls/${e.pr}/comments --paginate --jq '.[] | select(.pull_request_review_id == ${reviewId}) | "\\(.path)\\(.line // .original_line | if . then ":\\(.)" else "" end) \\(.body)"'`);
       continue;
+    }
+    // GitHub makes a reply in a thread a "commented" review with no text
+    // holding the reply. When the replies are here too, they say it all.
+    if (e.kind === "review.submitted" && reviewId !== null && e.data.state === "commented" && e.data.has_body === false) {
+      const comments = byReview.get(reviewId) ?? [];
+      if (comments.length && comments.every((c) => c.data.in_reply_to)) continue;
     }
     const [text, command] = describe(e);
     lines.push(`- ${text}`);

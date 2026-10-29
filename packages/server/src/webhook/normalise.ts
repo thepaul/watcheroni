@@ -44,6 +44,7 @@ interface Payload {
     pull_request_review_id?: number | null;
     path?: string;
     line?: number | null;
+    original_line?: number | null;
     in_reply_to_id?: number;
   };
   thread?: {
@@ -161,11 +162,10 @@ export function normalise(
       const { review, pull_request: pr } = payload;
       if (!review || !pr) break;
       const links = { html: review.html_url, api: `${pr.url}/reviews/${review.id}` };
-      // A "commented" review with no text is only a wrapper for its
-      // comments (a reply in a thread is one), which arrive as
-      // pull_request_review_comment (PROTOCOL.md, "Kinds").
-      if (action === "submitted" && !(review.state.toLowerCase() === "commented" && !review.body?.trim())) {
-        emit("review.submitted", pr.number, { review_id: review.id, state: review.state.toLowerCase() }, review.submitted_at, links);
+      if (action === "submitted") {
+        emit("review.submitted", pr.number, {
+          review_id: review.id, state: review.state.toLowerCase(), has_body: !!review.body?.trim(),
+        }, review.submitted_at, links);
       } else if (action === "dismissed") {
         emit("review.dismissed", pr.number, { review_id: review.id }, null, links);
       }
@@ -179,7 +179,7 @@ export function normalise(
         comment_id: comment.id,
         review_id: comment.pull_request_review_id ?? null,
         path: comment.path ?? null,
-        line: comment.line ?? null,
+        line: comment.line ?? comment.original_line ?? null,
         in_reply_to: comment.in_reply_to_id ?? null,
       }, comment.created_at, { html: comment.html_url, api: comment.url });
       break;
