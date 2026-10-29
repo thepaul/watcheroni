@@ -1079,7 +1079,7 @@ watcheroni config [get | set] <key> [value]
   reads the *whole* inbox, not just the targets named, so use one inbox per
   consumer.
 - **`wait`** connects over WebSocket, waits for at least one event, then
-  keeps collecting for a short settle time (default 20 s, `--settle`) so a
+  keeps collecting for a short settle time (default 10 s, `--settle`) so a
   review with ten comments arrives as one wake-up, not ten. It prints them,
   acknowledges, and exits. Exit codes: `0` events, `2` timeout, `3` every
   watched PR has ended, `4` login needed, `1` other errors.

@@ -64,7 +64,7 @@ teaches a session the commands and puts the CLI on its PATH.
 ## Commands
 
 ```
-watcheroni wait   [target...] [--timeout 1h] [--settle 20s] [--format text|json]
+watcheroni wait   [target...] [--timeout 1h] [--settle 5s] [--format text|json]
 watcheroni stream [target...]
 watcheroni exec   [target...] [--on kinds] [--batch] -- command [args...]
 watcheroni watch  [target...]
@@ -78,7 +78,7 @@ the current git branch, found through the checkout's GitHub remotes.
 below).
 
 - **`wait`** polls (every 2 minutes; `--interval`) until something
-  happens, waits `--settle` for related events, prints them with the
+  happens, waits `--settle` (5 s; `0` for none) for related events, prints them with the
   command that fetches each one's content, and exits. Exit codes: `0`
   events, `2` timeout, `3` every watched PR has ended, `4` no GitHub
   credentials, `1` other errors.

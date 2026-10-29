@@ -18,7 +18,7 @@ const EXIT = { events: 0, error: 1, timeout: 2, ended: 3, login: 4 } as const;
 const HELP = `watcheroni ${pkg.version}: wait for, stream, or act on what happens to GitHub pull requests
 
 Usage:
-  watcheroni wait   [target...] [--timeout 1h] [--settle 20s] [--format text|json]
+  watcheroni wait   [target...] [--timeout 1h] [--settle 5s] [--format text|json]
   watcheroni stream [target...]
   watcheroni exec   [target...] [--on kinds] [--batch] -- command [args...]
   watcheroni watch  [target...]
@@ -75,7 +75,7 @@ async function main(argv: string[]): Promise<number> {
       on: { type: "string" },
       interval: { type: "string", default: "2m" },
       timeout: { type: "string", default: "1h" },
-      settle: { type: "string", default: "20s" },
+      settle: { type: "string", default: "5s" },
       format: { type: "string", default: "text" },
       batch: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
