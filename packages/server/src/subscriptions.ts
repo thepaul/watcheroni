@@ -19,9 +19,12 @@ import {
 } from "./protocol";
 import type { PrBaseline, RepoHub, RepoInfo } from "./repo-hub";
 
-// The App's public page, where a repo owner installs it.
-export const APP_SLUG = "watcheroni";
-export const INSTALL_URL = `${GITHUB_WEB_URL}/apps/${APP_SLUG}/installations/new`;
+// The App's public page, where a repo owner installs it. The slug is the
+// GITHUB_APP_SLUG var, since a self-hosted copy has its own App; undefined
+// if it isn't set.
+export function installUrl(env: Pick<Env, "GITHUB_APP_SLUG">): string | undefined {
+  return env.GITHUB_APP_SLUG ? `${GITHUB_WEB_URL}/apps/${env.GITHUB_APP_SLUG}/installations/new` : undefined;
+}
 
 const REPO_NAME = /^([A-Za-z0-9_.-]{1,100})\/([A-Za-z0-9_.-]{1,100})$/;
 const KIND_PATTERN = /^(\*|[a-z_]+(\.[a-z_]+)*(\.\*)?)$/;
@@ -56,14 +59,14 @@ export async function createSubscription(
   const found = await findInstallation(env, owner, name);
   if (!found.ok) {
     return found.reason === "not_installed"
-      ? notInstalled(parsed.repo)
+      ? notInstalled(env, parsed.repo)
       : unavailable("Couldn't ask GitHub about the repository");
   }
   const installation = installationStub(env, found.id);
   // Spending a call each for the repo and the PR, made with the token.
   const minted = await installation.token(found.id, parsed.pr === undefined ? 1 : 2);
   if (!minted.ok) {
-    if (minted.reason === "not_installed") return notInstalled(parsed.repo);
+    if (minted.reason === "not_installed") return notInstalled(env, parsed.repo);
     if (minted.reason === "rate_limited") {
       return withRetryAfter(problem(429, "rate_limited", "This repository's installation has used its GitHub API budget"), minted.retry_after);
     }
@@ -72,7 +75,7 @@ export async function createSubscription(
 
   const repoRes = await githubGet(minted.token, `/repos/${owner}/${name}`);
   if (!repoRes) return unavailable("Couldn't reach GitHub");
-  if (repoRes.status === 404) return notInstalled(parsed.repo);
+  if (repoRes.status === 404) return notInstalled(env, parsed.repo);
   if (!repoRes.ok) return unavailable(`GitHub answered ${repoRes.status} for the repository`);
   const repoBody = (await repoRes.json()) as { id: number; full_name: string; private: boolean };
   const repo: RepoInfo & { private: boolean } = { id: repoBody.id, full_name: repoBody.full_name, private: !!repoBody.private };
@@ -247,8 +250,9 @@ async function checkPrivateAccess(request: Request, env: Env, accountId: number,
   return null;
 }
 
-function notInstalled(repo: string): Response {
-  return problem(409, "app_not_installed", `The watcheroni App isn't installed on ${repo}`, { install_url: INSTALL_URL });
+function notInstalled(env: Env, repo: string): Response {
+  const url = installUrl(env);
+  return problem(409, "app_not_installed", `The watcheroni App isn't installed on ${repo}`, url ? { install_url: url } : {});
 }
 
 // A GET to GitHub's REST API, or null if GitHub couldn't be reached.
