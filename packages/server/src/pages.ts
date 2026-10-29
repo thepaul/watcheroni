@@ -30,7 +30,7 @@ export function landingPage(installUrl: string): Response {
 <p class="lead">Wait for what happens to your GitHub pull requests: CI finishing or failing, reviews, comments, pushes, merges. Built for scripts and coding agents that open a PR and then need to know when there's something to do about it, without polling GitHub in a loop.</p>
 </header>
 <pre><code>${escape(WAIT_EXAMPLE)}</code></pre>
-<p>Each event comes with the command that fetches its details. <code>wait</code> exits once there's news, so run it again to keep watching.</p>
+<p>Events with more to read come with the command that fetches it. <code>wait</code> exits once there's news, so run it again to keep watching.</p>
 
 <h2>Start</h2>
 <ol class="steps">
@@ -50,7 +50,7 @@ claude plugin install watcheroni@watcheroni</code></pre>
 <h2>What the server keeps</h2>
 <ul>
 <li>The App's permissions are all read-only: metadata, pull requests, issues, checks, commit statuses and actions. No code, no administration, no write access of any kind.</li>
-<li>Your GitHub token is used once, to check who you are when you sign in (and what you can read when you watch a private repository), and then dropped. It is never stored.</li>
+<li>Your GitHub token is only used for checks: who you are when you sign in, and what you can read when you watch a private repository (checked again weekly). It is never stored.</li>
 <li>Webhook payloads are never stored, only the few facts each event needs: what happened, on which pull request, by whom, and links to the details on GitHub.</li>
 <li>Your watcheroni API key is stored only as a hash.</li>
 </ul>
