@@ -65,7 +65,7 @@ describe("diff", () => {
   it("checks: failures, workflow runs and the rollup", () => {
     const prev = snap({ checks: [check("lint"), check("test")] });
     let memory = initialMemory(prev);
-    expect(memory.rollup).toEqual({ head: HEAD1, result: "success" });
+    expect(memory.rollup).toMatchObject({ head: HEAD1, result: "success" });
 
     // A push: the new head's checks start running.
     const pushed = snap({ head: HEAD2, checks: [check("lint", { done: false, conclusion: null }), check("test", { done: false, conclusion: null })] });
@@ -97,6 +97,17 @@ describe("diff", () => {
     r = diff(allDone, rerun, memory);
     expect(kinds(r.events)).toEqual(["checks.completed"]);
     expect(r.events[0].data.result).toBe("success");
+    memory = r.memory;
+
+    // A check that started late finishes: same result, more checks.
+    const late = snap({ head: HEAD2, checks: [...rerun.checks, check("cla", { key: "status:cla", type: "status", checkRunId: null, workflowRunId: null })] });
+    r = diff(rerun, late, memory);
+    expect(kinds(r.events)).toEqual(["checks.completed"]);
+    expect(r.events[0].data).toMatchObject({ result: "success", counts: { success: 3 } });
+    expect(diff(late, { ...late }, r.memory).events).toEqual([]);
+
+    // State saved before `data` was kept: only the result counts.
+    expect(diff(late, { ...late }, { ...r.memory, rollup: { head: HEAD2, result: "success" } }).events).toEqual([]);
   });
 
   it("commit statuses", () => {

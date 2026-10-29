@@ -59,6 +59,10 @@ const FAILED = new Set(["failure", "timed_out", "action_required", "startup_fail
 
 const SCHEMA_VERSION = 4;
 
+// The normaliser's facts about checks, kept even while the repo is
+// throttled.
+const CHECK_FACTS = new Set(["check.started", "check.completed", "check_suite.updated"]);
+
 // A `prs` row someone watches, as opposed to one only remembered.
 const WATCHED = "EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.pr = prs.number)";
 const OPEN = "(state IS NULL OR state = 'open')";
@@ -555,6 +559,13 @@ export class RepoHub extends DurableObject<Env> {
     this.endThrottleIfDue(now, outgoing);
     const free = facts.every((f) => f.kind === "check.started" || f.kind === "check_suite.updated");
     if (!free && (this.throttledUntil() !== null || !take(this.sql, "ingest", REPO_LIMITS.ingest, now))) {
+      // Nothing is delivered, but the checks are still kept, or a run that
+      // finished during the throttle would hold its head's rollup open.
+      const heads = new Set<string>();
+      for (const fact of facts) {
+        if (CHECK_FACTS.has(fact.kind)) this.noteDerived(fact, now, heads, new Set());
+      }
+      this.rollUp(heads, now);
       this.throttle(now, outgoing);
       const ids = this.enqueue(outgoing, now);
       result.events = countItems(outgoing);
@@ -569,10 +580,17 @@ export class RepoHub extends DurableObject<Env> {
     // mergeability from the alarm.
     const events: UnsequencedEvent[] = [];
     const heads = new Set<string>();
+    // Runs this delivery first recorded as finished. GitHub may send a run
+    // created already finished as `created` and `completed`; its
+    // `check.failed` goes out only for the first.
+    const finished = new Set<number>();
     for (const fact of facts) {
       this.updatePr(fact);
-      this.noteDerived(fact, now, heads);
-      if (!INTERNAL_KINDS.has(fact.kind)) events.push(...this.withPrs(fact));
+      this.noteDerived(fact, now, heads, finished);
+      if (INTERNAL_KINDS.has(fact.kind)) continue;
+      const runId = fact.data.check_run_id;
+      if (fact.kind === "check.failed" && typeof runId === "number" && !finished.has(runId)) continue;
+      events.push(...this.withPrs(fact));
     }
     this.rollUp(heads, now);
 
@@ -711,13 +729,14 @@ export class RepoHub extends DurableObject<Env> {
   // Records check facts, adding the SHAs they touched to `heads`, and asks
   // for a mergeability check when a watched PR's head or base moves, or a
   // PR is merged into a watched PR's base.
-  private noteDerived(e: UnsequencedEvent, now: number, heads: Set<string>): void {
+  // `finished` collects the runs recorded as finished for the first time.
+  private noteDerived(e: UnsequencedEvent, now: number, heads: Set<string>, finished: Set<number>): void {
     const watched = () => e.pr !== null && this.sql.exec("SELECT 1 FROM subscriptions WHERE pr = ? LIMIT 1", e.pr).toArray().length > 0;
     switch (e.kind) {
       case "check.started":
       case "check.completed":
       case "check_suite.updated": {
-        const sha = this.recordCheck(e, now);
+        const sha = this.recordCheck(e, now, finished);
         if (sha) heads.add(sha);
         break;
       }
@@ -743,7 +762,7 @@ export class RepoHub extends DurableObject<Env> {
   // Keeps what's known about one check suite, check run or status. Every
   // repo with a subscription keeps them, not only watched heads, since a
   // push's checks can arrive before the push. Returns the SHA.
-  private recordCheck(e: UnsequencedEvent, now: number): string | null {
+  private recordCheck(e: UnsequencedEvent, now: number, finished: Set<number>): string | null {
     const d = e.data;
     const sha = str(d.head_sha);
     if (!sha) return null;
@@ -770,7 +789,8 @@ export class RepoHub extends DurableObject<Env> {
     const runId = num(d.check_run_id);
     if (runId !== null) {
       // A run's completion is final: a late `created` never undoes it.
-      upsert("run", String(runId), done ? "completed" : (str(d.status) ?? "queued"), done ? str(d.conclusion) : null, 0, "checks.status IS NOT 'completed'");
+      const written = upsert("run", String(runId), done ? "completed" : (str(d.status) ?? "queued"), done ? str(d.conclusion) : null, 0, "checks.status IS NOT 'completed'");
+      if (done && written.rowsWritten > 0) finished.add(runId);
       // GitHub tells only the suite's own App that it was requested, so a
       // suite is mostly first seen through its runs. Until its `completed`
       // arrives it may yet start more (jobs that wait on others).
@@ -792,9 +812,9 @@ export class RepoHub extends DurableObject<Env> {
 
   // Works out the rollup for each open watched PR at one of `heads`. One
   // that has finished differently from the last one sent (another result
-  // or other checks, or a new head) is sent from the alarm after
-  // ROLLUP_SETTLE_MS if it's still finished then: checks from other Apps
-  // and suites often appear a little later. One that isn't finished
+  // or other checks, or a new head) is sent from the alarm once it has
+  // stayed finished and unchanged for ROLLUP_SETTLE_MS: checks from other
+  // Apps and suites often appear a little later. One that isn't finished
   // cancels a pending send.
   private rollUp(heads: Set<string>, now: number): void {
     for (const sha of heads) {
@@ -806,7 +826,6 @@ export class RepoHub extends DurableObject<Env> {
       for (const { number } of prs) {
         const row = this.sql.exec<RollupRow>("SELECT * FROM rollups WHERE pr = ?", number).toArray()[0];
         const changed = rollup !== null && (row?.head_sha !== sha || row.fingerprint !== JSON.stringify(rollup));
-        if (changed && row?.settle_at) continue;
         const settleAt = changed ? now + ROLLUP_SETTLE_MS : null;
         if (!row && settleAt === null) continue;
         this.sql.exec(

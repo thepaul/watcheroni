@@ -786,14 +786,22 @@ earlier shape of them under schema 3), fed by internal kinds from
   longer a watched head are pruned a day after RepoHub last heard of
   them (`seen_at`, its own clock). A `pr.pushed` works out the new
   head's rollup straight away.
-- **Sending.** A finished rollup is sent from the alarm 20 seconds after
-  it finishes (`rollups.settle_at`), if it's still finished then; a new
-  check starting meanwhile cancels it. It's sent when it differs from the
+- **Sending.** A finished rollup is sent from the alarm once it has
+  stayed finished and unchanged for 20 seconds (`rollups.settle_at`,
+  moved on by every change); a new check starting meanwhile cancels it. It's sent when it differs from the
   last one sent to that PR (`rollups.head_sha` and `fingerprint`, the
   whole `data`): another result, more checks counted, or a new head,
   including a force-push back to an earlier one, as the CLI does. So a
   quick status that finishes before Actions creates its runs gives an
-  early `checks.completed`, and the full one follows.
+  early `checks.completed`, and the full one follows. The CLI's local
+  mode re-sends on the same changes (`Memory.rollup.data`).
+- **While throttled** nothing is delivered, but check facts are still
+  recorded and rolled up, so a run that finishes during a throttle
+  doesn't hold its head's rollup open.
+- **`check.failed` once per run.** A run created already finished gives
+  `check.completed` and `check.failed` from its `created` webhook; if
+  GitHub also sends `completed` for it, RepoHub delivers `check.failed`
+  only for the delivery that first recorded the run as finished.
 - **Suites are mostly seen through their runs.** GitHub sends
   `check_suite.requested` only to the suite's own App, so the queued,
   never-run suites the rule ignores rarely appear at all. A suite first

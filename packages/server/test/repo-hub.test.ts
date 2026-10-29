@@ -558,6 +558,46 @@ describe("checks.completed", () => {
     ]);
   });
 
+  it("keeps checks that finish while the repo is throttled", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await watch(repo, acct);
+    await hub(repo).ingest("r1", [run(repo, "check.started", 1, "build", { status: "queued" })]);
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("INSERT INTO buckets (name, tokens, updated_at) VALUES ('ingest', 0, ?)", Date.now());
+    });
+    expect(await hub(repo).ingest("r2", [run(repo, "check.completed", 1, "build", { conclusion: "success" })])).toMatchObject({ reason: "throttled" });
+    await hub(repo).ingest("s", [suite(repo, 10, "completed")]);
+    expect(await settle(repo)).toBe(true);
+    expect((await inbox(acct, "i")).map((e) => [e.kind, e.data.result ?? null])).toEqual([["repo.throttled", null], ["checks.completed", "success"]]);
+  });
+
+  it("sends check.failed once for a run created finished and then completed", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "i", pr: 7, kinds: ["check.failed"], baseline: { state: "open", head_sha: SHA_A } });
+    for (const action of ["created", "completed"]) {
+      const payload = example("check_run", action);
+      Object.assign(payload.check_run as object, {
+        id: 701, name: "external", head_sha: SHA_A, status: "completed", conclusion: "failure",
+        pull_requests: [{ number: 7 }], check_suite: { id: 89 }, app: { id: 7 },
+      });
+      await webhook("check_run", payload, repo);
+    }
+    expect((await inbox(acct, "i")).map((e) => [e.kind, e.data.check_run_id])).toEqual([["check.failed", 701]]);
+  });
+
+  it("waits for the rollup to stay unchanged for the whole settle delay", async () => {
+    const repo = fresh();
+    await watch(repo, fresh());
+    const settleAt = async () => (await stats(repo)).rollups[0].settle_at!;
+    await hub(repo).ingest("a", [status(repo, "cla", "success")]);
+    const first = await settleAt();
+    await new Promise((r) => setTimeout(r, 20));
+    await hub(repo).ingest("b", [status(repo, "lint", "success")]);
+    expect(await settleAt()).toBeGreaterThan(first);
+  });
+
   it("doesn't charge deliveries that only start checks to the ingest limit", async () => {
     const repo = fresh();
     await watch(repo, fresh());

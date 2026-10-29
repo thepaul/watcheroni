@@ -485,8 +485,9 @@ thread's first comment to see what the thread is about.
 finished, and again whenever that changes: a re-run changes the result,
 or checks that started late finish (each `checks.completed` covers every
 check seen on the head so far, so the later one supersedes the earlier).
-The server waits about 20 seconds after the checks finish before
-sending it. It is best-effort, because GitHub has no event meaning "all
+The server and the CLI's local mode follow the same rule; the server
+also waits until the checks have stayed finished, unchanged, for about
+20 seconds. It is best-effort, because GitHub has no event meaning "all
 checks are done".
 
 **Mergeability** (derived; no GitHub webhook exists for this):
