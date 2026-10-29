@@ -91,6 +91,12 @@ below).
   environment. An event is acknowledged only when the command exits 0.
   `--batch` runs it once per settled batch, with a JSON array on stdin.
 
+## Recipes
+
+Desktop and phone notifications, Slack, only CI failures, and running
+`exec` as a background service:
+[docs/recipes.md](https://github.com/thepaul/watcheroni/blob/main/docs/recipes.md).
+
 ## Server mode
 
 Sign in, which runs GitHub's device flow and saves an API key in

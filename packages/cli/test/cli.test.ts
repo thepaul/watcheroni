@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { Inbox } from "../src/inbox.ts";
 import { FakeServer } from "./fake-server.ts";
 
 // The CLI in server mode, run as a separate process against the fake
@@ -322,5 +323,46 @@ describe("selfhost", () => {
     const run = cli(["selfhost"]);
     expect(await run.code).toBe(1);
     expect(run.stderr()).toContain("git clone https://github.com/thepaul/watcheroni");
+  });
+});
+
+describe("reading with no server", () => {
+  // As `watcheroni watch` leaves an inbox for a PR that had already ended.
+  function leaveWatchEnded(): void {
+    process.env.WATCHERONI_STATE_DIR = env.WATCHERONI_STATE_DIR;
+    const inbox = Inbox.open("box");
+    inbox.append([{
+      v: 1, id: "local:octo/widgets#7:watch.ended:merged", sub: null, kind: "watch.ended", at: "t", received_at: "t",
+      repo: { id: 1, full_name: "octo/widgets" }, pr: 7, actor: null, data: { reason: "merged" }, links: {},
+    }]);
+    inbox.close();
+  }
+
+  it("runs the command for events left in an inbox that watches nothing, then exits 3", async () => {
+    leaveWatchEnded();
+    const run = cli(["exec", "--", "sh", "-c", 'echo "$WATCHERONI_KIND $WATCHERONI_REPO#$WATCHERONI_PR"'], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(3);
+    expect(run.stdout()).toBe("watch.ended octo/widgets#7\n");
+    expect(run.stderr()).toBe("watcheroni: Not on a git branch; name a PR (owner/repo#123); reading the events left in inbox box\n");
+    expect(Inbox.peek("box").pending).toBe(0);
+  });
+
+  it("doesn't wait on a repository-wide watch, which only a server feeds", async () => {
+    leaveWatchEnded();
+    const inbox = Inbox.open("box");
+    inbox.watchRepo("octo/widgets (pr.opened)", { owner: "octo", name: "widgets", kinds: ["pr.opened"] }, "sub_1");
+    inbox.close();
+    const run = cli(["exec", "--", "sh", "-c", 'echo "$WATCHERONI_KIND"'], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(3);
+    expect(run.stdout()).toBe("watch.ended\n");
+    expect(Inbox.peek("box").pending).toBe(0);
+  });
+
+  it("still needs a PR to watch, whatever the inbox holds", async () => {
+    leaveWatchEnded();
+    const run = cli(["watch"], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(1);
+    expect(run.stderr()).toBe("watcheroni: Not on a git branch; name a PR (owner/repo#123)\n");
+    expect(Inbox.peek("box").pending).toBe(1);
   });
 });

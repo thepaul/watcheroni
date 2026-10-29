@@ -221,6 +221,9 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
   set. Unfiltered repository-wide subscribers on that repo see these
   copies too; otherwise only PRs that have their own subscription get
   one, and a status on no watched PR's head arrives once with `pr` `null`.
+- The derived kinds (`checks.completed`, `merge.conflict`, `merge.clean`)
+  are worked out only for PRs that have a PR subscription of their own, so
+  a repository-wide subscription gets them only for those PRs.
 - `kinds`: event kinds or globs (`review.*`). Leaving it out means every
   kind for PR subscriptions.
 - `ignore.self`: drop events caused by the account's own GitHub user.
@@ -501,9 +504,13 @@ thread's first comment to see what the thread is about.
 
 `check.failed` arrives as soon as one check fails. `checks.completed` is
 **derived**: it's sent when every check on the PR's current head has
-finished, and again if a re-run changes the result. It is best-effort,
-because GitHub has no event meaning "all checks are done": a check that
-starts late can follow it.
+finished, and again whenever that changes: a re-run changes the result,
+or checks that started late finish (each `checks.completed` covers every
+check seen on the head so far, so the later one supersedes the earlier).
+The server and the CLI's local mode follow the same rule; the server
+also waits until the checks have stayed finished, unchanged, for about
+20 seconds. It is best-effort, because GitHub has no event meaning "all
+checks are done".
 
 **Mergeability** (derived; no GitHub webhook exists for this):
 
