@@ -105,9 +105,10 @@ export class Feed {
   // no PR is left. A server inbox may also be fed by subscriptions made
   // elsewhere, which can't be listed yet, so it ends only when this
   // command was watching PRs and they have all ended. A repository-wide
-  // watch has no end of its own.
+  // watch has no end of its own, but only the server feeds it: without
+  // one it leaves nothing to wait for.
   ended(): boolean {
-    if (this.inbox.watched().length || this.inbox.repoWatches().length) return false;
+    if (this.inbox.watched().length || (this.server && this.inbox.repoWatches().length)) return false;
     return this.server ? this.hadTargets : true;
   }
 
