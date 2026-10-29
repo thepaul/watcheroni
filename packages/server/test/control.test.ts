@@ -383,6 +383,56 @@ describe("redelivery when things go wrong", () => {
     expect(gh.redelivered).toEqual([repos.id, other.id]);
   });
 
+  it("doesn't let a redelivered installation event overtake a newer one", async () => {
+    const gh = hooks();
+    const inst = { installation_id: fresh(), event: "installation" };
+    const created = gh.add(503, 20 * 60_000, undefined, undefined, inst);
+    const deleted = gh.add(503, 15 * 60_000, undefined, undefined, inst);
+    // GitHub fails `deleted` once, so `created` is redelivered first.
+    let failed = false;
+    gh.redeliverStatus = (id) => (id === deleted.id && !failed ? ((failed = true), 503) : 202);
+    const stub = control();
+    expect(await stub.redeliver()).toMatchObject({ redelivered: 1, pending: 1 });
+    // The redelivered `created` succeeds with a newer ID than `deleted`.
+    expect(await stub.redeliver()).toMatchObject({ redelivered: 1, pending: 0 });
+    expect(gh.redelivered).toEqual([created.id, deleted.id]);
+  });
+
+  it("stops after two 422s in a row", async () => {
+    const gh = hooks();
+    const failures = Array.from({ length: 4 }, () => gh.add(502));
+    gh.redeliverStatus = () => 422;
+    const stub = control();
+    const run = await stub.redeliver();
+    expect(run).toMatchObject({ redelivered: 0, pending: 4 });
+    expect(run.error).toMatch(/422/);
+    expect((await stub.stats()).attempts.map((a) => a.guid).sort()).toEqual(failures.slice(0, 2).map((d) => d.guid).sort());
+  });
+
+  it("holds an installation's later events back after a 422, keeping them in order", async () => {
+    const gh = hooks();
+    const id = fresh();
+    const repos = gh.add(503, 20 * 60_000, undefined, undefined, { installation_id: id, event: "installation_repositories" });
+    gh.add(503, 15 * 60_000, undefined, undefined, { installation_id: id, event: "installation" });
+    const comment = gh.add(502, 10 * 60_000, undefined, undefined, { installation_id: id });
+    gh.redeliverStatus = (d) => (d === repos.id ? 422 : 202);
+    const stub = control();
+    expect(await stub.redeliver()).toMatchObject({ redelivered: 1, pending: 2 });
+    expect(gh.redelivered).toEqual([comment.id]);
+  });
+
+  it("makes a real run wait for a dry run under way, then run", async () => {
+    const gh = hooks();
+    const d = gh.add(502);
+    gh.delayMs = 50;
+    const stub = control();
+    const [dry, real] = await Promise.all([stub.redeliver({ dryRun: true }), stub.redeliver()]);
+    expect(dry.would_redeliver?.map((r) => r.guid)).toEqual([d.guid]);
+    expect(real).toMatchObject({ redelivered: 1, pending: 0 });
+    expect(gh.redelivered).toEqual([d.id]);
+    expect(gh.calls).toBe(3); // the dry run's list, then the real run's list and redelivery
+  });
+
   it("only dry-runs from the debug route unless told to redeliver to production", async () => {
     const gh = hooks();
     const d = gh.add(502);

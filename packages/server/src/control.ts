@@ -36,6 +36,11 @@ const MAX_AGE_MS = 3 * 24 * 3600_000 - 3600_000;
 // then unsuspend), so an old failed one isn't redelivered after a newer
 // one of the same installation succeeded.
 const STATEFUL_EVENT = "installation";
+// Events whose order matters, kept in order per installation.
+const INSTALLATION_EVENTS = new Set([STATEFUL_EVENT, "installation_repositories"]);
+// 422s in a row that stop a run's redeliveries: GitHub may mean the
+// whole endpoint ("has been spammed"), not one delivery.
+const MAX_422_IN_A_ROW = 2;
 
 // One item of GET /app/hook/deliveries (the fields used here).
 interface HookDelivery {
@@ -92,7 +97,7 @@ const message = (e: unknown) => String(e instanceof Error ? e.message : e);
 
 export class Control extends DurableObject<Env> {
   private readonly sql: SqlStorage;
-  private running: Promise<RedeliveryRun> | null = null;
+  private running: { dryRun: boolean; done: Promise<RedeliveryRun> } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -126,15 +131,22 @@ export class Control extends DurableObject<Env> {
 
   // ---- RPC -----------------------------------------------------------
 
-  // One run of the cron job. Runs don't overlap: a second call while one
-  // is under way gets that run's result. A dry run scans as usual (so the
-  // cursor moves and failures are queued) but redelivers nothing, and
-  // lists what it would have redelivered.
-  redeliver(options: { dryRun?: boolean } = {}): Promise<RedeliveryRun> {
-    this.running ??= this.run(!!options.dryRun).finally(() => {
+  // One run of the cron job. Runs don't overlap: a call while a run of
+  // the same kind is under way gets that run's result, and a call while
+  // one of the other kind is under way waits for it, then runs. A dry run
+  // scans as usual (so the cursor moves and failures are queued) but
+  // redelivers nothing, and lists what it would have redelivered.
+  async redeliver(options: { dryRun?: boolean } = {}): Promise<RedeliveryRun> {
+    const dryRun = !!options.dryRun;
+    while (this.running) {
+      if (this.running.dryRun === dryRun) return this.running.done;
+      await this.running.done.catch(() => {});
+    }
+    const done = this.run(dryRun).finally(() => {
       this.running = null;
     });
-    return this.running;
+    this.running = { dryRun, done };
+    return done;
   }
 
   stats(): ControlStats {
@@ -260,7 +272,9 @@ export class Control extends DurableObject<Env> {
         this.sql.exec("INSERT OR IGNORE INTO scan_ok (guid) VALUES (?)", item.guid);
         this.sql.exec("DELETE FROM queue WHERE guid = ?", item.guid);
       }
-      if (inst) {
+      // Only an original delivery is news: a redelivery has a new ID but
+      // carries an old event, which mustn't overtake newer ones.
+      if (inst && !item.redelivery) {
         this.sql.exec("INSERT OR IGNORE INTO scan_ok (guid) VALUES (?)", inst);
         this.sql.exec("DELETE FROM queue WHERE event = ? AND installation_id = ? AND delivery_id < ?", STATEFUL_EVENT, item.installation_id, item.id);
       }
@@ -287,9 +301,16 @@ export class Control extends DurableObject<Env> {
   // cap. A redelivery GitHub accepts leaves the queue: if it fails too,
   // that shows up as a new failed delivery in a later scan.
   private async redeliverQueued(now: number, headers: Record<string, string>, result: RedeliveryRun): Promise<void> {
+    let refusedInARow = 0;
+    // Installations with an installation event GitHub refused this run:
+    // their later installation events wait, so they stay in order.
+    const held = new Set<number>();
     for (const row of this.due()) {
+      const ordered = INSTALLATION_EVENTS.has(row.event) && row.installation_id !== null;
+      if (ordered && held.has(row.installation_id!)) continue;
       const res = await fetch(`${GITHUB_API_URL}/app/hook/deliveries/${row.delivery_id}/attempts`, { method: "POST", headers });
       await res.body?.cancel();
+      if (res.status !== 422) refusedInARow = 0;
       if (res.ok) {
         result.redelivered++;
         this.attempted(row.guid, now);
@@ -305,12 +326,16 @@ export class Control extends DurableObject<Env> {
       if (res.status === 429) throw new Error(`redelivering ${row.delivery_id}: GitHub answered 429`);
       // A 422 (this one refused) or a 5xx counts as an attempt, so one
       // bad row can't hold up the queue for long. A 422 moves on to the
-      // next row; a 5xx is GitHub in trouble, so the rest wait.
+      // next row, unless it's the second in a row; a 5xx is GitHub in
+      // trouble, so the rest wait.
       if (this.attempted(row.guid, now) >= REDELIVERY_LIMITS.attempts) {
         console.warn(`redelivery of ${row.guid} (${row.delivery_id}) given up: ${res.status}`);
         this.sql.exec("DELETE FROM queue WHERE guid = ?", row.guid);
       }
-      if (res.status === 422) continue;
+      if (res.status === 422 && ++refusedInARow < MAX_422_IN_A_ROW) {
+        if (ordered) held.add(row.installation_id!);
+        continue;
+      }
       throw new Error(`redelivering ${row.delivery_id}: GitHub answered ${res.status}`);
     }
   }

@@ -583,7 +583,9 @@ server can be down without losing events.
   on the test server would redeliver the same failures twice. On the
   test server `POST /debug/control/redeliver` runs the job by hand. It's
   a dry run by default: it scans (moving the cursor and queueing
-  failures) and lists what it would redeliver. Only with
+  failures) and lists what it would redeliver. Calls of the same kind
+  share a run under way; a real run waits for a dry one, and the other
+  way round. Only with
   `?confirm=production` does it redeliver, to the App's webhook URL,
   which is production's. The free plan allows 5 cron triggers an
   account.
@@ -610,8 +612,16 @@ server can be down without losing events.
   GUID, counting ones GitHub refused with a 422 or 5xx, so one bad row
   can't block the queue: a 422 moves on to the next row, a 5xx or 429
   stops the run's redeliveries (a 429 isn't counted), and a 400 or 404
-  drops the GUID. Listing and redelivering fail separately, so a listing
-  error doesn't hold up what's already queued.
+  drops the GUID. Two 422s in a row also stop the run, since GitHub may
+  mean the whole endpoint ("has been spammed"); otherwise one bad
+  stretch could use up every row's attempts in 3 runs. Counting a 5xx
+  is a trade-off: a GitHub outage spends one attempt a run on the row at
+  the head of the queue (and can drop it after 3 runs), but without it a
+  row GitHub always fails on would block the queue for 3 days. After a
+  422 on an `installation` or `installation_repositories` row, that
+  installation's later rows of those events wait for the next run, so
+  they stay in order. Listing and redelivering fail separately, so a
+  listing error doesn't hold up what's already queued.
 - **Installation events.** `Installation.onEvent` doesn't dedupe or
   order events, so a failed `installation` event (say `suspend`)
   redelivered after a newer one for the same installation succeeded
@@ -619,7 +629,8 @@ server can be down without losing events.
   carries `event` and `installation_id`, so a failed `installation`
   delivery isn't queued when the scan has seen a newer successful
   `installation` delivery for that installation, and one already queued
-  is dropped when such a delivery turns up. That holds only within a
+  is dropped when such a delivery turns up. Only original deliveries
+  count as newer: a redelivery has a new ID but carries an old event. That holds only within a
   scan, and a newer one that lands after the old one was redelivered
   can't undo it. `installation_repositories` is still redelivered: the
   list doesn't say which repos an event was about, so a later `added`
