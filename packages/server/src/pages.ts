@@ -21,8 +21,8 @@ octo/widgets#123: 2 new events
 
 octo/widgets#123 is still open. Run \`watcheroni wait\` again to keep watching.`;
 
-// GET /
-export function landingPage(installUrl: string): Response {
+// GET /. The install URL is undefined on a server that has no App yet.
+export function landingPage(installUrl: string | undefined): Response {
   return page(
     "watcheroni: wake up when your pull request needs you",
     `<header>
@@ -34,7 +34,7 @@ export function landingPage(installUrl: string): Response {
 
 <h2>Start</h2>
 <ol class="steps">
-<li><a class="button" href="${escape(installUrl)}">Install the GitHub App</a> on the repositories you want to watch.</li>
+<li>${installUrl ? `<a class="button" href="${escape(installUrl)}">Install the GitHub App</a>` : "Install the GitHub App"} on the repositories you want to watch.</li>
 <li>Sign in from your computer. It shows a code to enter at github.com:
 <pre><code>npx watcheroni login</code></pre></li>
 <li>In a checkout whose branch has an open pull request (or name one, like <code>octo/widgets#123</code>):

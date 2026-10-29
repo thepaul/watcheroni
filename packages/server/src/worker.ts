@@ -72,7 +72,7 @@ export default {
     const route = `${request.method} ${pathname}`;
 
     if (pathname === "/healthz") return new Response("ok");
-    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return landingPage(INSTALL_URL);
+    if (pathname === "/" && (request.method === "GET" || request.method === "HEAD")) return landingPage(installUrl(env));
     if (route === "GET /github/setup") return setupPage(url);
     if (route === "GET /v1/meta") return json(meta(env));
     if (route === "POST /github/webhook") return webhook(request, env);
