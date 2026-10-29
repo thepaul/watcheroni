@@ -1344,7 +1344,9 @@ Setup URLs.
 
 - **Domain and owner** for the hosted copy. The npm name `watcheroni` and
   the GitHub App name `watcheroni` were both free on 2026-10-26; claim them
-  early.
+  early. *Update 2026-10-28:* the `@watcheroni` npm scope is reserved by
+  the project's owner; `watcheroni` itself is still unclaimed until the
+  first publish (RELEASING.md).
 - **Who may watch a public repo?** As designed, anyone signed in can
   subscribe to a public repo that has the App installed. Repo owners might
   want "collaborators only", or to see who is watching. That needs a small
