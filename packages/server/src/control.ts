@@ -53,6 +53,20 @@ const ID_DIGITS = 20;
 const idKey = (id: string) => id.padStart(ID_DIGITS, "0");
 const plainId = (key: string) => key.replace(/^0+(?=\d)/, "");
 
+// Runs `work` with a signal that aborts after `ms`, and clears the timer as
+// soon as it's done. Not AbortSignal.timeout: its timer can't be cleared,
+// and keeps the object's invocation open the whole `ms` (30 s of wall time
+// a run, for a run that takes a second).
+async function timed<T>(ms: number, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new DOMException(`timed out after ${ms} ms`, "TimeoutError")), ms);
+  try {
+    return await work(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // The table layout, bumped to start over when it changes. 2: delivery
 // IDs as text.
 const SCHEMA = "2";
@@ -248,15 +262,21 @@ export class Control extends DurableObject<Env> {
     for (let page = 0; page < REDELIVERY_LIMITS.pages; page++) {
       const saved = this.getMeta("scan_next");
       const url = saved ?? `${GITHUB_API_URL}/app/hook/deliveries?per_page=${PER_PAGE}`;
-      const res = await fetch(url, { headers, signal: AbortSignal.timeout(REDELIVERY_LIMITS.timeoutMs) });
-      if (!res.ok) {
-        await res.body?.cancel();
+      const { status, text, link } = await timed(REDELIVERY_LIMITS.timeoutMs, async (signal) => {
+        const res = await fetch(url, { headers, signal });
+        if (!res.ok) {
+          await res.body?.cancel();
+          return { status: res.status, text: "", link: null };
+        }
+        return { status: res.status, text: await res.text(), link: res.headers.get("Link") };
+      });
+      if (status < 200 || status > 299) {
         // GitHub won't take the saved page link (expired, say): start the
         // scan again from the top. The cursor stays, so nothing is skipped.
-        if (saved !== null && res.status >= 400 && res.status < 500 && res.status !== 429) this.endScan();
-        throw new Error(`listing deliveries: GitHub answered ${res.status}`);
+        if (saved !== null && status >= 400 && status < 500 && status !== 429) this.endScan();
+        throw new Error(`listing deliveries: GitHub answered ${status}`);
       }
-      const items = parseDeliveries(await res.text());
+      const items = parseDeliveries(text);
       result.pages++;
       let top = this.getMeta("scan_top");
       let reached = false;
@@ -275,7 +295,7 @@ export class Control extends DurableObject<Env> {
         result.scanned++;
         if (this.classify(item, id, at)) result.queued++;
       }
-      const next = nextLink(res.headers.get("Link"));
+      const next = nextLink(link);
       if (reached || !next) {
         // The scan is complete: everything up to its top is queued or fine.
         if (top !== null) this.setMeta("cursor", top);
@@ -340,12 +360,15 @@ export class Control extends DurableObject<Env> {
     for (const row of this.due()) {
       const ordered = INSTALLATION_EVENTS.has(row.event) && row.installation_id !== null;
       if (ordered && held.has(row.installation_id!)) continue;
-      const res = await fetch(`${GITHUB_API_URL}/app/hook/deliveries/${plainId(row.delivery_id)}/attempts`, {
-        method: "POST",
-        headers,
-        signal: AbortSignal.timeout(REDELIVERY_LIMITS.timeoutMs),
+      const res = await timed(REDELIVERY_LIMITS.timeoutMs, async (signal) => {
+        const res = await fetch(`${GITHUB_API_URL}/app/hook/deliveries/${plainId(row.delivery_id)}/attempts`, {
+          method: "POST",
+          headers,
+          signal,
+        });
+        await res.body?.cancel();
+        return res;
       });
-      await res.body?.cancel();
       if (res.status !== 422) refusedInARow = 0;
       if (res.ok) {
         result.redelivered++;
