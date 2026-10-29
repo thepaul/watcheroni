@@ -61,6 +61,9 @@ export interface Options {
   appName?: string;
   public: boolean;
   update: boolean;
+  // --trust-worker: after confirming at the terminal, record the Worker's
+  // newest version as selfhost's own.
+  trustWorker?: boolean;
   // CLOUDFLARE_ACCOUNT_ID, which picks the account when there are several.
   accountId?: string;
 }
@@ -105,6 +108,8 @@ export interface Deps {
   deviceFlowEnabled: (clientId: string) => Promise<boolean>;
   // Waits for the person to press Enter.
   pause: (prompt: string) => Promise<void>;
+  // What the person types, or null if there's no terminal to ask at.
+  ask: (prompt: string) => Promise<string | null>;
   readFile: (name: string) => string | null;
   // `secret` files are written with mode 0600.
   writeFile: (name: string, text: string, secret?: boolean) => void;
@@ -208,7 +213,10 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     if (!(await history())?.includes(versionId)) {
       throw new SelfhostFailed(
         `the Worker ${name} on Cloudflare account ${accountId} isn't the one selfhost deployed: its deployment history ` +
-          `doesn't have version ${versionId}. It may have been deleted and made again, or redeployed many times since. ${fix}`,
+          `doesn't have version ${versionId}. Either it was deleted and made again, perhaps by someone else, or ten or more ` +
+          "deployments were made outside selfhost (deploys by hand, secret changes, rollbacks), which pushes the recorded " +
+          "version out of the history Cloudflare shows. If it's yours, `npm run selfhost -- --trust-worker` shows its " +
+          `deployments and records the newest after you confirm. ${fix}`,
       );
     }
   };
@@ -217,9 +225,13 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     if (!versions?.length) throw new SelfhostFailed(`the Worker ${name} has no deployments`);
     return versions[versions.length - 1];
   };
-  const deploy = async () => {
+  // `deployed` records the new version as soon as there is one, before
+  // anything else can fail: the Worker exists from then on.
+  const deploy = async (deployed: (versionId: string) => void) => {
     const { code, output } = await wrangler(["deploy", "-c", CONFIG_FILE]);
     if (code !== 0) throw new SelfhostFailed(`wrangler deploy failed (exit ${code})`);
+    const versionId = /Current Version ID:\s*([0-9a-f-]{36})/i.exec(output)?.[1] ?? (await newestVersion());
+    deployed(versionId);
     const url = deployedUrl(output, name);
     if (!url) {
       throw new SelfhostFailed(
@@ -227,11 +239,28 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
           "open Workers & Pages in the dashboard once to choose a workers.dev subdomain, then run this again.",
       );
     }
-    const versionId = /Current Version ID:\s*([0-9a-f-]{36})/i.exec(output)?.[1] ?? (await newestVersion());
-    return { url, versionId };
+    return url;
   };
   const recordWorker = (versionId: string) =>
     deps.writeFile(WORKER_FILE, `${JSON.stringify({ name, account_id: accountId, version_id: versionId } satisfies WorkerRecord, null, 2)}\n`);
+
+  if (o.trustWorker) {
+    // Only for the Worker these files are about, and only by someone at
+    // the terminal who has seen its deployments.
+    if (!(pending || saved)) throw new SelfhostFailed(`there's no selfhost setup here (${PENDING_FILE} or ${CONFIG_FILE}) to trust a Worker for`);
+    if ((await history()) === null) throw new SelfhostFailed(`there's no Worker called ${name} on Cloudflare account ${accountId}`);
+    print(`The deployments of the Worker ${name} on Cloudflare account ${accountId}:`);
+    await wrangler(["deployments", "list", "--name", name]);
+    print("If any of these weren't made by you or selfhost, stop here.");
+    const answer = await deps.ask(`Type the Worker's name (${name}) to have selfhost treat it as the one it deployed: `);
+    if (answer === null) throw new SelfhostFailed("--trust-worker asks for confirmation, so it needs a terminal");
+    if (answer.trim() !== name) throw new SelfhostFailed("that isn't the Worker's name; nothing changed");
+    const newest = await newestVersion();
+    if (pending) deps.writeFile(PENDING_FILE, JSON.stringify({ ...pending, created: true, version_id: newest }, null, 2), true);
+    else recordWorker(newest);
+    print(`Recorded version ${newest}. Run ${pending ? "npm run selfhost" : "npm run selfhost -- --update"} again.`);
+    return "";
+  }
 
   if (o.update) {
     if (!saved) throw new SelfhostFailed(`there's no finished setup to update (${CONFIG_FILE}); run selfhost without --update first`);
@@ -242,11 +271,10 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
         `${WORKER_FILE} doesn't confirm that ${CONFIG_FILE} is for the Worker selfhost deployed (${name} on account ${accountId}), so it won't deploy`,
       );
     }
-    await confirm(record.version_id, `Check ${CONFIG_FILE}; it won't deploy until that's sorted out.`);
+    await confirm(record.version_id, `Otherwise check ${CONFIG_FILE}; it won't deploy until that's sorted out.`);
     print(`Remaking ${CONFIG_FILE} from wrangler.jsonc and deploying ${name}...`);
     writeConfig(saved);
-    const { url, versionId } = await deploy();
-    recordWorker(versionId);
+    const url = await deploy(recordWorker);
     print(`Deployed ${url}.`);
     return url;
   }
@@ -264,7 +292,7 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
   const saveState = () => deps.writeFile(PENDING_FILE, JSON.stringify(state, null, 2), true);
   if (pending?.created && pending.version_id) {
     state = pending;
-    await confirm(pending.version_id, `If it's yours to remove, delete it; or remove ${PENDING_FILE} and choose another --name.`);
+    await confirm(pending.version_id, `Otherwise remove ${PENDING_FILE} and choose another --name.`);
   } else {
     if ((await history()) !== null) {
       throw new SelfhostFailed(
@@ -280,9 +308,10 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
   }
   print(`Deploying the Worker ${name}, so it has a URL for the App...`);
   writeConfig(state.app ? appVars(state.app) : NO_APP);
-  const { url, versionId: firstVersion } = await deploy();
-  state = { ...state, created: true, version_id: firstVersion };
-  saveState();
+  const url = await deploy((versionId) => {
+    state = { ...state, created: true, version_id: versionId };
+    saveState();
+  });
 
   // 3. The GitHub App.
   if (state.app && state.ticket_key && state.storage_key) {
@@ -320,10 +349,11 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
   // 5. The App's vars, and the real deploy.
   print(`Deploying ${name} with the App's ID, client ID and slug...`);
   writeConfig(appVars(app));
-  const { versionId: lastVersion } = await deploy();
-  state = { ...state, version_id: lastVersion };
-  saveState();
-  recordWorker(lastVersion);
+  await deploy((versionId) => {
+    state = { ...state, version_id: versionId };
+    saveState();
+    recordWorker(versionId);
+  });
 
   // 6. Device flow, which `watcheroni login` uses.
   while (!(await deps.deviceFlowEnabled(app.client_id))) {
@@ -415,6 +445,10 @@ export function dryRunDeps(real: Pick<Deps, "readFile" | "print">): Deps {
       return true;
     },
     pause: async () => {},
+    ask: async (prompt) => {
+      print(`  [dry run] would ask: ${prompt}`);
+      return null;
+    },
     writeFile: (name, text, secret) => {
       if (name === CONFIG_FILE) configName = (JSON.parse(text) as { name: string }).name;
       if (secret) return print(`  [dry run] would save the Worker's name and account${text.includes('"app"') ? ", and the new App's details," : ""} in ${name} (mode 0600) until setup finishes`);
@@ -474,6 +508,14 @@ function realDeps(): Deps {
       await rl.question(prompt);
       rl.close();
     },
+    // Only at a terminal, so a script or a pipe can't answer for someone.
+    ask: async (prompt) => {
+      if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = await rl.question(prompt);
+      rl.close();
+      return answer;
+    },
     readFile: (name) => (existsSync(join(SERVER_DIR, name)) ? readFileSync(join(SERVER_DIR, name), "utf8") : null),
     writeFile: (name, text, secret) => writeFileSync(join(SERVER_DIR, name), text, secret ? { mode: 0o600 } : {}),
     removeFile: (name) => rmSync(join(SERVER_DIR, name), { force: true }),
@@ -520,6 +562,10 @@ Options:
   --public          let anyone install the App (by default only its owner)
   --update          after a git pull: remake wrangler.selfhost.json from
                     wrangler.jsonc and deploy
+  --trust-worker    when selfhost won't touch the Worker because its
+                    deployment history no longer has the version selfhost
+                    recorded: shows the deployments and, once you type the
+                    Worker's name, records the newest (needs a terminal)
   --dry-run         say what it would do, changing nothing
 
 With several Cloudflare accounts, set CLOUDFLARE_ACCOUNT_ID to choose one.
@@ -536,6 +582,7 @@ export async function main(argv: string[]): Promise<number> {
       "app-name": { type: "string" },
       public: { type: "boolean", default: false },
       update: { type: "boolean", default: false },
+      "trust-worker": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -556,6 +603,7 @@ export async function main(argv: string[]): Promise<number> {
       appName: values["app-name"],
       public: values.public,
       update: values.update,
+      trustWorker: values["trust-worker"],
       accountId: process.env.CLOUDFLARE_ACCOUNT_ID || undefined,
     },
     deps,

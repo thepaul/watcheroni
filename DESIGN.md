@@ -1231,7 +1231,12 @@ Worker, account and App; if its first deploy never finished, it checks
 again that no Worker of that name exists. `--update` deploys only if
 `.selfhost-worker.json` matches the configuration's name and account and
 that Worker's history has the recorded version, and records the new one,
-so an edited `wrangler.selfhost.json` can't send it to another Worker. Later runs keep to the Worker and account the
+so an edited `wrangler.selfhost.json` can't send it to another Worker. A
+first deploy that exits 0 is recorded before anything else is checked,
+even its URL. Cloudflare lists only the last ten deployments, so ten made
+outside selfhost (deploys by hand, secret changes, rollbacks) also make
+it refuse; `--trust-worker` shows the deployments and, once the Worker's
+name is typed back at a terminal, records the newest. Later runs keep to the Worker and account the
 first one chose (from that file, or from the configuration once setup
 has finished): a different `--name` or `CLOUDFLARE_ACCOUNT_ID` is
 refused, as is a state file that doesn't name its Worker and account.

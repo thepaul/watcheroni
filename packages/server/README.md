@@ -110,7 +110,17 @@ account unless that file says selfhost made it and the Worker's
 deployment history still has the version selfhost recorded, and later
 runs refuse a different `--name`. `--update` checks the same against
 `.selfhost-worker.json` (gitignored), which records the Worker once
-setup has finished. If GitHub creates the App but the next step fails,
+setup has finished.
+
+Cloudflare shows only a Worker's last ten deployments, and changing a
+secret or rolling back counts as one. After ten or more made outside
+selfhost, the recorded version drops out of that history and selfhost
+refuses to touch the Worker. Running `npm run selfhost -- --update`
+after changing the Worker by hand keeps the record current and avoids
+this. If it happens anyway, `npm run selfhost -- --trust-worker` shows
+the Worker's deployments and, once you type its name back, records the
+newest as selfhost's own. It only works at a terminal, so no script can
+answer for you. If GitHub creates the App but the next step fails,
 the App's key can't be fetched again: delete the App (it says where)
 and run it again.
 

@@ -30,6 +30,8 @@ function fake(
     // The Worker's deployment history on Cloudflare (null: no Worker),
     // shared between runs that pass the same object.
     cloud?: { history: string[] | null };
+    // What's typed at --trust-worker's question; null: no terminal.
+    answer?: string | null;
     deviceFlowAfter?: number;
     accounts?: { id: string; name: string }[];
   } = {},
@@ -74,6 +76,7 @@ function fake(
     },
     deviceFlowEnabled: async () => ++deviceChecks > (o.deviceFlowAfter ?? 0),
     pause: async () => void pauses++,
+    ask: async (prompt) => (printed.push(prompt), o.answer ?? null),
     readFile: (name) => files[name] ?? null,
     writeFile: (name, text) => void (files[name] = text),
     removeFile: (name) => void delete files[name],
@@ -241,6 +244,58 @@ describe("selfhost keeps to one Worker on one account", () => {
       await expect(selfhost(OPTIONS, f.deps)).rejects.toThrow(/isn't the one selfhost deployed/);
       expect(f.wrangler.some((c) => ["deploy", "secret"].includes(c.args[0]))).toBe(false);
     }
+  });
+
+  it("records a first deploy that worked even when its URL can't be found, so a rerun carries on", async () => {
+    const first = fake();
+    const real = first.deps.wrangler;
+    first.deps.wrangler = async (args, o) => {
+      const res = await real(args, o);
+      return args[0] === "deploy" ? { ...res, output: res.output.replace(URL_, "") } : res;
+    };
+    await expect(selfhost(OPTIONS, first.deps)).rejects.toThrow(/workers.dev URL/);
+    expect(JSON.parse(first.files[PENDING_FILE])).toMatchObject({ created: true, version_id: first.cloud.history![0] });
+
+    const second = fake({ cloud: first.cloud, files: { ...first.files } });
+    expect(await selfhost(OPTIONS, second.deps)).toBe(URL_);
+    expect(second.files[PENDING_FILE]).toBeUndefined();
+  });
+
+  it("--trust-worker re-records a Worker whose recorded version has left its history, once its name is typed back", async () => {
+    const cloud = { history: [randomUUID(), randomUUID()] };
+    const pending = state({ created: true, version_id: randomUUID(), app: APP, ticket_key: "t", storage_key: "s" });
+    await expect(selfhost(OPTIONS, fake({ cloud, files: { [PENDING_FILE]: pending } }).deps)).rejects.toThrow(/--trust-worker/);
+
+    // No terminal, or the wrong name: nothing changes.
+    for (const answer of [null, "watcheroni", ""]) {
+      const f = fake({ cloud, answer, files: { [PENDING_FILE]: pending } });
+      await expect(selfhost({ ...OPTIONS, trustWorker: true }, f.deps)).rejects.toThrow(answer === null ? /needs a terminal/ : /nothing changed/);
+      expect(f.files[PENDING_FILE]).toBe(pending);
+    }
+
+    const trust = fake({ cloud, answer: "mine", files: { [PENDING_FILE]: pending } });
+    await selfhost({ ...OPTIONS, trustWorker: true }, trust.deps);
+    // It showed the deployments, and changed nothing on Cloudflare.
+    expect(trust.wrangler.map((c) => c.args.join(" "))).toContain("deployments list --name mine");
+    expect(trust.wrangler.some((c) => ["deploy", "secret"].includes(c.args[0]))).toBe(false);
+    expect(JSON.parse(trust.files[PENDING_FILE]).version_id).toBe(cloud.history[1]);
+
+    const rerun = fake({ cloud, files: { ...trust.files } });
+    expect(await selfhost(OPTIONS, rerun.deps)).toBe(URL_);
+  });
+
+  it("--trust-worker works for --update too", async () => {
+    const done = fake();
+    await selfhost(OPTIONS, done.deps);
+    // Ten deployments by hand push the recorded one out.
+    done.cloud.history = Array.from({ length: 10 }, () => randomUUID());
+    const files = { [CONFIG_FILE]: done.files[CONFIG_FILE], [WORKER_FILE]: done.files[WORKER_FILE] };
+    await expect(selfhost({ ...OPTIONS, update: true }, fake({ cloud: done.cloud, files }).deps)).rejects.toThrow(/ten or more/);
+
+    const trust = fake({ cloud: done.cloud, answer: "watcheroni", files: { ...files } });
+    await selfhost({ ...OPTIONS, trustWorker: true }, trust.deps);
+    expect(JSON.parse(trust.files[WORKER_FILE]).version_id).toBe(done.cloud.history.at(-1));
+    await selfhost({ ...OPTIONS, update: true }, fake({ cloud: done.cloud, files: { ...trust.files } }).deps);
   });
 
   it("refuses a --name that differs from the resume file or the configuration", async () => {
