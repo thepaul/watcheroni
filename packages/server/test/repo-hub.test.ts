@@ -587,6 +587,50 @@ describe("checks.completed", () => {
     expect((await inbox(acct, "i")).map((e) => [e.kind, e.data.check_run_id])).toEqual([["check.failed", 701]]);
   });
 
+  it("takes a run completed again with a new conclusion, and ignores the same one", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await subscribe(repo, { account: acct, inbox: "i", pr: 7, kinds: ["check.failed", "checks.completed"], baseline: { state: "open", head_sha: SHA_A } });
+    const completed = (conclusion: string) => {
+      const payload = example("check_run", "completed");
+      Object.assign(payload.check_run as object, {
+        id: 801, name: "external", head_sha: SHA_A, status: "completed", conclusion,
+        pull_requests: [{ number: 7 }], check_suite: { id: 90 }, app: { id: 7 },
+      });
+      return payload;
+    };
+    const suiteDone = { ...fact(repo, "check_suite.updated", null, { head_sha: SHA_A, suite_id: 90, status: "completed", conclusion: "success" }), at: "2099-01-01T00:00:00Z" };
+    await webhook("check_run", completed("success"), repo);
+    await hub(repo).ingest("s", [suiteDone]);
+    expect(await settle(repo)).toBe(true);
+    // The App changes its mind; then says the same again.
+    await webhook("check_run", completed("failure"), repo);
+    await webhook("check_run", completed("failure"), repo);
+    expect(await settle(repo)).toBe(true);
+    expect((await inbox(acct, "i")).map((e) => [e.kind, e.data.result ?? e.data.conclusion])).toEqual([
+      ["checks.completed", "success"],
+      ["check.failed", "failure"],
+      ["checks.completed", "failure"],
+    ]);
+  });
+
+  it("follows a push made while the repo is throttled", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    await watch(repo, acct, SHA_B);
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("INSERT INTO buckets (name, tokens, updated_at) VALUES ('ingest', 0, ?)", Date.now());
+    });
+    expect(await hub(repo).ingest("push", [fact(repo, "pr.pushed", 7, { before: SHA_B, after: SHA_A })])).toMatchObject({ reason: "throttled" });
+    expect((await stats(repo)).prs).toMatchObject([{ number: 7, head_sha: SHA_A }]);
+    await hub(repo).ingest("r1", [run(repo, "check.started", 1, "build", { status: "queued" })]);
+    await hub(repo).ingest("r2", [run(repo, "check.completed", 1, "build", { conclusion: "success" })]);
+    await hub(repo).ingest("s", [suite(repo, 10, "completed")]);
+    expect(await settle(repo)).toBe(true);
+    // The settled rollup comes from the alarm, throttle or not.
+    expect((await inbox(acct, "i")).map((e) => [e.kind, e.data.head_sha ?? null])).toEqual([["repo.throttled", null], ["checks.completed", SHA_A]]);
+  });
+
   it("waits for the rollup to stay unchanged for the whole settle delay", async () => {
     const repo = fresh();
     await watch(repo, fresh());
