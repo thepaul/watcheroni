@@ -4,5 +4,5 @@
     "moduleResolution": "bundler",
     "types": ["@cloudflare/vitest-plugin/types"]
   },
-  "include": ["./**/*.ts", "../src/worker-configuration.d.ts"]
+  "include": ["./**/*.ts", "../src/worker-configuration.d.ts", "../src/assets.d.ts"]
 }

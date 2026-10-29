@@ -6,6 +6,12 @@
   // request.signal lets the long-poll bridge notice a client hanging up.
   "compatibility_flags": ["enable_request_signal"],
   "observability": { "enabled": true },
+  // The logo and favicons (src/images.ts): SVGs as strings, the rest as
+  // ArrayBuffers.
+  "rules": [
+    { "type": "Text", "globs": ["**/*.svg"], "fallthrough": true },
+    { "type": "Data", "globs": ["**/*.png", "**/*.ico"], "fallthrough": true }
+  ],
   "durable_objects": {
     "bindings": [
       { "name": "ACCOUNT", "class_name": "Account" },

@@ -146,6 +146,25 @@ describe("meta", () => {
     expect(await landingPage(undefined).text()).not.toContain("/installations/new");
   });
 
+  it("serves the logo and favicons the pages link to", async () => {
+    const html = await (await call("/")).text();
+    for (const [path, type] of [
+      ["/favicon.ico", "image/x-icon"],
+      ["/favicon.svg", "image/svg+xml"],
+      ["/apple-touch-icon.png", "image/png"],
+      ["/logo.svg", "image/svg+xml"],
+      ["/logo-dark.svg", "image/svg+xml"],
+    ]) {
+      expect(html).toMatch(new RegExp(`(href|src|srcset)="${path}"`));
+      const res = await call(path);
+      expect(res.status).toBe(200);
+      expect(res.headers.get("content-type")).toBe(type);
+      expect((await res.arrayBuffer()).byteLength).toBeGreaterThan(500);
+    }
+    expect(await (await call("/logo.svg")).text()).toMatch(/^<svg /);
+    expect((await call("/favicon.ico", { method: "HEAD" })).status).toBe(200);
+  });
+
   it("has a page for GitHub to send people to after installing", async () => {
     const res = await call("/github/setup?installation_id=1&setup_action=install");
     expect(res.status).toBe(200);

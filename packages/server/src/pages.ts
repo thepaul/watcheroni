@@ -1,7 +1,8 @@
 // The server's two HTML pages: the landing page at GET / and the App's
 // Setup URL at GET /github/setup. Inline HTML and CSS, light and dark from
 // the browser's setting, no scripts, cookies or anything from another
-// host (the Content-Security-Policy says so). The install URL comes from
+// host (the Content-Security-Policy says so; the logo and favicons are
+// the Worker's own, from images.ts). The install URL comes from
 // the caller, so these don't decide which App they point at.
 
 const REPO_URL = "https://github.com/thepaul/watcheroni";
@@ -27,6 +28,7 @@ export function landingPage(installUrl: string | undefined): Response {
   return page(
     "watcheroni: wake up when your pull request needs you",
     `<header>
+${LOGO}
 <h1>watcheroni</h1>
 <p class="lead">Wait for what happens to your GitHub pull requests: CI finishing or failing, reviews, comments, pushes, merges. Built for scripts and coding agents that open a PR and then need to know when there's something to do about it, without polling GitHub in a loop.</p>
 </header>
@@ -81,6 +83,7 @@ export function setupPage(url: URL): Response {
   return page(
     "watcheroni",
     `<header>
+${LOGO}
 <h1>${heading}</h1>
 <p class="lead">${lead}</p>
 </header>
@@ -94,6 +97,12 @@ export function setupPage(url: URL): Response {
   );
 }
 
+// The meerkat, with a ringed version that stands out on a dark page.
+const LOGO = `<picture class="logo">
+<source srcset="/logo-dark.svg" media="(prefers-color-scheme: dark)">
+<img src="/logo.svg" alt="" width="96" height="96">
+</picture>`;
+
 function page(title: string, body: string): Response {
   const html = `<!doctype html>
 <html lang="en">
@@ -102,6 +111,9 @@ function page(title: string, body: string): Response {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>${escape(title)}</title>
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <style>${STYLE}</style>
 </head>
 <body>
@@ -114,7 +126,7 @@ ${body}
   return new Response(html, {
     headers: {
       "content-type": "text/html; charset=utf-8",
-      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      "content-security-policy": "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       "referrer-policy": "no-referrer",
       "x-content-type-options": "nosniff",
       "cache-control": "public, max-age=300",
@@ -128,6 +140,7 @@ const STYLE = `
   * { box-sizing: border-box; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-text-size-adjust: 100%; }
   main { max-width: 44rem; margin: 0 auto; padding: 2.5rem 16px 4rem; }
+  .logo img { display: block; margin-bottom: 1rem; }
   h1 { font-size: 2rem; margin: 0 0 .5rem; letter-spacing: -.01em; }
   h2 { font-size: 1.2rem; margin: 2.5rem 0 .75rem; padding-top: 1.5rem; border-top: 1px solid var(--border); }
   .lead { font-size: 1.1rem; margin-top: 0; }
