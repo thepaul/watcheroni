@@ -9,7 +9,7 @@ import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { UsageError, parseTarget, targetKey } from "../src/targets.ts";
-import { alice, check, snap } from "./fixtures.ts";
+import { alice, bob, check, snap } from "./fixtures.ts";
 
 let n = 0;
 beforeEach(() => {
@@ -125,7 +125,7 @@ describe("text output", () => {
     const before = snap({ checks: [check("lint", { done: false, conclusion: null })] });
     const after = snap({
       checks: [check("lint", { conclusion: "failure" })],
-      reviews: [{ id: 10, state: "CHANGES_REQUESTED", at: "t", url: "u", author: alice }],
+      reviews: [{ id: 10, state: "CHANGES_REQUESTED", empty: false, at: "t", url: "u", author: alice }],
       reviewComments: [
         { id: 20, reviewId: 10, inReplyTo: null, path: "a.ts", line: 3, at: "t", url: "u", author: alice },
         { id: 21, reviewId: 10, inReplyTo: null, path: "b.ts", line: null, at: "t", url: "u", author: alice },
@@ -137,15 +137,71 @@ describe("text output", () => {
     expect(formatText(events, ["octo/widgets#7"])).toBe([
       "octo/widgets#7: 6 new events",
       "- review.submitted by alice: changes_requested",
-      "  gh api repos/octo/widgets/pulls/7/reviews/10",
+      "  gh api repos/octo/widgets/pulls/7/reviews/10 --jq '.state, .body'",
       "- 2 review comments by alice on a.ts:3, b.ts",
-      "  gh api repos/octo/widgets/pulls/7/reviews/10/comments",
+      "  gh api repos/octo/widgets/pulls/7/comments --paginate --jq '.[] | select(.pull_request_review_id == 10) | \"\\(.path)\\(.line // .original_line | if . then \":\\(.)\" else \"\" end) \\(.body)\"'",
       "- check.failed: \"lint\" (failure) on 1111111",
       "  gh run view 500 -R octo/widgets --log-failed",
       "- workflow.completed: \"CI\" failure",
       "  gh run view 500 -R octo/widgets --log-failed",
       "- checks.completed on 1111111: failure; failed: lint",
       "  gh pr checks 7 -R octo/widgets",
+      "",
+      "octo/widgets#7 is still open. Run `watcheroni wait` again to keep watching.",
+    ].join("\n"));
+    inbox.close();
+  });
+
+  it("prints a reply once, and says which thread was resolved", async () => {
+    const inbox = open();
+    const target = { owner: "octo", name: "widgets", number: 7 };
+    inbox.watch(targetKey(target), target);
+    const comment = { id: 20, reviewId: 10, inReplyTo: null, path: "a.ts", line: 3, at: "t", url: "u", author: alice };
+    const thread = { id: "T1", resolved: false, path: "a.ts", line: 3, commentId: 20 };
+    const before = snap({
+      reviews: [{ id: 10, state: "COMMENTED", empty: false, at: "t", url: "u", author: alice }],
+      reviewComments: [comment],
+      threads: [thread],
+    });
+    // GitHub models the reply as a review with no text holding one comment.
+    const after = snap({
+      reviews: [...before.reviews, { id: 11, state: "COMMENTED", empty: true, at: "t", url: "u", author: bob }],
+      reviewComments: [comment, { ...comment, id: 21, reviewId: 11, inReplyTo: 20, author: bob }],
+      threads: [{ ...thread, resolved: true }],
+    });
+    const list = [before, after];
+    await pollOnce(inbox, () => {}, async () => list.shift()!);
+    const events = await pollOnce(inbox, () => {}, async () => list.shift()!);
+    expect(formatText(events, ["octo/widgets#7"])).toBe([
+      "octo/widgets#7: 3 new events",
+      "- review_comment.created by bob on a.ts:3 (a reply)",
+      "  gh api repos/octo/widgets/pulls/comments/21 --jq .body",
+      "- thread.resolved on a.ts:3",
+      "  gh api repos/octo/widgets/pulls/comments/20 --jq .body",
+      "",
+      "octo/widgets#7 is still open. Run `watcheroni wait` again to keep watching.",
+    ].join("\n"));
+    inbox.close();
+  });
+
+  it("keeps a \"commented\" review with no text when its comments are new, not replies", async () => {
+    const inbox = open();
+    const target = { owner: "octo", name: "widgets", number: 7 };
+    inbox.watch(targetKey(target), target);
+    // "Start a review", one inline comment, submitted with no summary.
+    const after = snap({
+      reviews: [{ id: 10, state: "COMMENTED", empty: true, at: "t", url: "u", author: alice }],
+      reviewComments: [{ id: 20, reviewId: 10, inReplyTo: null, path: "a.ts", line: 3, at: "t", url: "u", author: alice }],
+    });
+    const list = [snap(), after];
+    await pollOnce(inbox, () => {}, async () => list.shift()!);
+    const events = await pollOnce(inbox, () => {}, async () => list.shift()!);
+    expect(formatText(events, ["octo/widgets#7"])).toBe([
+      "octo/widgets#7: 2 new events",
+      "- review.submitted by alice: commented",
+      "  gh api repos/octo/widgets/pulls/7/reviews/10 --jq '.state, .body'",
+      "- review_comment.created by alice on a.ts:3",
+      "  gh api repos/octo/widgets/pulls/comments/20 --jq .body",
       "",
       "octo/widgets#7 is still open. Run `watcheroni wait` again to keep watching.",
     ].join("\n"));

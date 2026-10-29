@@ -3,6 +3,7 @@ import type { Check, Snapshot } from "../src/snapshot.ts";
 export const HEAD1 = "1".repeat(40);
 export const HEAD2 = "2".repeat(40);
 export const alice = { id: 1, login: "alice", bot: false };
+export const bob = { id: 2, login: "bob", bot: false };
 
 export function snap(over: Partial<Snapshot> = {}): Snapshot {
   return {
