@@ -3,21 +3,34 @@ import { LoginNeeded, graphql } from "./github.ts";
 
 export interface Target { owner: string; name: string; number: number }
 
+// A whole repository, watched on the server only: local mode would have to
+// poll every PR in it. `kinds` is required; `base` and `author` narrow it
+// to PRs targeting that branch or opened by that login.
+export interface RepoTarget { owner: string; name: string; kinds: string[]; base?: string; author?: string }
+
 export const targetKey = (t: Target) => `${t.owner}/${t.name}#${t.number}`;
+
+// `octo/widgets (pr.opened; base main; author paul)`: names the watch, and
+// tells apart watches on one repo with different filters.
+export const repoKey = (t: RepoTarget) =>
+  `${t.owner}/${t.name} (${[t.kinds.join(","), t.base && `base ${t.base}`, t.author && `author ${t.author}`].filter(Boolean).join("; ")})`;
+
+export const isPr = <T extends { owner: string; name: string }>(t: T | Target): t is Target => "number" in t;
+
+export const anyKey = (t: Target | RepoTarget) => (isPr(t) ? targetKey(t) : repoKey(t));
 
 export class UsageError extends Error {}
 
-// `owner/repo#123` or a PR URL. Repository-wide targets (`owner/repo`)
-// need the server, which local mode doesn't have.
-export function parseTarget(arg: string): Target {
+// `owner/repo#123`, a PR URL, or `owner/repo` for the whole repository
+// (which only the server can watch; the caller adds the filters).
+export function parseTarget(arg: string): Target | { owner: string; name: string } {
   const short = arg.match(/^([\w.-]+)\/([\w.-]+)#(\d+)$/);
   const url = arg.match(/^https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)(?:[/?#].*)?$/);
   const m = short ?? url;
   if (m) return { owner: m[1], name: m[2], number: Number(m[3]) };
-  if (/^[\w.-]+\/[\w.-]+$/.test(arg)) {
-    throw new UsageError(`${arg}: watching a whole repository needs the watcheroni server; name a PR (${arg}#123)`);
-  }
-  throw new UsageError(`${arg}: expected owner/repo#123 or a pull request URL`);
+  const repo = arg.match(/^([\w.-]+)\/([\w.-]+)$/) ?? arg.match(/^https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)\/?$/);
+  if (repo) return { owner: repo[1], name: repo[2] };
+  throw new UsageError(`${arg}: expected owner/repo#123, a pull request URL, or owner/repo`);
 }
 
 // GitHub repositories named by this checkout's remotes, upstream first,

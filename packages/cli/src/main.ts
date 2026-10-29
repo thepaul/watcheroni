@@ -9,7 +9,7 @@ import { Inbox, InboxBusy } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
 import { RENEW_EVERY_MS, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "./server.ts";
-import { UsageError, currentBranchPr, parseTarget, targetKey } from "./targets.ts";
+import { UsageError, currentBranchPr, isPr, parseTarget, repoKey, targetKey, type RepoTarget, type Target } from "./targets.ts";
 
 // Exit codes (DESIGN.md, "The CLI").
 const EXIT = { events: 0, error: 1, timeout: 2, ended: 3, login: 4 } as const;
@@ -26,16 +26,20 @@ Usage:
   watcheroni login | logout   sign in to the server ($WATCHERONI_SERVER)
 
 Targets are owner/repo#123 or a pull request URL. With none, the open PR
-for the current git branch.
+for the current git branch. owner/repo watches the whole repository, with
+the server only, and needs --kinds.
 
 Options:
   --inbox NAME      which inbox to use (default: $WATCHERONI_INBOX, or
                     cc-$CLAUDE_CODE_SESSION_ID in Claude Code, or "default")
   --kinds LIST      only these kinds, e.g. check.*,review.submitted
+  --base BRANCH     owner/repo targets: only PRs against this branch
+  --author LOGIN    owner/repo targets: only PRs opened by this GitHub user
   --interval TIME   how often to poll GitHub (default 2m, at least 10s)
 
 wait exits 0 after printing events, 2 on timeout, 3 when every watched PR
-has ended, 4 when GitHub credentials are missing, 1 on other errors.
+has ended (never while a whole repository is watched), 4 when GitHub
+credentials are missing, 1 on other errors.
 
 With a server ($WATCHERONI_SERVER and $WATCHERONI_API_KEY, or
 ~/.config/watcheroni), wait, stream and exec read the inbox on the server.
@@ -62,6 +66,8 @@ async function main(argv: string[]): Promise<number> {
     options: {
       inbox: { type: "string" },
       kinds: { type: "string" },
+      base: { type: "string" },
+      author: { type: "string" },
       on: { type: "string" },
       interval: { type: "string", default: "2m" },
       timeout: { type: "string", default: "1h" },
@@ -90,9 +96,10 @@ async function main(argv: string[]): Promise<number> {
   if (verb === "logout") return (await logout(), 0);
 
   if (verb === "ls") {
-    const { watched, pending } = Inbox.peek(inboxName);
-    if (!watched.length) process.stdout.write(`Inbox ${inboxName} is watching nothing.\n`);
+    const { watched, repos, pending } = Inbox.peek(inboxName);
+    if (!watched.length && !repos.length) process.stdout.write(`Inbox ${inboxName} is watching nothing.\n`);
     for (const w of watched) process.stdout.write(`${targetKey(w.target)}  since ${w.addedAt}\n`);
+    for (const r of repos) process.stdout.write(`${repoKey(r.target)}  since ${r.addedAt}\n`);
     if (pending) process.stdout.write(`${pending} event(s) not yet read.\n`);
     return 0;
   }
@@ -106,19 +113,46 @@ async function main(argv: string[]): Promise<number> {
   if (opts.format !== "text" && opts.format !== "json") throw new UsageError("--format is text or json");
 
   const config = loadServer();
+  const parsed = args.map(parseTarget);
+  const targets: Target[] = parsed.filter(isPr);
+  const repoTargets: RepoTarget[] = parsed.filter((t) => !isPr(t)).map((t) => ({
+    ...t,
+    kinds,
+    ...(opts.base ? { base: opts.base } : {}),
+    ...(opts.author ? { author: opts.author } : {}),
+  }));
+  if ((opts.base || opts.author) && !repoTargets.length) throw new UsageError("--base and --author are for whole-repository targets (owner/repo)");
+  if (verb !== "unwatch") {
+    for (const t of repoTargets) {
+      const repo = `${t.owner}/${t.name}`;
+      if (!config) {
+        throw new UsageError(`${repo}: watching a whole repository needs the watcheroni server (see \`watcheroni login\`); from this machine it would mean polling every PR in it. Name a PR instead (${repo}#123)`);
+      }
+      if (!kinds.length) throw new UsageError(`${repo}: watching a whole repository needs --kinds, e.g. --kinds pr.opened`);
+    }
+  }
   const inbox = Inbox.open(inboxName);
-  const targets = args.map(parseTarget);
+  const client = config && new ServerClient(config);
 
   if (verb === "unwatch") {
-    if (!targets.length) throw new UsageError("unwatch needs a target");
+    if (!parsed.length) throw new UsageError("unwatch needs a target");
     for (const t of targets) {
       if (!inbox.unwatch(targetKey(t))) log(`${targetKey(t)} wasn't being watched in inbox ${inboxName}`);
+    }
+    // A repository-wide watch is only on the server, so it's ended there.
+    for (const t of repoTargets) {
+      const gone = inbox.unwatchRepo(t.owner, t.name);
+      if (!gone.length) log(`${t.owner}/${t.name} wasn't being watched as a whole in inbox ${inboxName}`);
+      for (const r of gone) {
+        await client?.request("DELETE", `/v1/inboxes/${inboxName}/subscriptions/${r.sub}`).catch((e: unknown) => {
+          if (!(e instanceof ServerError && e.status === 404)) log(`couldn't end the server's watch on ${repoKey(r.target)}: ${(e as Error).message}`);
+        });
+      }
     }
     return 0;
   }
 
   // With a server: make sure the inbox exists, which also checks the key.
-  const client = config && new ServerClient(config);
   let reachable = false;
   if (client) {
     try {
@@ -126,11 +160,23 @@ async function main(argv: string[]): Promise<number> {
       reachable = true;
     } catch (e) {
       if (!(e instanceof Unreachable)) throw e;
+      if (repoTargets.length) throw new Unreachable(`${e.message}; a whole repository can only be watched by the server`);
       log(`${e.message}; polling GitHub from this machine instead`);
     }
   }
 
-  if (!targets.length) {
+  // Whole repositories: subscribed on the server, or not at all.
+  for (const t of client && reachable ? repoTargets : []) {
+    const key = repoKey(t);
+    const known = inbox.repoWatches().find((r) => repoKey(r.target) === key);
+    if (known) continue;
+    const sub = await subscribe(client!, inboxName, t, { log, githubToken: () => githubTokenFor(client!.url) });
+    if (!sub) throw new ServerError(`can't watch ${key}: the server won't, and a whole repository can't be watched from this machine`, 0, "refused");
+    inbox.watchRepo(key, t, sub);
+    log(`watching ${key} in inbox ${inboxName}`);
+  }
+
+  if (!targets.length && !repoTargets.length) {
     try {
       targets.push(await currentBranchPr());
     } catch (e) {
