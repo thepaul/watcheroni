@@ -412,9 +412,13 @@ export class ServerReader {
           this.o.log(`${this.client.url}: ${msg.code}${msg.detail ? `: ${msg.detail}` : ""}`);
         }
       });
+      const onAbort = () => {
+        if (ws.readyState === WebSocket.CONNECTING) ws.close();
+      };
       const finish = (code: number, reason: string) => {
         clearTimeout(connectTimer);
         clearInterval(pinger);
+        this.abort.signal.removeEventListener("abort", onAbort);
         if (this.ws === ws) this.ws = null;
         resolve({ opened, code, reason });
       };
@@ -425,9 +429,7 @@ export class ServerReader {
       ws.addEventListener("error", () => {
         if (!opened) finish(1006, "");
       });
-      this.abort.signal.addEventListener("abort", () => {
-        if (ws.readyState === WebSocket.CONNECTING) ws.close();
-      });
+      this.abort.signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
