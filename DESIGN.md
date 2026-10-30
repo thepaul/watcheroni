@@ -897,8 +897,8 @@ repos, and the App installed on repos producing 5,000 webhooks a day.
 | Deliveries to accounts (~1,000 matching events) | | ~1,000 |
 | Client wake-ups: 100 PRs × ~20 a day × (ticket + connect) | 4,000 | 4,000 |
 | Subscribes, acks, reads, verifies | ~2,000 | ~3,000 |
-| Mergeability and cron jobs | ~1,000 | ~2,000 |
-| **Total a day** | **~12,000** | **~15,000** |
+| Cron jobs | ~1,000 | ~1,000 |
+| **Total a day** | **~12,000** | **~14,000** |
 
 That's about 15% of each free allowance. Keepalive pings cost nothing,
 and duration stays small because nothing waits in an object while awake.

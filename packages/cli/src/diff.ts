@@ -120,7 +120,9 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
     else data.status_context = c.name;
     if (c.workflowRunId !== null) data.workflow_run_id = c.workflowRunId;
     const opts = { at: c.at, html: c.url, api: c.checkRunId !== null ? `${api}/check-runs/${c.checkRunId}` : undefined };
-    const discriminator = `${next.head}:${c.key}:${c.conclusion}`;
+    // A commit status set again, even to the same state, is a new status
+    // (as on the server), so its time tells the two apart.
+    const discriminator = `${next.head}:${c.key}:${c.conclusion}${c.checkRunId === null ? `:${c.at}` : ""}`;
     emit("check.completed", discriminator, data, opts);
     if (isFailed(c)) emit("check.failed", discriminator, data, opts);
   }

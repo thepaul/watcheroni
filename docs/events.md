@@ -299,7 +299,8 @@ sent again. A commit status is sent each time it's set.
 **Local mode:** a check on the PR's head commit that is finished now and
 wasn't at the last poll, or has another conclusion than it had. After a
 push every finished check on the new head counts. A commit status set
-again to the same state isn't seen.
+again is sent again if a poll sees it pending in between, or finished with
+a newer time.
 
 ### `check.failed`
 

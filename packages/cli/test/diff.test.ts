@@ -116,6 +116,15 @@ describe("diff", () => {
     expect(events[0].links).toEqual({ html: "https://ci.example/1" });
   });
 
+  it("a commit status set again to the same state is a new event", () => {
+    const status = (o: Partial<Parameters<typeof check>[1]>) =>
+      snap({ checks: [check("ci/x", { type: "status", key: "status:ci/x", checkRunId: null, workflowRunId: null, conclusion: "success", ...o })] });
+    const first = diff(status({ done: false, conclusion: null }), status({ at: "2026-10-30T01:00:00Z" }));
+    const again = diff(status({ done: false, conclusion: null }), status({ at: "2026-10-30T02:00:00Z" }));
+    expect(kinds(again)).toEqual(["check.completed"]);
+    expect(again[0].id).not.toBe(first[0].id);
+  });
+
   it("ends with the PR", () => {
     const open = snap();
     const merged = snap({ state: "MERGED", mergeSha: "m".repeat(40), comments: [{ id: 1, at: "t", url: "u", author: alice }] });
