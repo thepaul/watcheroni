@@ -103,7 +103,9 @@ export class FakeServer {
   readonly verifiedUntil = new Map<string, string>();
   readonly verified: { id: string; githubToken: string | null }[] = [];
   // What POST /v1/github/refresh answers, and the refresh tokens it saw.
+  // With refreshLimited, it's the server's own 429 instead.
   refreshAnswer: Record<string, unknown> = { error: "bad_refresh_token" };
+  refreshLimited = false;
   readonly refreshed: string[] = [];
   private http: Server | null = null;
   private waiting = new Set<() => void>();
@@ -216,7 +218,8 @@ export class FakeServer {
     };
     if (req.method === "POST" && url.pathname === "/v1/github/refresh") {
       this.refreshed.push((await readBody<{ refresh_token: string }>()).refresh_token);
-      return json(200, this.refreshAnswer);
+      if (this.refreshLimited) res.setHeader("Retry-After", "60");
+      return this.refreshLimited ? json(429, { status: 429, code: "rate_limited" }) : json(200, this.refreshAnswer);
     }
     if (!this.authorized(req)) return json(401, { status: 401, code: "unauthorized" });
     const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?(?:\/([^/]+)(\/[a-z]+)?)?$/);

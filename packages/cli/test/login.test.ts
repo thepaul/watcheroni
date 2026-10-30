@@ -12,8 +12,9 @@ beforeEach(() => {
   process.env.WATCHERONI_CREDENTIALS = join(mkdtempSync(join(tmpdir(), "watcheroni-cred-")), "credentials.json");
 });
 
-// A fake server and GitHub. `answers` are what the token endpoint says, in turn.
-function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = true) {
+// A fake server and GitHub. `answers` are what the token endpoint says, in
+// turn, and `loginStatus` what /v1/login answers (one status, or one per call).
+function fake(answers: Record<string, unknown>[], loginStatus: number | number[] = 200, canOpen = true) {
   const calls: { url: string; body: unknown; auth: string | null }[] = [];
   const opened: string[] = [];
   const printed: string[] = [];
@@ -34,10 +35,15 @@ function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = t
           return Response.json({ device_code: "dc", user_code: "ABCD-1234", verification_uri: `${GITHUB}/login/device`, expires_in: 900, interval: 5 });
         case `${GITHUB}/login/oauth/access_token`:
           return Response.json(answers.shift());
-        case `${SERVER}/v1/login`:
-          return loginStatus === 200
+        case `${SERVER}/v1/login`: {
+          const status = Array.isArray(loginStatus) ? loginStatus.shift()! : loginStatus;
+          if (status === 429) {
+            return Response.json({ code: "rate_limited", title: "Too many sign-in requests from this address" }, { status, headers: { "Retry-After": "60" } });
+          }
+          return status === 200
             ? Response.json({ api_key: "wk1_7_secret", key_id: "key_1", account: { id: 7, login: "octocat" } })
-            : Response.json({ title: "nope" }, { status: loginStatus });
+            : Response.json({ title: "nope" }, { status });
+        }
         case `${SERVER}/v1/keys/current`:
           return new Response(null, { status: 204 });
       }
@@ -82,6 +88,27 @@ describe("login", () => {
   it("stops when the user cancels, saving nothing", async () => {
     const { deps } = fake([{ error: "access_denied" }]);
     await expect(login(SERVER, deps)).rejects.toThrow(LoginFailed);
+    expect(readCredentials().servers).toEqual({});
+  });
+
+  it("waits out a 429 once, keeping the GitHub token rather than starting over", async () => {
+    const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }], [429, 200]);
+    const before = deps.now();
+    await login(SERVER, deps);
+    expect(printed).toContain(`${SERVER} is limiting sign-ins from this address; trying again in 60 seconds.`);
+    expect(deps.now() - before).toBeGreaterThanOrEqual(60_000);
+    expect(calls.filter((c) => c.url === `${SERVER}/v1/login`).map((c) => c.body)).toEqual([
+      expect.objectContaining({ github_token: "ghu_tok" }),
+      expect.objectContaining({ github_token: "ghu_tok" }),
+    ]);
+    // The device flow ran once.
+    expect(calls.filter((c) => c.url === `${GITHUB}/login/device/code`)).toHaveLength(1);
+    expect(readCredentials().servers[SERVER]?.api_key).toBe("wk1_7_secret");
+  });
+
+  it("says when to try again if it's still limited", async () => {
+    const { deps } = fake([{ access_token: "ghu_tok" }], [429, 429]);
+    await expect(login(SERVER, deps)).rejects.toThrow(`${SERVER} is limiting sign-ins from this address; try again in 60 seconds`);
     expect(readCredentials().servers).toEqual({});
   });
 

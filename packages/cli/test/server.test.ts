@@ -254,6 +254,34 @@ describe("subscribing on the server", () => {
     expect(fake.subscriptions).toEqual([]);
   });
 
+  it("says the server is limiting refreshes, not to sign in again, on a 429", async () => {
+    fake.repos.set("octo/secret", { private: true });
+    fake.refreshLimited = true;
+    const path = signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    expect(await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) })).toBeNull();
+    expect(messages.at(-1)).toBe(
+      `couldn't subscribe to octo/secret#3 (${fake.url} is limiting GitHub token refreshes from this address; try again in 60 seconds)`,
+    );
+    expect(messages.join("\n")).not.toMatch(/watcheroni login/);
+    // The refresh token wasn't used up, so it's kept for next time.
+    expect((JSON.parse(readFileSync(path, "utf8")) as Credentials).servers[fake.url].github.refresh_token).toBe("ghr_old");
+
+    // Renewing logs the same, and leaves the subscription for next time.
+    fake.refreshLimited = false;
+    fake.githubTokens.add("ghu_old");
+    signIn({ expires_at: new Date(Date.now() + 3600_000).toISOString() });
+    const sub = await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) });
+    fake.verifiedUntil.set(sub!, new Date(Date.now() + 3600_000).toISOString());
+    fake.refreshLimited = true;
+    signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    messages.length = 0;
+    await renewSubscriptions(client(), "box", { log, githubToken: () => githubTokenFor(fake.url) });
+    expect(messages).toEqual([
+      `couldn't renew the server's watch on octo/secret: ${fake.url} is limiting GitHub token refreshes from this address; try again in 60 seconds`,
+    ]);
+    expect(fake.verified).toEqual([]);
+  });
+
   it("renews private subscriptions due within two days, and only those", async () => {
     fake.repos.set("octo/secret", { private: true });
     fake.repos.set("octo/widgets", { private: false });
