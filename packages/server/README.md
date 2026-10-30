@@ -11,8 +11,11 @@ What's here, compared with the full design:
   token with GitHub and issues an API key, of which only a SHA-256 hash is
   stored in that user's `acct:<id>` object), `GET /v1/keys`,
   `DELETE /v1/keys/{id|current}`, the `POST /v1/github/refresh` proxy,
-  WebSocket tickets (`TICKET_KEY`, `TICKET_KEY_OLD` for rotation) and the
-  per-account limit of 120 requests a minute. Inboxes, numbered events
+  WebSocket tickets (`TICKET_KEY`, `TICKET_KEY_OLD` for rotation), the
+  per-account limit of 120 requests a minute, and limits per IPv4
+  address or IPv6 /64 on `/v1/login` and `/v1/github/refresh` (Rate
+  Limiting bindings, which `wrangler dev` and the tests simulate
+  locally; a config without them limits nothing). Inboxes, numbered events
   with dedupe by `id`, `ack`, `GET .../events?after=&wait=&limit=`
   long-polling through the Worker bridge, the WebSocket protocol (`hello`,
   `ready`, `events`, `ack`, `ping`/`pong` answered by the runtime), and
@@ -30,8 +33,7 @@ What's here, compared with the full design:
   and `/debug/{accounts,repos,installations}/{id}` show what an object is
   doing (see "Worker routes" in DESIGN.md).
 - **Not yet:** Control, re-verifying private
-  subscriptions (`/verify`), expiring subscriptions, the per-IP limit on
-  `/v1/login` and `/v1/github/refresh`, revoking keys on the
+  subscriptions (`/verify`), expiring subscriptions, revoking keys on the
   `github_app_authorization` webhook (`Account.revokeAllKeys` is ready for
   it), `inbox.gap`. The tests stub GitHub.
 

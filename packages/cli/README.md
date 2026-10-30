@@ -117,6 +117,11 @@ the credentials file. The environment wins, and `WATCHERONI_SERVER=`
 `WATCHERONI_CREDENTIALS` moves just the credentials. `watcheroni logout`
 revokes the key and forgets it.
 
+The server URL must be `https://`: the API key goes with every request,
+and the GitHub tokens with sign-in and refreshes. Plain `http://` is only
+accepted to this machine itself (`localhost`, `*.localhost`, `127.0.0.0/8`
+or `[::1]`), for a server running under `wrangler dev`.
+
 To run your own server, with your own GitHub App, on Cloudflare's free
 plan: `watcheroni selfhost` in a clone of the repository (see
 [the server's README](https://github.com/thepaul/watcheroni/tree/main/packages/server#run-your-own)). It also sets

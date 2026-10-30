@@ -7,8 +7,9 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { hostname } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import type { LoginResponse, Meta } from "@watcheroni/protocol";
-import { configDir, serverSetting } from "./config.ts";
+import { checkServerUrl, configDir, serverSetting } from "./config.ts";
 import { clean } from "./format.ts";
+import { Unreachable } from "./server.ts";
 
 export const DEFAULT_SERVER = "https://watcheroni.dev";
 
@@ -104,7 +105,7 @@ function openUrl(url: string): boolean {
 }
 
 export function serverUrl(): string {
-  return (serverSetting() || DEFAULT_SERVER).replace(/\/+$/, "");
+  return checkServerUrl(serverSetting() || DEFAULT_SERVER);
 }
 
 export function credentialsPath(): string {
@@ -132,6 +133,7 @@ function writeCredentials(creds: Credentials, path = credentialsPath()): void {
 export class LoginFailed extends Error {}
 
 export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps): Promise<ServerCredentials> {
+  server = checkServerUrl(server);
   const { fetch, print } = deps;
   const metaRes = await fetch(`${server}/v1/meta`);
   if (!metaRes.ok) throw new LoginFailed(`${server}/v1/meta answered ${metaRes.status}`);
@@ -141,11 +143,24 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
   // github.com.
   const token = await deviceFlow(GITHUB_WEB_URL, meta.github.client_id, deps);
 
-  const res = await fetch(`${server}/v1/login`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ github_token: token.access_token, label: `watcheroni CLI on ${hostname()}` }),
-  });
+  const send = () =>
+    fetch(`${server}/v1/login`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ github_token: token.access_token, label: `watcheroni CLI on ${hostname()}` }),
+    });
+  let res = await send();
+  // Too many sign-ins from this address. The GitHub token is still good,
+  // so rather than send the user through the device flow again, wait once
+  // if it isn't long.
+  if (res.status === 429) {
+    const wait = retryAfter(res);
+    if (wait > MAX_LOGIN_WAIT_SECONDS) throw new LoginFailed(signInsLimited(server, wait));
+    print(`${server} is limiting sign-ins from this address; trying again in ${wait} seconds.`);
+    await deps.sleep(wait * 1000);
+    res = await send();
+    if (res.status === 429) throw new LoginFailed(signInsLimited(server, retryAfter(res)));
+  }
   if (!res.ok) {
     const problem = (await res.json().catch(() => ({}))) as { title?: string };
     throw new LoginFailed(`the server refused the login (${res.status}${problem.title ? `: ${problem.title}` : ""})`);
@@ -172,9 +187,23 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
   return entry;
 }
 
+// The longest a login waits out a 429 before giving up.
+const MAX_LOGIN_WAIT_SECONDS = 120;
+
+function signInsLimited(server: string, wait: number): string {
+  return `${server} is limiting sign-ins from this address; try again in ${wait} seconds`;
+}
+
+// A 429's Retry-After in seconds; the server always sends one.
+function retryAfter(res: Response): number {
+  const n = Number(res.headers.get("Retry-After"));
+  return Number.isFinite(n) && n > 0 ? Math.ceil(n) : 60;
+}
+
 // Revokes this machine's key on the server and forgets the credentials.
 // False if there was nothing to forget.
 export async function logout(server = serverUrl(), deps: LoginDeps = defaultDeps): Promise<boolean> {
+  server = checkServerUrl(server);
   const creds = readCredentials();
   const entry = creds.servers[server];
   if (!entry) {
@@ -200,8 +229,11 @@ export async function logout(server = serverUrl(), deps: LoginDeps = defaultDeps
 // The GitHub token `watcheroni login` saved for the server, for
 // subscribing to private repos. An expired one is renewed through the
 // server's refresh proxy (PROTOCOL.md, "Refreshing the GitHub token") and
-// saved. Null if there's none, or it can't be renewed.
+// saved. Null if there's none, or it can't be renewed. Throws
+// Unreachable when the server can't refresh it just now (no answer, a
+// 429 or a 5xx), which `watcheroni login` wouldn't fix.
 export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetch" | "now"> = defaultDeps): Promise<string | null> {
+  server = checkServerUrl(server);
   const github = readCredentials().servers[server]?.github;
   if (!github?.access_token) return null;
   const now = deps.now();
@@ -209,13 +241,23 @@ export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetc
   if (expiresAt - now > TOKEN_MARGIN_MS) return github.access_token;
   const refreshExpiresAt = github.refresh_token_expires_at ? Date.parse(github.refresh_token_expires_at) : Infinity;
   if (!github.refresh_token || refreshExpiresAt <= now) return null;
-  let token: Partial<TokenResponse> & { error?: string };
+  let res: Response;
   try {
-    const res = await deps.fetch(`${server}/v1/github/refresh`, {
+    res = await deps.fetch(`${server}/v1/github/refresh`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ refresh_token: github.refresh_token }),
     });
+  } catch (e) {
+    const cause = (e as Error & { cause?: Error }).cause;
+    throw new Unreachable(`can't reach ${server} to refresh the GitHub token: ${cause?.message ?? (e as Error).message}`);
+  }
+  if (res.status === 429) {
+    throw new Unreachable(`${server} is limiting GitHub token refreshes from this address; try again in ${retryAfter(res)} seconds`);
+  }
+  if (res.status >= 500) throw new Unreachable(`${server} couldn't refresh the GitHub token (${res.status})`);
+  let token: Partial<TokenResponse> & { error?: string };
+  try {
     token = (await res.json()) as typeof token;
   } catch {
     return null;

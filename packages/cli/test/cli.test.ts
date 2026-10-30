@@ -190,6 +190,12 @@ describe("wait against a server", () => {
     expect(run.stderr()).toMatch(/inbox box watches no PR to poll from here instead/);
   });
 
+  it("won't send the API key over plain http to another machine", async () => {
+    const run = cli(["wait"], { WATCHERONI_SERVER: "http://watcheroni.dev" });
+    expect(await run.code).toBe(1);
+    expect(run.stderr()).toBe("watcheroni: http://watcheroni.dev: the server must be https; plain http is only for localhost, 127.0.0.0/8 or [::1]\n");
+  });
+
   it("runs as before with no server", async () => {
     const run = cli(["wait"], { WATCHERONI_SERVER: "" });
     expect(await run.code).toBe(1);
