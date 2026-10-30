@@ -17,8 +17,8 @@ import {
 } from "../src/login.ts";
 
 const SERVER = "https://watcheroni.test";
-const GITHUB = "https://github.test";
-const DEVICE_PAGE = "https://github.com/login/device";
+const GITHUB = "https://github.com";
+const DEVICE_PAGE = `${GITHUB}/login/device`;
 
 beforeEach(() => {
   process.env.WATCHERONI_CREDENTIALS = join(mkdtempSync(join(tmpdir(), "watcheroni-cred-")), "credentials.json");
@@ -41,7 +41,7 @@ function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = t
       calls.push({ url, body, auth: new Headers(init?.headers).get("Authorization") });
       switch (url) {
         case `${SERVER}/v1/meta`:
-          return Response.json({ protocol: 1, server: "t", features: [], limits: {}, github: { client_id: "Iv23cli", web_url: GITHUB, api_url: "" } });
+          return Response.json({ protocol: 1, server: "t", features: [], limits: {}, github: { client_id: "Iv23cli", web_url: "https://github.evil.test", api_url: "" } });
         case `${GITHUB}/login/device/code`:
           return Response.json({ device_code: "dc", user_code: userCode, verification_uri: page, expires_in: 900, interval: 5 });
         case `${GITHUB}/login/oauth/access_token`:
@@ -93,6 +93,32 @@ describe("login", () => {
     }
   });
 
+  it("runs the device flow on github.com, whatever web_url the server names", async () => {
+    const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
+    await login(SERVER, deps);
+    expect(calls.map((c) => c.url)).toEqual([
+      `${SERVER}/v1/meta`,
+      `${GITHUB}/login/device/code`,
+      `${GITHUB}/login/oauth/access_token`,
+      `${SERVER}/v1/login`,
+    ]);
+  });
+
+  it("cleans what it repeats from an answer", async () => {
+    const a = fake([{ error: "bad", error_description: "no\x1b[2J\u009b31m‮way\n".repeat(50) }]);
+    const err = await login(SERVER, a.deps).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(LoginFailed);
+    expect((err as Error).message).toMatch(/^GitHub: no \[2J 31m way no/);
+    expect((err as Error).message).not.toMatch(/[\x00-\x1f\u0080-\u009f‮]/);
+    expect((err as Error).message.length).toBeLessThan(120);
+
+    const b = fake([], 200, true, `https://evil.com/\u009b‮${"x".repeat(1000)}`);
+    const refused = await login(SERVER, b.deps).catch((e: Error) => e);
+    expect((refused as Error).message).toMatch(/^refusing to send you to "https:\/\/evil\.com\//);
+    expect((refused as Error).message).not.toMatch(/[\u0080-\u009f‮]/);
+    expect((refused as Error).message.length).toBeLessThan(200);
+  });
+
   it("refuses a one-time code that isn't a plain code", async () => {
     const { deps, printed } = fake([{ access_token: "ghu_tok" }], 200, true, DEVICE_PAGE, "\x1b]8;;https://evil.com\x07ABCD");
     await expect(login(SERVER, deps)).rejects.toThrow(/odd one-time code/);
@@ -105,6 +131,9 @@ describe("opening the browser", () => {
     expect(githubUrl("https://github.com/login/device")).toBe("https://github.com/login/device");
     expect(githubUrl("https://GitHub.com/login/device")).toBe("https://github.com/login/device");
     expect(githubUrl("https://github.com:443/login/device")).toBe("https://github.com/login/device");
+    // Odd spellings of github.com itself are fine once normalised.
+    expect(githubUrl("https:github.com")).toBe("https://github.com/");
+    expect(githubUrl("https://%67ithub.com/login/device")).toBe("https://github.com/login/device");
     // Quotes and spaces come out encoded; `&` stays, which is harmless
     // without a shell.
     expect(githubUrl(`https://github.com/a"b c?x=1&y='2'"`)).toBe("https://github.com/a%22b%20c?x=1&y=%272%27%22");
@@ -120,6 +149,10 @@ describe("opening the browser", () => {
       "https://user@github.com/login/device",
       "https://user:pw@github.com/login/device",
       "https://github.com:8443/login/device",
+      "https://github.com./login/device",
+      "https://%67ithub.com.evil.com/",
+      "https://gіthub.com/login/device", // Cyrillic і
+      `https://github.com/${"x".repeat(500)}`,
       "",
       42,
       null,
@@ -131,7 +164,8 @@ describe("opening the browser", () => {
   it("passes the URL as one argument, with no cmd or shell", () => {
     const href = githubUrl("https://github.com/login/device?a=1&b=\"2\"")!;
     expect(browserCommand(href, "darwin", {})).toEqual(["open", href]);
-    expect(browserCommand(href, "win32", {})).toEqual(["rundll32", "url.dll,FileProtocolHandler", href]);
+    expect(browserCommand(href, "win32", {})).toEqual(["C:\\Windows\\System32\\rundll32.exe", "url.dll,FileProtocolHandler", href]);
+    expect(browserCommand(href, "win32", { SystemRoot: "D:\\Win" })?.[0]).toBe("D:\\Win\\System32\\rundll32.exe");
     expect(browserCommand(href, "linux", { DISPLAY: ":0" })).toEqual(["xdg-open", href]);
     expect(browserCommand(href, "linux", {})).toBeNull();
 
@@ -142,6 +176,12 @@ describe("opening the browser", () => {
     }) as unknown as typeof spawn;
     expect(launch(["rundll32", "url.dll,FileProtocolHandler", href], run)).toBe(true);
     expect(runs).toEqual([{ cmd: "rundll32", args: ["url.dll,FileProtocolHandler", href], options: expect.objectContaining({ shell: false }) }]);
+  });
+
+  it("survives a launcher that isn't there", async () => {
+    expect(launch(["/nonexistent/watcheroni-browser", "https://github.com/"])).toBe(true);
+    // The spawn error arrives later and is swallowed.
+    await new Promise((r) => setTimeout(r, 50));
   });
 
   it("runs the device flow, trades the token for a key, and keeps both locally", async () => {

@@ -5,9 +5,10 @@
 import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, win32 } from "node:path";
 import type { LoginResponse, Meta } from "@watcheroni/protocol";
 import { configDir, serverSetting } from "./config.ts";
+import { clean } from "./format.ts";
 
 export const DEFAULT_SERVER = "https://watcheroni.dev";
 
@@ -45,11 +46,13 @@ const defaultDeps: LoginDeps = {
   openUrl,
 };
 
-// The only host the CLI sends anyone to. The server names GitHub's web
-// URL in /v1/meta, but neither it nor anyone between it and us gets to
-// choose what this machine opens. The server only speaks to github.com,
-// so there's no Enterprise host to allow.
+// The only host the CLI signs in at or sends anyone to. The server names
+// GitHub's web URL in /v1/meta, but neither it nor anyone between it and
+// us gets to choose where the device flow runs or what this machine
+// opens. The server only speaks to github.com, so there's no Enterprise
+// host to allow.
 const GITHUB_HOST = "github.com";
+const GITHUB_WEB_URL = `https://${GITHUB_HOST}`;
 
 // `url` normalised, if it's an https page on github.com with no user or
 // password in it; null otherwise. Anything else could be a local file or
@@ -63,15 +66,16 @@ export function githubUrl(url: unknown): string | null {
     return null;
   }
   if (parsed.protocol !== "https:" || parsed.hostname !== GITHUB_HOST || parsed.port || parsed.username || parsed.password) return null;
-  return parsed.href;
+  return parsed.href.length > 500 ? null : parsed.href;
 }
 
 // The program and arguments that open `href` in a browser: the URL is
 // one argument, and no shell (such as `cmd /c start`) gets to read `&`
-// or quotes in it. Null where there's no way to.
+// or quotes in it. Null where there's no way to. rundll32 is named by
+// full path, since Windows looks in the current directory before PATH.
 export function browserCommand(href: string, platform: string, env: NodeJS.ProcessEnv): string[] | null {
   if (platform === "darwin") return ["open", href];
-  if (platform === "win32") return ["rundll32", "url.dll,FileProtocolHandler", href];
+  if (platform === "win32") return [win32.join(env.SystemRoot || "C:\\Windows", "System32", "rundll32.exe"), "url.dll,FileProtocolHandler", href];
   if (env.DISPLAY || env.WAYLAND_DISPLAY) return ["xdg-open", href];
   return null;
 }
@@ -133,9 +137,9 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
   if (!metaRes.ok) throw new LoginFailed(`${server}/v1/meta answered ${metaRes.status}`);
   const meta = (await metaRes.json()) as Meta;
   if (!meta.github?.client_id) throw new LoginFailed(`${server} doesn't offer sign-in yet`);
-  const { client_id, web_url } = meta.github;
-
-  const token = await deviceFlow(web_url, client_id, deps);
+  // The server's web_url is ignored: the device flow always runs on
+  // github.com.
+  const token = await deviceFlow(GITHUB_WEB_URL, meta.github.client_id, deps);
 
   const res = await fetch(`${server}/v1/login`, {
     method: "POST",
@@ -257,15 +261,14 @@ async function deviceFlow(webUrl: string, clientId: string, deps: LoginDeps): Pr
   };
 
   const code = await post("/login/device/code", { client_id: clientId });
-  if (typeof code.device_code !== "string") throw new LoginFailed(`GitHub didn't start the device flow: ${JSON.stringify(code)}`);
-  // This answer comes from wherever the server's web_url points, so it's
-  // checked before the user is sent anywhere. GitHub's code page is
-  // always on github.com; any other address stops the sign-in rather than
-  // leaving the user to judge it.
+  if (typeof code.device_code !== "string") throw new LoginFailed(`GitHub didn't start the device flow: ${clean(JSON.stringify(code))}`);
+  // Checked anyway before the user is sent anywhere. GitHub's code page
+  // is always on github.com; any other address stops the sign-in rather
+  // than leaving the user to judge it.
   const uri = githubUrl(code.verification_uri);
-  if (!uri) throw new LoginFailed(`refusing to send you to ${JSON.stringify(String(code.verification_uri))}: it isn't an https page on ${GITHUB_HOST}`);
+  if (!uri) throw new LoginFailed(`refusing to send you to ${JSON.stringify(clean(code.verification_uri))}: it isn't an https page on ${GITHUB_HOST}`);
   if (typeof code.user_code !== "string" || !/^[\w-]{1,32}$/.test(code.user_code)) {
-    throw new LoginFailed(`GitHub sent an odd one-time code: ${JSON.stringify(String(code.user_code))}`);
+    throw new LoginFailed(`GitHub sent an odd one-time code: ${JSON.stringify(clean(code.user_code))}`);
   }
   deps.print(`Your one-time code: ${code.user_code}`);
   deps.print(deps.openUrl(uri)
@@ -299,7 +302,7 @@ async function deviceFlow(webUrl: string, clientId: string, deps: LoginDeps): Pr
       case "expired_token":
         throw new LoginFailed("the code expired; run `watcheroni login` again");
       default:
-        throw new LoginFailed(`GitHub: ${answer.error_description ?? answer.error ?? "unexpected answer"}`);
+        throw new LoginFailed(`GitHub: ${clean(answer.error_description ?? answer.error ?? "unexpected answer")}`);
     }
   }
   throw new LoginFailed("the code expired; run `watcheroni login` again");
