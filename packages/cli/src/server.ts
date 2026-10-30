@@ -2,6 +2,7 @@ import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, 
 import pkg from "../package.json" with { type: "json" };
 import { type ServerConfig, checkServerUrl } from "./config.ts";
 import { LoginNeeded } from "./github.ts";
+import { githubUrl } from "./login.ts";
 import { anyKey, isPr, type RepoTarget, type Target } from "./targets.ts";
 
 // Server mode: reading an inbox on a watcheroni server (PROTOCOL.md,
@@ -136,7 +137,9 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
   } catch (e) {
     if (e instanceof ServerError) {
       if (e.code === "app_not_installed") {
-        const url = typeof e.problem.install_url === "string" ? `; it can be installed from ${e.problem.install_url}` : "";
+        // Shown only if it's a github.com page, like the sign-in page.
+        const install = githubUrl(e.problem.install_url);
+        const url = install ? `; it can be installed from ${install}` : "";
         o.log(`the watcheroni App isn't installed on ${repo}${url}`);
       } else if (e.code === "github_token_invalid") {
         o.log(`${client.url} didn't accept this machine's GitHub token for ${repo}; run \`watcheroni login\` again`);

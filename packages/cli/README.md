@@ -99,7 +99,10 @@ Desktop and phone notifications, Slack, only CI failures, and running
 Sign in, which runs GitHub's device flow and saves an API key in
 `~/.config/watcheroni/credentials.json` (mode 0600). It opens the browser
 at GitHub's code page when you're at this machine's own terminal; over
-SSH, or with `WATCHERONI_NO_BROWSER` set, it just prints the address:
+SSH, or with `WATCHERONI_NO_BROWSER` set, it just prints the address. It
+signs in at github.com whatever the server says, and only sends you to an
+`https://github.com` page: if GitHub's answer names another, the sign-in
+stops there.
 
 ```
 watcheroni login                      # https://watcheroni.dev

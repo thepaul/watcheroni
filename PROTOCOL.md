@@ -72,6 +72,11 @@ with no GitHub App configured leaves out `github` and doesn't offer
 sign-in. `github.app_slug` and `github.install_url` are present only when
 the server knows its App's slug (each copy of the server, self-hosted
 ones included, has its own App); clients MUST cope without them.
+Clients SHOULD NOT open a URL, or offer it as a place to sign in or
+install the App, unless it's an `https://github.com/` page. The
+watcheroni CLI runs the device flow on github.com whatever `web_url`
+says, refuses a `verification_uri` anywhere else, and leaves out any
+other `install_url`.
 
 ## Authentication
 
