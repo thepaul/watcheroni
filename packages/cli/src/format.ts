@@ -4,6 +4,12 @@ import type { WatchEvent } from "@watcheroni/protocol";
 // docs. Each line ends with the command that fetches the content, since
 // events carry pointers, not text; its `--jq` keeps just the text an agent
 // needs.
+//
+// Names, paths, branches, labels and links come from whoever made them on
+// GitHub (a fork's workflow names its checks), and an agent reads this
+// output and runs its commands. So every such value is cleaned and quoted
+// unless it is plainly one word, and commands are built only from numeric
+// IDs and a repository name of the shape GitHub allows.
 
 const BODY = "--jq .body";
 
@@ -13,7 +19,8 @@ const BODY = "--jq .body";
 export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string, repoEnded = false): string {
   const groups = new Map<string, WatchEvent[]>();
   for (const e of events) {
-    const key = e.repo ? (e.pr !== null ? `${e.repo.full_name}#${e.pr}` : e.repo.full_name) : "other";
+    const repo = e.repo ? word(e.repo.full_name) : "other";
+    const key = e.repo && e.pr !== null ? `${repo}#${e.pr}` : repo;
     groups.set(key, [...(groups.get(key) ?? []), e]);
   }
   const lines: string[] = [];
@@ -55,7 +62,10 @@ function describeAll(events: WatchEvent[]): string[] {
       const where = comments.map((c) => location(c.data) || "?");
       lines.push(`- ${comments.length} review comments${by(e)} on ${where.join(", ")}`);
       // The review's own comments endpoint leaves out the lines.
-      lines.push(`  gh api ${repoPath(e)}/pulls/${e.pr}/comments --paginate --jq '.[] | select(.pull_request_review_id == ${reviewId}) | "\\(.path)\\(.line // .original_line | if . then ":\\(.)" else "" end) \\(.body)"'`);
+      const repo = repoPath(e);
+      if (repo && id(e.pr) && id(reviewId)) {
+        lines.push(`  gh api ${repo}/pulls/${e.pr}/comments --paginate --jq '.[] | select(.pull_request_review_id == ${reviewId}) | "\\(.path)\\(.line // .original_line | if . then ":\\(.)" else "" end) \\(.body)"'`);
+      }
       continue;
     }
     // GitHub makes a reply in a thread a "commented" review with no text
@@ -74,37 +84,45 @@ function describeAll(events: WatchEvent[]): string[] {
 function describe(e: WatchEvent): [string, string | null] {
   const d = e.data;
   const repo = repoPath(e);
-  const short = (sha: unknown) => (typeof sha === "string" ? sha.slice(0, 7) : "?");
+  const full = repo ? repo.slice("repos/".length) : null;
+  const api = repo ? `gh api ${repo}` : null;
+  // A command only when the repository and every ID in it are sound.
+  const cmd = (...parts: (string | number | null)[]) => (parts.every((p) => p !== null) ? parts.join("") : null);
+  const pr = id(e.pr);
+  const short = (sha: unknown) => (typeof sha === "string" && /^[0-9a-f]{7,64}$/i.test(sha) ? sha.slice(0, 7) : "?");
   switch (e.kind) {
     case "review.submitted":
-      return [`review.submitted${by(e)}: ${d.state}`, `gh api ${repo}/pulls/${e.pr}/reviews/${d.review_id} --jq '.state, .body'`];
+      return [`review.submitted${by(e)}: ${word(d.state)}`, cmd(api, "/pulls/", pr, "/reviews/", id(d.review_id), " --jq '.state, .body'")];
     case "review.dismissed":
-      return [`review.dismissed: review ${d.review_id}`, null];
+      return [`review.dismissed: review ${id(d.review_id) ?? "?"}`, null];
     case "review_comment.created": {
       const where = d.path ? ` on ${location(d)}` : "";
       const reply = d.in_reply_to ? " (a reply)" : "";
-      return [`review_comment.created${by(e)}${where}${reply}`, `gh api ${repo}/pulls/comments/${d.comment_id} ${BODY}`];
+      return [`review_comment.created${by(e)}${where}${reply}`, cmd(api, "/pulls/comments/", id(d.comment_id), ` ${BODY}`)];
     }
     case "comment.created":
-      return [`comment.created${by(e)}`, `gh api ${repo}/issues/comments/${d.comment_id} ${BODY}`];
+      return [`comment.created${by(e)}`, cmd(api, "/issues/comments/", id(d.comment_id), ` ${BODY}`)];
     case "thread.resolved":
     case "thread.unresolved": {
       // The command shows the thread's first comment.
       const where = d.path ? ` on ${location(d)}` : "";
-      return [`${e.kind}${by(e)}${where}`, typeof d.comment_id === "number" ? `gh api ${repo}/pulls/comments/${d.comment_id} ${BODY}` : null];
+      return [`${e.kind}${by(e)}${where}`, cmd(api, "/pulls/comments/", id(d.comment_id), ` ${BODY}`)];
     }
     case "check.failed": {
-      const command = typeof d.workflow_run_id === "number"
-        ? `gh run view ${d.workflow_run_id} -R ${e.repo?.full_name} --log-failed`
-        : typeof d.check_run_id === "number" ? `gh api ${repo}/check-runs/${d.check_run_id}` : e.links.html ?? null;
-      return [`check.failed: "${d.name}" (${d.conclusion}) on ${short(d.head_sha)}`, command];
+      // A commit status has no ID to fetch; its link is shown as a link,
+      // never as a command.
+      const command = id(d.workflow_run_id)
+        ? cmd("gh run view ", id(d.workflow_run_id), " -R ", full, " --log-failed")
+        : cmd(api, "/check-runs/", id(d.check_run_id));
+      const details = command ? null : link(e.links.html);
+      return [`check.failed: ${quoted(d.name)} (${word(d.conclusion)}) on ${short(d.head_sha)}${details ? `; details: ${details}` : ""}`, command];
     }
     case "checks.completed": {
-      const failed = Array.isArray(d.failed) && d.failed.length ? `; failed: ${d.failed.join(", ")}` : "";
-      return [`checks.completed on ${short(d.head_sha)}: ${d.result}${failed}`, failed ? `gh pr checks ${e.pr} -R ${e.repo?.full_name}` : null];
+      const failed = Array.isArray(d.failed) && d.failed.length ? `; failed: ${d.failed.slice(0, MAX_LISTED).map(quoted).join(", ")}${d.failed.length > MAX_LISTED ? `, and ${d.failed.length - MAX_LISTED} more` : ""}` : "";
+      return [`checks.completed on ${short(d.head_sha)}: ${word(d.result)}${failed}`, failed ? cmd("gh pr checks ", pr, " -R ", full) : null];
     }
     case "workflow.completed":
-      return [`workflow.completed: "${d.workflow}" ${d.conclusion}`, d.conclusion === "success" ? null : `gh run view ${d.run_id} -R ${e.repo?.full_name} --log-failed`];
+      return [`workflow.completed: ${quoted(d.workflow)} ${word(d.conclusion)}`, d.conclusion === "success" ? null : cmd("gh run view ", id(d.run_id), " -R ", full, " --log-failed")];
     case "merge.conflict":
       return [`merge.conflict with the base branch (head ${short(d.head_sha)}, base ${short(d.base_sha)})`, null];
     case "merge.clean":
@@ -112,13 +130,13 @@ function describe(e: WatchEvent): [string, string | null] {
     case "pr.pushed":
       return [`pr.pushed: ${short(d.before)} -> ${short(d.after)}`, null];
     case "pr.base_changed":
-      return [`pr.base_changed: ${d.from} -> ${d.to}`, null];
+      return [`pr.base_changed: ${word(d.from)} -> ${word(d.to)}`, null];
     case "pr.review_requested":
-      return [`pr.review_requested: ${d.reviewer}`, null];
+      return [`pr.review_requested: ${word(d.reviewer)}`, null];
     case "pr.merged":
       return [`pr.merged as ${short(d.merge_sha)}`, null];
     case "watch.ended":
-      return [`watch.ended: the PR was ${d.reason}`, null];
+      return [`watch.ended: the PR was ${word(d.reason)}`, null];
     // A repository-wide watch (no PR) isn't polled from here when it ends.
     case "watch.expired":
       return [e.pr === null
@@ -131,21 +149,69 @@ function describe(e: WatchEvent): [string, string | null] {
     case "watch.revoked":
       return ["watch.revoked: the watcheroni App lost access to this repo", null];
     case "inbox.gap":
-      return [`inbox.gap: events after ${d.missed_after} were dropped before they were read; check the watched PRs on GitHub`, null];
-    default:
-      return [`${e.kind}${by(e)}`, e.links.api ? `gh api ${e.links.api.replace("https://api.github.com/", "")}` : null];
+      return [`inbox.gap: events after ${id(d.missed_after) ?? "?"} were dropped before they were read; check the watched PRs on GitHub`, null];
+    default: {
+      const path = typeof e.links.api === "string" ? /^https:\/\/api\.github\.com\/([\w.\/-]+)$/.exec(e.links.api)?.[1] : undefined;
+      return [`${word(e.kind)}${by(e)}`, path && !path.includes("..") ? `gh api ${path}` : null];
+    }
   }
 }
 
 // `a.ts:3`, or `a.ts` without a line, or "" without a path.
 function location(d: WatchEvent["data"]): string {
-  return d.path ? `${d.path}${d.line ? `:${d.line}` : ""}` : "";
+  return d.path ? `${word(d.path)}${id(d.line) ? `:${d.line}` : ""}` : "";
 }
 
 function by(e: WatchEvent): string {
-  return e.actor ? ` by ${e.actor.login}` : "";
+  return e.actor ? ` by ${word(e.actor.login)}` : "";
 }
 
-function repoPath(e: WatchEvent): string {
-  return `repos/${e.repo?.full_name ?? "?"}`;
+// `repos/owner/name`, or null if the name isn't one GitHub would give.
+function repoPath(e: WatchEvent): string | null {
+  const name = e.repo?.full_name;
+  return typeof name === "string" && REPO_NAME.test(name) ? `repos/${name}` : null;
+}
+
+const REPO_NAME = /^[A-Za-z0-9-]{1,39}\/[\w.-]{1,100}$/;
+const PLAIN = /^[\w.\/@+:-]+$/;
+const MAX_LENGTH = 100;
+const MAX_LISTED = 10;
+// C0 and C1 controls, line and paragraph separators, zero-width and
+// bidirectional formatting characters.
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
+
+// A value made printable on one line, and cut to a sane length.
+function clean(v: unknown): string {
+  const s = String(v ?? "").replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim();
+  return s.length > MAX_LENGTH ? `${s.slice(0, MAX_LENGTH - 1)}…` : s;
+}
+
+// A value that should be one word (a login, path, branch, state): bare
+// when it is, quoted when it isn't, so it can't pass for more output.
+function word(v: unknown): string {
+  const s = clean(v);
+  return s && PLAIN.test(s) ? s : JSON.stringify(s);
+}
+
+// A free-form name (a check, a workflow), always quoted.
+function quoted(v: unknown): string {
+  return JSON.stringify(clean(v));
+}
+
+// A positive integer as text, or null.
+function id(v: unknown): string | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? String(v) : null;
+}
+
+// An http(s) URL, percent-encoded so it is one unbroken word, or null.
+function link(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  try {
+    const url = new URL(v);
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    const href = url.href.replace(/[^\x21-\x7e]|["'`<>\\]/g, encodeURIComponent);
+    return href.length > 500 ? null : href;
+  } catch {
+    return null;
+  }
 }
