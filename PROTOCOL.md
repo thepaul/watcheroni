@@ -58,8 +58,11 @@ No authentication. Returns everything a client needs to start:
     "api_url": "https://api.github.com"
   },
   "limits": {
-    "inboxes_per_account": 50,
+    "inboxes_per_account": 500,
     "subscriptions_per_account": 200,
+    "keys_per_account": 100,
+    "sockets_per_account": 50,
+    "long_polls_per_account": 50,
     "max_wait_seconds": 300,
     "max_ttl_seconds": 2592000,
     "private_verify_seconds": 604800
@@ -110,7 +113,8 @@ user is, once, and exchanges that for an API key.
 
    The key is shown only once. `label` is optional (at most 100
    characters are kept). A failure to reach GitHub is `503 unavailable`
-   with `Retry-After`.
+   with `Retry-After`. An account with `limits.keys_per_account` live keys
+   already gets `422 quota_exceeded`; revoke one first (see "Keys").
 
 3. The client keeps the GitHub token and refresh token **locally**. It
    needs them again only to subscribe to private repositories (see
@@ -169,6 +173,11 @@ DELETE /v1/inboxes/{name}        delete, with its subscriptions and events
 
 Names: 1-64 characters from `[A-Za-z0-9._-]`. An inbox and its
 subscriptions are deleted after 30 days in which nothing read it.
+
+An account has at most `limits.inboxes_per_account` inboxes. Creating
+another, with `PUT` or by connecting a WebSocket to a new name, answers
+`422 quota_exceeded`, unless the server can first delete an inbox nobody
+has read for 30 days that has no subscriptions or connections left.
 
 ```json
 {
@@ -337,6 +346,12 @@ GET /v1/inboxes/{name}/events?after=40&wait=300&limit=100
 after a wait is normal, not an error. The response doesn't move `acked`;
 see "Acknowledging".
 
+At most `limits.long_polls_per_account` requests may be waiting at once
+on one account. One more that would have to wait gets `429
+too_many_connections` with `Retry-After`; one that can be answered at
+once is answered. Ask again after `Retry-After`, or read over a
+WebSocket instead.
+
 ### WebSocket
 
 1. Get a ticket (lives 60 seconds, usable once):
@@ -382,7 +397,10 @@ unauthorized`; don't retry it, get a new ticket.
 
 **Close codes:** `4001` key revoked (don't retry
 without signing in again); `4004` inbox deleted; `4029` too many
-connections for this account; `1012` server restarting (reconnect). For
+connections for this account, sent straight after the handshake when the
+account already has `limits.sockets_per_account` WebSockets open (don't
+reconnect at once; long-poll instead, or retry later); `1012` server
+restarting (reconnect). For
 any other close, reconnect with backoff (1 s doubling to 60 s, with
 jitter) and send `hello` with your current position.
 
@@ -565,8 +583,9 @@ Errors use `application/problem+json`
 | 404 | `not_found` | No such repo, PR, inbox or subscription. |
 | 409 | `app_not_installed` | Includes `install_url` when the server knows its App's slug. |
 | 409 | `pr_not_open` | Subscribing to a merged or closed PR. |
-| 422 | `quota_exceeded` | Too many inboxes or subscriptions; `detail` says which. |
+| 422 | `quota_exceeded` | Too many inboxes, subscriptions or API keys; `title` says which. |
 | 429 | `rate_limited` | Includes `Retry-After`. |
+| 429 | `too_many_connections` | Too many long polls waiting on the account; includes `Retry-After`. |
 | 503 | `unavailable` | Try again later; includes `Retry-After`. |
 
 Clients MUST handle any `code` they don't know by its HTTP status.
@@ -581,7 +600,10 @@ them, and messages on an open WebSocket don't count against the budget.
 A `429` always carries `Retry-After` (seconds).
 
 Limits apply per account, per repository and per IP address (for the
-unauthenticated endpoints). The values are the server's choice and are
+unauthenticated endpoints). An account's caps on what it can hold, as
+opposed to its request rate, are in `/v1/meta` as `*_per_account`:
+inboxes, subscriptions, live API keys, open WebSockets, and long polls
+waiting at once. The values are the server's choice and are
 published in `/v1/meta`. Limits on a repository affect everyone watching
 it; when a repository is throttled, its subscribers get `repo.throttled`.
 

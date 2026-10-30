@@ -3,7 +3,7 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { newTicketPayload, parseApiKey, signTicket, verifyTicket } from "../src/auth";
 import { landingPage } from "../src/pages";
-import type { KeysResponse, LoginResponse, Meta, TicketResponse } from "../src/protocol";
+import { ACCOUNT_MAX_KEYS, type KeysResponse, type LoginResponse, type Meta, type TicketResponse } from "../src/protocol";
 
 const BASE = "https://watcheroni.test";
 const DEBUG = { Authorization: "Bearer test-debug-token" };
@@ -184,6 +184,17 @@ describe("meta", () => {
     expect(meta.github?.client_id).toBe("Iv23test");
     expect(meta.server).toMatch(/^watcheroni\/\d+\.\d+\.\d+$/);
   });
+
+  it("publishes the per-account caps", async () => {
+    const meta = await (await call("/v1/meta")).json<Meta>();
+    expect(meta.limits).toMatchObject({
+      inboxes_per_account: 500,
+      subscriptions_per_account: 200,
+      keys_per_account: 100,
+      sockets_per_account: 50,
+      long_polls_per_account: 50,
+    });
+  });
 });
 
 describe("API keys", () => {
@@ -229,6 +240,32 @@ describe("API keys", () => {
     ws.accept();
     await call(`/v1/keys/${key_id}`, { method: "DELETE", headers: bearer(api_key) });
     expect(await closed).toBe(4001);
+  });
+
+  it(`allows ${ACCOUNT_MAX_KEYS} live keys per account, then 422 until one is revoked`, async () => {
+    const accountId = nextAccount++;
+    const first = await mintKey(accountId);
+    // The rest straight into storage, to spare the request budget.
+    await runInDurableObject(env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${accountId}`)), (_, state) => {
+      for (let i = 2; i < ACCOUNT_MAX_KEYS; i++) {
+        state.storage.sql.exec("INSERT INTO keys (id, hash, created_at) VALUES (?, ?, 0)", `key_fake${i}`, crypto.getRandomValues(new Uint8Array(32)));
+      }
+    });
+    const last = await post(`/debug/accounts/${accountId}/keys`, {}, DEBUG);
+    expect(last.status).toBe(200);
+
+    const refused = await post(`/debug/accounts/${accountId}/keys`, {}, DEBUG);
+    expect(refused.status).toBe(422);
+    expect(await refused.json()).toMatchObject({ code: "quota_exceeded", title: `Too many API keys on this account (at most ${ACCOUNT_MAX_KEYS})` });
+    mockGitHub({ [CHECK_URL]: tokenOk({ id: accountId, login: "keyhoarder" }) });
+    const login = await post("/v1/login", { github_token: "ghu_good" });
+    expect(login.status).toBe(422);
+    expect((await login.json<{ code: string }>()).code).toBe("quota_exceeded");
+    vi.restoreAllMocks();
+
+    // A revoked key doesn't count.
+    expect((await call("/v1/keys/key_fake2", { method: "DELETE", headers: bearer(first.api_key) })).status).toBe(204);
+    expect((await post(`/debug/accounts/${accountId}/keys`, {}, DEBUG)).status).toBe(200);
   });
 });
 

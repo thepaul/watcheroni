@@ -28,6 +28,11 @@ import { landingPage, setupPage } from "./pages";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
 import {
+  ACCOUNT_MAX_INBOXES,
+  ACCOUNT_MAX_KEYS,
+  ACCOUNT_MAX_LONG_POLLS,
+  ACCOUNT_MAX_SOCKETS,
+  ACCOUNT_MAX_SUBSCRIPTIONS,
   INBOX_NAME,
   MAX_LIMIT,
   MAX_TTL_SECONDS,
@@ -144,8 +149,10 @@ async function api(
   if (inbox === null) return problem(404, "not_found", "No such endpoint");
   const name = inbox;
   switch (`${request.method} /v1/inboxes/{name}${rest}`) {
-    case "PUT /v1/inboxes/{name}":
-      return json(await account.ensureInbox(name));
+    case "PUT /v1/inboxes/{name}": {
+      const opened = await account.openInbox(name);
+      return opened.ok ? json(opened.inbox) : problem(opened.status, opened.code, opened.detail);
+    }
 
     case "POST /v1/inboxes/{name}/subscriptions":
       return createSubscription(request, env, account, accountId, name);
@@ -199,7 +206,16 @@ function meta(env: Env): Meta {
           },
         }
       : {}),
-    limits: { max_wait_seconds: MAX_WAIT_SECONDS, max_ttl_seconds: MAX_TTL_SECONDS, private_verify_seconds: PRIVATE_VERIFY_SECONDS },
+    limits: {
+      inboxes_per_account: ACCOUNT_MAX_INBOXES,
+      subscriptions_per_account: ACCOUNT_MAX_SUBSCRIPTIONS,
+      keys_per_account: ACCOUNT_MAX_KEYS,
+      sockets_per_account: ACCOUNT_MAX_SOCKETS,
+      long_polls_per_account: ACCOUNT_MAX_LONG_POLLS,
+      max_wait_seconds: MAX_WAIT_SECONDS,
+      max_ttl_seconds: MAX_TTL_SECONDS,
+      private_verify_seconds: PRIVATE_VERIFY_SECONDS,
+    },
   };
 }
 
@@ -225,7 +241,8 @@ async function login(request: Request, env: Env): Promise<Response> {
   const { id, login } = check.user;
   const { key, hash } = await newApiKey(id);
   const keyId = newKeyId();
-  await accountStub(env, id).createKey(keyId, hash, body.label?.slice(0, MAX_LABEL_LENGTH) || null, login);
+  const created = await accountStub(env, id).createKey(keyId, hash, body.label?.slice(0, MAX_LABEL_LENGTH) || null, login);
+  if (!created.ok) return problem(created.status, created.code, created.detail);
   return json({ api_key: key, key_id: keyId, account: { id, login } } satisfies LoginResponse);
 }
 
@@ -307,7 +324,8 @@ async function debug(request: Request, url: URL, env: Env): Promise<Response> {
     const { key, hash } = await newApiKey(accountId);
     const keyId = newKeyId();
     const login = body.login ?? `debug-${accountId}`;
-    await account.createKey(keyId, hash, body.label ?? "debug", login);
+    const created = await account.createKey(keyId, hash, body.label ?? "debug", login);
+    if (!created.ok) return problem(created.status, created.code, created.detail);
     return json({ api_key: key, key_id: keyId, account: { id: accountId, login } } satisfies LoginResponse);
   }
   if (rest === "/stats" && request.method === "GET") {
@@ -481,6 +499,8 @@ async function longPoll(
   target.searchParams.set("mode", "bridge");
   target.searchParams.set("after", String(first.next));
   const upgraded = await account.fetch(target, { headers: { Upgrade: "websocket" } });
+  // Too many long polls already waiting on this account.
+  if (upgraded.status === 429) return upgraded;
   const ws = upgraded.webSocket;
   if (!ws) return problem(503, "unavailable", "Could not open the bridge");
   ws.accept();

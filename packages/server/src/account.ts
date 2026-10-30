@@ -1,11 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
 import type { ActivityItem } from "./repo-hub";
 import {
+  ACCOUNT_MAX_INBOXES,
+  ACCOUNT_MAX_KEYS,
+  ACCOUNT_MAX_LONG_POLLS,
+  ACCOUNT_MAX_SOCKETS,
   ACCOUNT_MAX_SUBSCRIPTIONS,
   ACCOUNT_REQUESTS_PER_MINUTE,
+  INBOX_IDLE_DAYS,
   INBOX_MAX_EVENTS,
   MAX_LIMIT,
   problem,
+  withRetryAfter,
   type KeyInfo,
   type ClientMessage,
   type EventsPage,
@@ -48,7 +54,9 @@ type SubscriptionRow = {
   verified_until: number | null;
 };
 
-export type SubscriptionCheck = { ok: true } | { ok: false; status: number; code: string; detail: string };
+// An account cap that refused a request, as the problem the Worker answers with.
+export type Refusal = { ok: false; status: number; code: string; detail: string };
+export type SubscriptionCheck = { ok: true } | Refusal;
 
 type KeyRow = {
   id: string;
@@ -90,6 +98,9 @@ const WAKES_KEPT = 200;
 // request would be a write per request.
 const LAST_USED_GRANULARITY_MS = 60 * 60 * 1000;
 const SUBPROTOCOL = "watcheroni.v1";
+// How long a client refused for too many long polls should wait. Most end
+// well within this, when an event comes or their wait runs out.
+const LONG_POLL_RETRY_SECONDS = 30;
 
 export class Account extends DurableObject<Env> {
   private readonly instance = crypto.randomUUID();
@@ -160,12 +171,16 @@ export class Account extends DurableObject<Env> {
 
   // RPC, at login: store a new key's hash. The Worker has already checked
   // the user's GitHub token and made the key; the key itself never gets here.
-  createKey(id: string, hash: ArrayBuffer, label: string | null, login: string): KeyInfo {
+  createKey(id: string, hash: ArrayBuffer, label: string | null, login: string): { ok: true; key: KeyInfo } | Refusal {
+    const live = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM keys WHERE revoked_at IS NULL").one().n;
+    if (live >= ACCOUNT_MAX_KEYS) {
+      return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many API keys on this account (at most ${ACCOUNT_MAX_KEYS})` };
+    }
     const now = Date.now();
     this.sql.exec("INSERT INTO meta (k, v) VALUES ('login', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", login);
     this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('created_at', ?)", String(now));
     this.sql.exec("INSERT INTO keys (id, hash, label, created_at) VALUES (?, ?, ?, ?)", id, hash, label, now);
-    return keyInfo({ id, label, created_at: now, last_used_at: null });
+    return { ok: true, key: keyInfo({ id, label, created_at: now, last_used_at: null }) };
   }
 
   // RPC, on every API request: is this a live key, and is there budget
@@ -244,10 +259,40 @@ export class Account extends DurableObject<Env> {
     return { state, retryAfter };
   }
 
-  // RPC: create the inbox if needed.
-  ensureInbox(name: string): InboxRow {
+  // RPC: create the inbox if needed and there's room for it.
+  openInbox(name: string): { ok: true; inbox: InboxRow } | Refusal {
+    const room = this.roomForInbox(name);
+    return room.ok ? { ok: true, inbox: this.ensureInbox(name) } : room;
+  }
+
+  // Creates the inbox if needed, whatever the cap. Only API calls and
+  // client sockets are held to it; deliveries go to inboxes they made.
+  private ensureInbox(name: string): InboxRow {
     this.sql.exec("INSERT OR IGNORE INTO inboxes (name, created_at) VALUES (?, ?)", name, Date.now());
     return this.inbox(name)!;
+  }
+
+  // Is there room for the inbox, if it's new? At the cap, deletes the
+  // inboxes nobody has read for INBOX_IDLE_DAYS, if nothing is subscribed
+  // or connected to them, to make some.
+  private roomForInbox(name: string): { ok: true } | Refusal {
+    if (this.inbox(name)) return { ok: true };
+    const count = () => this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM inboxes").one().n;
+    if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
+    const idle = this.sql
+      .exec<{ name: string }>(
+        `SELECT name FROM inboxes WHERE MAX(created_at, COALESCE(last_read_at, 0)) < ?
+         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.inbox = inboxes.name)`,
+        Date.now() - INBOX_IDLE_DAYS * 24 * 3600 * 1000,
+      )
+      .toArray();
+    for (const { name: old } of idle) {
+      if (this.ctx.getWebSockets(`inbox:${old}`).length) continue;
+      this.sql.exec("DELETE FROM events WHERE inbox = ?", old);
+      this.sql.exec("DELETE FROM inboxes WHERE name = ?", old);
+    }
+    if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
+    return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many inboxes on this account (at most ${ACCOUNT_MAX_INBOXES})` };
   }
 
   // RPC: one page of events after `after` (or after `acked` when null).
@@ -278,7 +323,7 @@ export class Account extends DurableObject<Env> {
     if (!this.inbox(inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
     const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions").one().n;
     if (n >= ACCOUNT_MAX_SUBSCRIPTIONS) {
-      return { ok: false, status: 422, code: "quota_exceeded", detail: `subscriptions on this account (at most ${ACCOUNT_MAX_SUBSCRIPTIONS})` };
+      return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many subscriptions on this account (at most ${ACCOUNT_MAX_SUBSCRIPTIONS})` };
     }
     return { ok: true };
   }
@@ -389,7 +434,9 @@ export class Account extends DurableObject<Env> {
   // WebSocket upgrades only. The Worker has already checked the caller's
   // key or the ticket's signature and expiry, and the inbox name. A client
   // socket names its key, and a ticket's nonce and expiry; this checks the
-  // key is still live and the ticket hasn't been used.
+  // key is still live and the ticket hasn't been used. Sockets are counted
+  // by their tags, which outlast hibernation, and a socket drops out of
+  // the count however it ends.
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("expected a WebSocket upgrade", { status: 426 });
@@ -405,6 +452,22 @@ export class Account extends DurableObject<Env> {
         return problem(401, "unauthorized", "Ticket already used");
       }
     }
+    // A client that asks for a subprotocol fails the handshake unless the
+    // server picks one.
+    const offered = request.headers.get("Sec-WebSocket-Protocol")?.split(",").map((p) => p.trim()) ?? [];
+    const responseHeaders: HeadersInit = offered.includes(SUBPROTOCOL) ? { "Sec-WebSocket-Protocol": SUBPROTOCOL } : {};
+    if (mode === "client") {
+      // Too many sockets is said with a close code, which clients see more
+      // reliably than a refused handshake; the CLI long-polls instead.
+      if (this.ctx.getWebSockets("mode:client").length >= ACCOUNT_MAX_SOCKETS) {
+        return refuseSocket(4029, "too many connections", responseHeaders);
+      }
+      const room = this.roomForInbox(name);
+      if (!room.ok) return problem(room.status, room.code, room.detail);
+    } else if (this.ctx.getWebSockets("mode:bridge").length >= ACCOUNT_MAX_LONG_POLLS) {
+      const res = problem(429, "too_many_connections", `Too many long polls waiting on this account (at most ${ACCOUNT_MAX_LONG_POLLS})`);
+      return withRetryAfter(res, LONG_POLL_RETRY_SECONDS);
+    }
     this.ensureInbox(name);
 
     const { 0: client, 1: server } = new WebSocketPair();
@@ -419,10 +482,6 @@ export class Account extends DurableObject<Env> {
     // An event may have arrived between the Worker's first read and this
     // connection; send it now rather than wait for the next one.
     if (mode === "bridge") this.sendFrom(server, attachment, 1);
-    // A client that asks for a subprotocol fails the handshake unless the
-    // server picks one.
-    const offered = request.headers.get("Sec-WebSocket-Protocol")?.split(",").map((p) => p.trim()) ?? [];
-    const responseHeaders: HeadersInit = offered.includes(SUBPROTOCOL) ? { "Sec-WebSocket-Protocol": SUBPROTOCOL } : {};
     return new Response(null, { status: 101, webSocket: client, headers: responseHeaders });
   }
 
@@ -518,6 +577,15 @@ function keyInfo(row: KeyRow): KeyInfo {
     created_at: new Date(row.created_at).toISOString(),
     last_used_at: row.last_used_at === null ? null : new Date(row.last_used_at).toISOString(),
   };
+}
+
+// Completes the handshake, then closes at once with `code`. The socket
+// isn't accepted for hibernation, so it's never counted.
+function refuseSocket(code: number, reason: string, headers: HeadersInit): Response {
+  const { 0: client, 1: server } = new WebSocketPair();
+  server.accept();
+  server.close(code, reason);
+  return new Response(null, { status: 101, webSocket: client, headers });
 }
 
 function send(ws: WebSocket, msg: ServerMessage): void {
