@@ -50,9 +50,11 @@
   },
   // Secrets, not in this file (wrangler secret put, or .dev.vars for
   // wrangler dev): GITHUB_APP_PRIVATE_KEY (PKCS#8 PEM), GITHUB_CLIENT_SECRET,
-  // GITHUB_WEBHOOK_SECRET, TICKET_KEY, STORAGE_KEY (32 bytes of base64, for
-  // the cached installation tokens), and during rotation TICKET_KEY_OLD. DEBUG_TOKEN turns on the /debug
-  // routes; leave it unset in production.
+  // GITHUB_WEBHOOK_SECRET, TICKET_KEY, API_KEY_SECRET (the HMAC key for
+  // the tag on API keys; changing it invalidates every key), STORAGE_KEY
+  // (32 bytes of base64, for the cached installation tokens), and during
+  // rotation TICKET_KEY_OLD. DEBUG_TOKEN turns on the /debug routes; leave
+  // it unset in production.
 
   // The top level is the test server, watcheroni-proto on workers.dev, so
   // a plain `wrangler deploy` can't touch production. Production is

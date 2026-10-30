@@ -96,7 +96,8 @@ export default {
       return connectWithTicket(request, env, inbox, ticket);
     }
 
-    const parsed = await parseApiKey(bearer(request) ?? "");
+    // A forged key stops here, before any Durable Object.
+    const parsed = await parseApiKey(bearer(request) ?? "", env.API_KEY_SECRET);
     if (!parsed) return problem(401, "unauthorized", "Missing or malformed API key");
     const account = accountStub(env, parsed.accountId);
     const auth = await account.authenticate(parsed.hash);
@@ -214,7 +215,7 @@ async function login(request: Request, env: Env): Promise<Response> {
   if (body.label !== undefined && typeof body.label !== "string") {
     return problem(400, "invalid_request", "label must be a string");
   }
-  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET || !env.API_KEY_SECRET) {
     return problem(503, "unavailable", "Sign-in isn't configured on this server");
   }
   const check = await checkUserToken(env, body.github_token);
@@ -224,7 +225,7 @@ async function login(request: Request, env: Env): Promise<Response> {
       : withRetryAfter(problem(503, "unavailable", "Couldn't check the token with GitHub"), 30);
   }
   const { id, login } = check.user;
-  const { key, hash } = await newApiKey(id);
+  const { key, hash } = await newApiKey(id, env.API_KEY_SECRET);
   const keyId = newKeyId();
   await accountStub(env, id).createKey(keyId, hash, body.label?.slice(0, MAX_LABEL_LENGTH) || null, login);
   return json({ api_key: key, key_id: keyId, account: { id, login } } satisfies LoginResponse);
@@ -334,8 +335,9 @@ async function debug(request: Request, url: URL, env: Env): Promise<Response> {
   const rest = m[2];
 
   if (rest === "/keys" && request.method === "POST") {
+    if (!env.API_KEY_SECRET) return problem(503, "unavailable", "API_KEY_SECRET isn't set on this server");
     const body = (await readJson<{ label?: string; login?: string }>(request)) ?? {};
-    const { key, hash } = await newApiKey(accountId);
+    const { key, hash } = await newApiKey(accountId, env.API_KEY_SECRET);
     const keyId = newKeyId();
     const login = body.login ?? `debug-${accountId}`;
     await account.createKey(keyId, hash, body.label ?? "debug", login);

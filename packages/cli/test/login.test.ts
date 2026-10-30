@@ -62,7 +62,7 @@ function fake(
             return Response.json({ code: "rate_limited", title: "Too many sign-in requests from this address" }, { status, headers: { "Retry-After": "60" } });
           }
           return status === 200
-            ? Response.json({ api_key: "wk1_7_secret", key_id: "key_1", account: { id: 7, login: "octocat" } })
+            ? Response.json({ api_key: "wk2_7_secret_tag", key_id: "key_1", account: { id: 7, login: "octocat" } })
             : Response.json({ title: "nope" }, { status });
         }
         case `${SERVER}/v1/keys/current`:
@@ -209,7 +209,7 @@ describe("opening the browser", () => {
     expect(calls.find((c) => c.url === `${SERVER}/v1/login`)?.body).toMatchObject({ github_token: "ghu_tok" });
     const creds = readCredentials();
     expect(creds.servers[SERVER]).toMatchObject({
-      api_key: "wk1_7_secret",
+      api_key: "wk2_7_secret_tag",
       account: { id: 7, login: "octocat" },
       github: { access_token: "ghu_tok", refresh_token: "ghr_tok" },
     });
@@ -234,7 +234,7 @@ describe("opening the browser", () => {
     ]);
     // The device flow ran once.
     expect(calls.filter((c) => c.url === `${GITHUB}/login/device/code`)).toHaveLength(1);
-    expect(readCredentials().servers[SERVER]?.api_key).toBe("wk1_7_secret");
+    expect(readCredentials().servers[SERVER]?.api_key).toBe("wk2_7_secret_tag");
   });
 
   it("says when to try again if it's still limited", async () => {
@@ -254,7 +254,7 @@ describe("logout", () => {
     const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
     await login(SERVER, deps);
     expect(await logout(SERVER, deps)).toBe(true);
-    expect(calls.at(-1)).toMatchObject({ url: `${SERVER}/v1/keys/current`, auth: "Bearer wk1_7_secret" });
+    expect(calls.at(-1)).toMatchObject({ url: `${SERVER}/v1/keys/current`, auth: "Bearer wk2_7_secret_tag" });
     expect(JSON.parse(readFileSync(process.env.WATCHERONI_CREDENTIALS!, "utf8")).servers).toEqual({});
     expect(await logout(SERVER, deps)).toBe(false);
   });
@@ -268,8 +268,8 @@ describe("choosing the server", () => {
       delete process.env.WATCHERONI_SERVER;
       delete process.env.WATCHERONI_API_KEY;
       expect(loadServer()).toBeNull();
-      writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { [DEFAULT_SERVER]: { api_key: "wk1_7_secret" } } }));
-      expect(loadServer()).toEqual({ url: DEFAULT_SERVER, apiKey: "wk1_7_secret" });
+      writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { [DEFAULT_SERVER]: { api_key: "wk2_7_secret_tag" } } }));
+      expect(loadServer()).toEqual({ url: DEFAULT_SERVER, apiKey: "wk2_7_secret_tag" });
       process.env.WATCHERONI_SERVER = "";
       expect(loadServer()).toBeNull();
     } finally {
@@ -325,21 +325,21 @@ describe("the server URL", () => {
     const saved = { ...process.env };
     try {
       process.env.WATCHERONI_CONFIG_DIR = mkdtempSync(join(tmpdir(), "watcheroni-config-"));
-      process.env.WATCHERONI_API_KEY = "wk1_7_secret";
+      process.env.WATCHERONI_API_KEY = "wk2_7_secret_tag";
       process.env.WATCHERONI_SERVER = "http://watcheroni.dev";
       expect(() => loadServer()).toThrow(/^http:\/\/watcheroni\.dev: the server must be https/);
       expect(() => serverUrl()).toThrow(/must be https/);
       delete process.env.WATCHERONI_SERVER;
       writeFileSync(join(process.env.WATCHERONI_CONFIG_DIR, "config.json"), JSON.stringify({ server: "http://localhost.evil.com" }));
       expect(() => loadServer()).toThrow(/^http:\/\/localhost\.evil\.com: the server must be https/);
-      expect(() => new ServerClient({ url: "http://watcheroni.dev", apiKey: "wk1_7_secret" })).toThrow(/must be https/);
+      expect(() => new ServerClient({ url: "http://watcheroni.dev", apiKey: "wk2_7_secret_tag" })).toThrow(/must be https/);
 
       // Nor is anything sent to a server named outright.
       const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
       await expect(login("http://watcheroni.test", deps)).rejects.toThrow(/must be https/);
       await expect(logout("http://watcheroni.test", deps)).rejects.toThrow(/must be https/);
       writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({
-        servers: { "http://watcheroni.test": { api_key: "wk1_7_secret", github: { access_token: "ghu_old", refresh_token: "ghr_tok", expires_at: new Date(0).toISOString() } } },
+        servers: { "http://watcheroni.test": { api_key: "wk2_7_secret_tag", github: { access_token: "ghu_old", refresh_token: "ghr_tok", expires_at: new Date(0).toISOString() } } },
       }));
       await expect(githubTokenFor("http://watcheroni.test", deps)).rejects.toThrow(/must be https/);
       expect(calls).toEqual([]);

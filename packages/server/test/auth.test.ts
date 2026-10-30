@@ -1,7 +1,7 @@
-import { runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { newTicketPayload, parseApiKey, signTicket, verifyTicket } from "../src/auth";
+import { base64url, newApiKey, newTicketPayload, parseApiKey, signTicket, verifyTicket } from "../src/auth";
 import { landingPage } from "../src/pages";
 import worker from "../src/worker";
 import type { KeysResponse, LoginResponse, Meta, TicketResponse } from "../src/protocol";
@@ -25,6 +25,26 @@ const bearer = (key: string) => ({ Authorization: `Bearer ${key}` });
 
 async function mintKey(accountId = nextAccount++): Promise<LoginResponse> {
   return (await post(`/debug/accounts/${accountId}/keys`, {}, DEBUG)).json();
+}
+
+const accountStub = (id: number) => env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
+const randomSecret = () => base64url(crypto.getRandomValues(new Uint8Array(32)));
+const noAccount = () => {
+  throw new Error("no Account objects here");
+};
+// The test env, but with an ACCOUNT binding that throws if touched.
+const untouchable = () => ({ ...env, ACCOUNT: { get: noAccount, idFromName: noAccount, idFromString: noAccount } }) as unknown as Env;
+
+// Every row of every table in an account's storage, by table.
+function storedRows(accountId: number): Promise<Record<string, unknown[]>> {
+  return runInDurableObject(accountStub(accountId), (_, state) => {
+    const rows: Record<string, unknown[]> = {};
+    for (const { name } of state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'")) {
+      if (name.startsWith("_cf_") || name.startsWith("sqlite_")) continue;
+      rows[name] = state.storage.sql.exec(`SELECT * FROM "${name}"`).toArray();
+    }
+    return rows;
+  });
 }
 
 // Stands in for GitHub, recording the requests the server made. Bodies are
@@ -61,7 +81,7 @@ describe("login", () => {
     expect(res.status).toBe(200);
     const body = await res.json<LoginResponse>();
     expect(body.account).toEqual({ id, login: "octocat" });
-    expect(body.api_key).toMatch(new RegExp(`^wk1_${id}_[A-Za-z0-9_-]{43}$`));
+    expect(body.api_key).toMatch(new RegExp(`^wk2_${id}_[A-Za-z0-9_-]{43}_[A-Za-z0-9_-]{43}$`));
     expect(body.key_id).toMatch(/^key_[0-9A-Z]{26}$/);
 
     // The server asked with the App's credentials and the user's token.
@@ -109,7 +129,7 @@ describe("login", () => {
     const id = nextAccount++;
     mockGitHub({ [CHECK_URL]: tokenOk({ id, login: "hashcheck" }) });
     const { api_key } = await (await post("/v1/login", { github_token: "ghu_secret_token" })).json<LoginResponse>();
-    const parsed = (await parseApiKey(api_key))!;
+    const parsed = (await parseApiKey(api_key, env.API_KEY_SECRET))!;
     const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
     const dump = await runInDurableObject(stub, (_, state) => {
       const rows: unknown[] = [];
@@ -198,9 +218,71 @@ describe("API keys", () => {
 
   it("can't be used against another account", async () => {
     const { api_key } = await mintKey();
-    const [, , secret] = api_key.match(/^wk1_(\d+)_(.+)$/)!;
-    const other = `wk1_${nextAccount++}_${secret}`;
+    const [, , secret, tag] = api_key.match(/^wk2_(\d+)_(.{43})_(.{43})$/)!;
+    const other = `wk2_${nextAccount++}_${secret}_${tag}`;
     expect((await call("/v1/keys", { headers: bearer(other) })).status).toBe(401);
+  });
+
+  it("turns away keys without a valid tag before any Account object", async () => {
+    const { api_key } = await mintKey();
+    const [, id, secret, tag] = api_key.match(/^wk2_(\d+)_(.{43})_(.{43})$/)!;
+    const made = `wk2_${nextAccount++}_${randomSecret()}`;
+    // The tag's last character carries two unused bits; flipping one
+    // decodes to the same bytes, but isn't the tag the server wrote.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const respelt = tag.slice(0, -1) + alphabet[alphabet.indexOf(tag.at(-1)!) ^ 1];
+    for (const key of [
+      `${made}_${tag}`,
+      `${made}_${"A".repeat(43)}`,
+      made,
+      `wk2_${id}_${secret}_${tag.slice(0, -4)}${tag.endsWith("AAAA") ? "BBBB" : "AAAA"}`,
+      `wk2_${id}_${randomSecret()}_${tag}`,
+      `wk2_${id}_${secret}_${respelt}`,
+      // Keys from before tags aren't accepted at all.
+      `wk1_${id}_${secret}`,
+      `wk1_${id}_${secret}_${tag}`,
+    ]) {
+      const res = await worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(key) }), untouchable());
+      expect(res.status, key).toBe(401);
+    }
+    // And the real key gets as far as the Account object.
+    await expect(worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(api_key) }), untouchable())).rejects.toThrow(/no Account/);
+  });
+
+  it("leaves nothing in storage for a key the Account object doesn't know", async () => {
+    // A correctly tagged key for an account that was never made.
+    const madeUp = nextAccount++;
+    const { key } = await newApiKey(madeUp, env.API_KEY_SECRET);
+    expect((await call("/v1/keys", { headers: bearer(key) })).status).toBe(401);
+    expect(await storedRows(madeUp)).toEqual({});
+
+    // Nor does a wrong key for a real account, even in a new instance of
+    // its object.
+    const real = nextAccount++;
+    await mintKey(real);
+    await evictDurableObject(accountStub(real));
+    const before = await storedRows(real);
+    expect(before.keys).toHaveLength(1);
+    await evictDurableObject(accountStub(real));
+    const { key: unknown } = await newApiKey(real, env.API_KEY_SECRET);
+    expect((await call("/v1/keys", { headers: bearer(unknown) })).status).toBe(401);
+    expect(await storedRows(real)).toEqual(before);
+  });
+
+  it("aren't issued or accepted without API_KEY_SECRET", async () => {
+    const accountId = nextAccount++;
+    const { api_key } = await mintKey(accountId);
+    const unset = { ...env, API_KEY_SECRET: undefined } as unknown as Env;
+    const send = (path: string, init: RequestInit = {}) => worker.fetch(new Request(`${BASE}${path}`, init), unset);
+
+    const seen = mockGitHub({});
+    const login = await send("/v1/login", { method: "POST", body: JSON.stringify({ github_token: "ghu_x" }) });
+    expect(login.status).toBe(503);
+    expect(seen).toHaveLength(0);
+    expect((await send(`/debug/accounts/${accountId}/keys`, { method: "POST", headers: DEBUG })).status).toBe(503);
+    // A real key is turned away before any Account object.
+    const res = await worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(api_key) }), { ...untouchable(), API_KEY_SECRET: undefined } as unknown as Env);
+    expect(res.status).toBe(401);
   });
 
   it("lists keys and revokes them by ID or as current", async () => {

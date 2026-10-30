@@ -9,7 +9,7 @@ import { UsageError } from "./targets.ts";
 // the CLI works as before, polling GitHub from this machine.
 //
 //   ~/.config/watcheroni/config.json        {"server": "https://..."}
-//   ~/.config/watcheroni/credentials.json   {"servers": {"https://...": {"api_key": "wk1_..."}}}
+//   ~/.config/watcheroni/credentials.json   {"servers": {"https://...": {"api_key": "wk2_..."}}}
 //
 // WATCHERONI_SERVER and WATCHERONI_API_KEY override both, for CI. An empty
 // WATCHERONI_SERVER means local mode whatever config.json says. With

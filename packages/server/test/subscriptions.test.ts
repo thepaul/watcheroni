@@ -617,6 +617,17 @@ describe("revoking the App's authorization", () => {
     expect(res).toMatchObject({ revoked_keys: 1 });
     expect((await call("/v1/keys", { headers: user.auth })).status).toBe(401);
   });
+
+  it("leaves nothing behind for a user who never signed in", async () => {
+    const id = 987654321;
+    const res = await webhook("github_app_authorization", { action: "revoked", sender: { id, login: "stranger" } });
+    expect(res).toMatchObject({ revoked_keys: 0 });
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
+    const tables = await runInDurableObject(stub, (_, state) =>
+      state.storage.sql.exec<{ name: string }>("SELECT name FROM sqlite_master WHERE type = 'table'").toArray().map((t) => t.name),
+    );
+    expect(tables.filter((name) => !name.startsWith("_cf_") && !name.startsWith("sqlite_"))).toEqual([]);
+  });
 });
 
 describe("Installation", () => {

@@ -13,7 +13,7 @@ The words MUST, SHOULD and MAY are used as in RFC 2119.
 
 - **Account.** One GitHub user. Created the first time that user logs in.
 - **API key.** The service's own credential for an account
-  (`wk1_...`). A user may have several (one per machine or client), each
+  (`wk2_...`). A user may have several (one per machine or client), each
   revocable.
 - **Inbox.** A named, ordered log of events belonging to an account, with
   a cursor. One consumer reads one inbox. A Claude Code session, a chat
@@ -107,7 +107,7 @@ user is, once, and exchanges that for an API key.
 
    ```json
    {
-     "api_key": "wk1_1234567_Q2hhbmdlIG1lIHRvIGEgcmVhbCByYW5kb20ga2V5",
+     "api_key": "wk2_1234567_ml_7EFrJhBuG47RnIM7bUuFVWadusxzuk0f0j5fTYuI_Kp5gKQx1yzem2TnsXSs-5vgqvYQTiIV1I5KScGY3hC0",
      "key_id": "key_01JBQ3...",
      "account": {"id": 1234567, "login": "paul"}
    }
@@ -129,11 +129,11 @@ user is, once, and exchanges that for an API key.
 Every other request carries:
 
 ```
-Authorization: Bearer wk1_...
+Authorization: Bearer wk2_...
 ```
 
-The key's format is `wk1_<account id>_<secret>`; clients MUST treat it as
-opaque.
+The key's format is `wk2_<account id>_<secret>_<tag>`; clients MUST treat
+it as opaque.
 
 ### Refreshing the GitHub token
 
@@ -359,7 +359,7 @@ see "Acknowledging".
    ```
 
    Clients that can set headers on a WebSocket handshake MAY instead send
-   `Authorization: Bearer wk1_...` to the `ws` URL directly.
+   `Authorization: Bearer wk2_...` to the `ws` URL directly.
 2. Connect to `url` with subprotocol `watcheroni.v1`.
 3. Messages are JSON text frames.
 

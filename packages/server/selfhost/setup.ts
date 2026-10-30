@@ -13,7 +13,7 @@ export function toPkcs8(pem: string): string {
   return createPrivateKey(pem).export({ type: "pkcs8", format: "pem" }).toString();
 }
 
-// TICKET_KEY and STORAGE_KEY: 32 random bytes, base64.
+// TICKET_KEY, API_KEY_SECRET and STORAGE_KEY: 32 random bytes, base64.
 export function newKey(): string {
   return randomBytes(32).toString("base64");
 }

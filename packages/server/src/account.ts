@@ -77,9 +77,9 @@ export interface Delivery {
 export interface AccountStats {
   instance: string;
   startedAt: string;
-  // Each time this object was constructed: the first time, and every time
-  // it woke from hibernation or eviction. A new entry while sockets stayed
-  // open is the evidence that it hibernated.
+  // Each instance of this object that did any work: the first, and one
+  // each time it woke from hibernation or eviction. A new entry while
+  // sockets stayed open is the evidence that it hibernated.
   wakes: { instance: string; at: string }[];
   sockets: { inbox: string; mode: string; pos: number | null; connectedAt: string }[];
   inboxes: InboxRow[];
@@ -95,18 +95,35 @@ export class Account extends DurableObject<Env> {
   private readonly instance = crypto.randomUUID();
   private readonly startedAt = Date.now();
   private readonly sql: SqlStorage;
+  // Whether this account's tables exist. The Worker turns away keys
+  // without a valid tag, but checking the key's hash is this object's job;
+  // as a second line of defence, it writes nothing until login makes the
+  // account (createKey) or a key is accepted, so a request that gets this
+  // far with a bad key leaves no storage behind.
+  private created: boolean;
+  private opened = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.migrate();
+    this.created = this.sql.exec("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'keys'").toArray().length > 0;
+    if (this.created) this.migrate();
+    // Keepalives are answered by the runtime without waking the object.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+  }
+
+  // Before this instance's first write, once the caller is known to be
+  // genuine: the tables, for a new account, and a row in `wakes`.
+  private open(): void {
+    if (this.opened) return;
+    if (!this.created) this.migrate();
+    this.created = true;
+    this.opened = true;
     this.sql.exec("INSERT INTO wakes (instance, at) VALUES (?, ?)", this.instance, this.startedAt);
     this.sql.exec(
       "DELETE FROM wakes WHERE rowid NOT IN (SELECT rowid FROM wakes ORDER BY at DESC LIMIT ?)",
       WAKES_KEPT,
     );
-    // Keepalives are answered by the runtime without waking the object.
-    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   private migrate(): void {
@@ -161,6 +178,7 @@ export class Account extends DurableObject<Env> {
   // RPC, at login: store a new key's hash. The Worker has already checked
   // the user's GitHub token and made the key; the key itself never gets here.
   createKey(id: string, hash: ArrayBuffer, label: string | null, login: string): KeyInfo {
+    this.open();
     const now = Date.now();
     this.sql.exec("INSERT INTO meta (k, v) VALUES ('login', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", login);
     this.sql.exec("INSERT OR IGNORE INTO meta (k, v) VALUES ('created_at', ?)", String(now));
@@ -170,8 +188,10 @@ export class Account extends DurableObject<Env> {
 
   // RPC, on every API request: is this a live key, and is there budget
   // left? The hash is of 32 random bytes, so looking it up with `=` leaks
-  // nothing useful through timing.
+  // nothing useful through timing. Nothing is written for a key that
+  // doesn't match, not even the rate limit's bucket.
   authenticate(hash: ArrayBuffer): AuthResult {
+    if (!this.created) return { ok: false, reason: "unauthorized" };
     const key = this.sql
       .exec<{ id: string; last_used_at: number | null }>(
         "SELECT id, last_used_at FROM keys WHERE hash = ? AND revoked_at IS NULL",
@@ -179,6 +199,7 @@ export class Account extends DurableObject<Env> {
       )
       .toArray()[0];
     if (!key) return { ok: false, reason: "unauthorized" };
+    this.open();
     const now = Date.now();
     if (key.last_used_at === null || now - key.last_used_at >= LAST_USED_GRANULARITY_MS) {
       this.sql.exec("UPDATE keys SET last_used_at = ? WHERE id = ?", now, key.id);
@@ -188,8 +209,10 @@ export class Account extends DurableObject<Env> {
     return { ok: true, keyId: key.id, rate: rate.state };
   }
 
-  // RPC: live keys, oldest first.
+  // RPC: live keys, oldest first. Also reached for any GitHub user who
+  // revokes the App (revokeAllKeys), who may never have signed in.
   listKeys(): KeyInfo[] {
+    if (!this.created) return [];
     return this.sql
       .exec<KeyRow>("SELECT id, label, created_at, last_used_at FROM keys WHERE revoked_at IS NULL ORDER BY id")
       .toArray()
@@ -213,7 +236,7 @@ export class Account extends DurableObject<Env> {
   }
 
   private keyActive(id: string): boolean {
-    return this.sql.exec("SELECT 1 FROM keys WHERE id = ? AND revoked_at IS NULL", id).toArray().length > 0;
+    return this.created && this.sql.exec("SELECT 1 FROM keys WHERE id = ? AND revoked_at IS NULL", id).toArray().length > 0;
   }
 
   // Remembers a ticket's nonce until the ticket expires. False if it was
@@ -246,6 +269,7 @@ export class Account extends DurableObject<Env> {
 
   // RPC: create the inbox if needed.
   ensureInbox(name: string): InboxRow {
+    this.open();
     this.sql.exec("INSERT OR IGNORE INTO inboxes (name, created_at) VALUES (?, ?)", name, Date.now());
     return this.inbox(name)!;
   }
@@ -255,6 +279,7 @@ export class Account extends DurableObject<Env> {
   readEvents(name: string, after: number | null, limit: number): EventsPage | null {
     const inbox = this.inbox(name);
     if (!inbox) return null;
+    this.open();
     this.sql.exec("UPDATE inboxes SET last_read_at = ? WHERE name = ?", Date.now(), name);
     const from = after ?? inbox.acked;
     const events = this.eventsAfter(name, from, limit);
@@ -268,6 +293,8 @@ export class Account extends DurableObject<Env> {
 
   // RPC: move the acknowledged position forward, never back or past head.
   ack(name: string, seq: number): InboxRow | null {
+    if (!this.inbox(name)) return null;
+    this.open();
     this.sql.exec("UPDATE inboxes SET acked = MAX(acked, MIN(?, head)) WHERE name = ?", seq, name);
     return this.inbox(name);
   }
@@ -286,6 +313,7 @@ export class Account extends DurableObject<Env> {
   // RPC, once RepoHub has the subscription.
   saveSubscription(sub: SubscriptionInfo): void {
     const { baseline: _, ...rest } = sub;
+    this.open();
     this.sql.exec(
       `INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at, verified_until)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -308,6 +336,7 @@ export class Account extends DurableObject<Env> {
   }
 
   getSubscription(inbox: string, id: string): SubscriptionInfo | null {
+    if (!this.created) return null;
     const row = this.sql.exec<SubscriptionRow>("SELECT * FROM subscriptions WHERE inbox = ? AND id = ?", inbox, id).toArray()[0];
     return row ? subscriptionInfo(row) : null;
   }
@@ -317,6 +346,7 @@ export class Account extends DurableObject<Env> {
   // now if a client is connected to it. A time not in the future means
   // nobody has read the inbox for the whole TTL.
   subscriptionActivity(items: ActivityItem[]): Record<string, number> {
+    this.open();
     const now = Date.now();
     const out: Record<string, number> = {};
     for (const item of items) {
@@ -374,6 +404,10 @@ export class Account extends DurableObject<Env> {
 
   // RPC: what the hibernation test looks at.
   stats(): AccountStats {
+    if (!this.created) {
+      return { instance: this.instance, startedAt: new Date(this.startedAt).toISOString(), wakes: [], sockets: [], inboxes: [] };
+    }
+    this.open();
     const wakes = this.sql
       .exec<{ instance: string; at: number }>("SELECT instance, at FROM wakes ORDER BY at DESC LIMIT 50")
       .toArray()
@@ -427,6 +461,7 @@ export class Account extends DurableObject<Env> {
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    this.open();
     const attachment = ws.deserializeAttachment() as Attachment;
     let msg: ClientMessage;
     try {
@@ -479,6 +514,7 @@ export class Account extends DurableObject<Env> {
   }
 
   private inbox(name: string): InboxRow | null {
+    if (!this.created) return null;
     return this.sql.exec<InboxRow>("SELECT * FROM inboxes WHERE name = ?", name).toArray()[0] ?? null;
   }
 
