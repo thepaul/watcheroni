@@ -93,9 +93,11 @@ export interface TicketResponse {
   url: string;
 }
 
-// `wk1_<account id>_<secret>`. Clients treat keys as opaque; this is for
-// the server and for telling a key from other strings.
-export const API_KEY = /^wk1_(\d{1,20})_([A-Za-z0-9_-]{43})$/;
+// `wk2_<account id>_<secret>_<tag>`, the tag being the server's HMAC of
+// everything before it. Clients treat keys as opaque; this is for the
+// server and for telling a key from other strings. Groups: account id,
+// secret, tag.
+export const API_KEY = /^wk2_(\d{1,20})_([A-Za-z0-9_-]{43})_([A-Za-z0-9_-]{43})$/;
 export const TICKET_TTL_SECONDS = 60;
 export const ACCOUNT_REQUESTS_PER_MINUTE = 120;
 

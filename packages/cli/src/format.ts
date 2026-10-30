@@ -181,7 +181,7 @@ const MAX_LISTED = 10;
 const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
 
 // A value made printable on one line, and cut to a sane length.
-function clean(v: unknown): string {
+export function clean(v: unknown): string {
   const s = String(v ?? "").replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim();
   return s.length > MAX_LENGTH ? `${s.slice(0, MAX_LENGTH - 1)}…` : s;
 }

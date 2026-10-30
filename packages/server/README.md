@@ -9,10 +9,15 @@ What's here, compared with the full design:
 
 - **Implemented:** sign-in (`POST /v1/login` checks a GitHub App user
   token with GitHub and issues an API key, of which only a SHA-256 hash is
-  stored in that user's `acct:<id>` object), `GET /v1/keys`,
+  stored in that user's `acct:<id>` object, and which carries an HMAC
+  tag under `API_KEY_SECRET` so made-up keys never reach a Durable
+  Object), `GET /v1/keys`,
   `DELETE /v1/keys/{id|current}`, the `POST /v1/github/refresh` proxy,
-  WebSocket tickets (`TICKET_KEY`, `TICKET_KEY_OLD` for rotation) and the
-  per-account limit of 120 requests a minute. Inboxes, numbered events
+  WebSocket tickets (`TICKET_KEY`, `TICKET_KEY_OLD` for rotation), the
+  per-account limit of 120 requests a minute, and limits per IPv4
+  address or IPv6 /64 on `/v1/login` and `/v1/github/refresh` (Rate
+  Limiting bindings, which `wrangler dev` and the tests simulate
+  locally; a config without them limits nothing). Inboxes, numbered events
   with dedupe by `id`, `ack`, `GET .../events?after=&wait=&limit=`
   long-polling through the Worker bridge, the WebSocket protocol (`hello`,
   `ready`, `events`, `ack`, `ping`/`pong` answered by the runtime), and
@@ -30,8 +35,7 @@ What's here, compared with the full design:
   and `/debug/{accounts,repos,installations}/{id}` show what an object is
   doing (see "Worker routes" in DESIGN.md).
 - **Not yet:** Control, re-verifying private
-  subscriptions (`/verify`), expiring subscriptions, the per-IP limit on
-  `/v1/login` and `/v1/github/refresh`, revoking keys on the
+  subscriptions (`/verify`), expiring subscriptions, revoking keys on the
   `github_app_authorization` webhook (`Account.revokeAllKeys` is ready for
   it), `inbox.gap`. The tests stub GitHub.
 
@@ -67,6 +71,16 @@ openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put STORAGE_KEY
 openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put STORAGE_KEY --env production
 ```
 
+And `API_KEY_SECRET` (the same), the HMAC key for the tag on API keys.
+Without it, login and `/debug` key minting answer 503 and no key is
+accepted. Changing it invalidates every key issued under the old one,
+so set it once:
+
+```
+openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put API_KEY_SECRET
+openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put API_KEY_SECRET --env production
+```
+
 ## Run your own
 
 To run your own server, with your own GitHub App, on your own Cloudflare
@@ -99,7 +113,8 @@ anyway; `watcheroni selfhost` just runs it from the clone you're in.
 The Worker's configuration is `wrangler.selfhost.json` (gitignored),
 made from `wrangler.jsonc`'s production settings with your name and
 App. After a `git pull`, redeploy with `npm run selfhost -- --update`,
-which remakes it. Other wrangler commands take `-c
+which remakes it and sets any secret the new version needs that the
+Worker doesn't have yet (such as `API_KEY_SECRET`). Other wrangler commands take `-c
 wrangler.selfhost.json`, e.g. `npx wrangler tail -c
 wrangler.selfhost.json`. If a run stops part way, run it again: the
 Worker's name and account, and then the App it created, are kept in
@@ -131,6 +146,7 @@ and run it again.
    ```
    npx wrangler login
    npx wrangler secret put TICKET_KEY
+   npx wrangler secret put API_KEY_SECRET
    npx wrangler secret put DEBUG_TOKEN
    npm run deploy
    ```

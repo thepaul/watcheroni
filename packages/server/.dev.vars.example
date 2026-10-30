@@ -5,6 +5,9 @@ TICKET_KEY=change-me
 # The previous TICKET_KEY while rotating; tickets live 60 seconds, so it
 # can be removed a minute after the new key is in place.
 TICKET_KEY_OLD=
+# HMAC key for the tag on API keys, e.g. `openssl rand -base64 32`.
+# Changing it invalidates every key issued under the old one.
+API_KEY_SECRET=change-me
 # Turns on the /debug routes (minting keys, injecting events, stats).
 DEBUG_TOKEN=change-me
 # The App's private key as PKCS#8 PEM (GitHub gives PKCS#1; convert with

@@ -99,7 +99,10 @@ Desktop and phone notifications, Slack, only CI failures, and running
 Sign in, which runs GitHub's device flow and saves an API key in
 `~/.config/watcheroni/credentials.json` (mode 0600). It opens the browser
 at GitHub's code page when you're at this machine's own terminal; over
-SSH, or with `WATCHERONI_NO_BROWSER` set, it just prints the address:
+SSH, or with `WATCHERONI_NO_BROWSER` set, it just prints the address. It
+signs in at github.com whatever the server says, and only sends you to an
+`https://github.com` page: if GitHub's answer names another, the sign-in
+stops there.
 
 ```
 watcheroni login                      # https://watcheroni.dev
@@ -113,6 +116,11 @@ the credentials file. The environment wins, and `WATCHERONI_SERVER=`
 (empty) forces local mode. `WATCHERONI_CONFIG_DIR` moves both files, and
 `WATCHERONI_CREDENTIALS` moves just the credentials. `watcheroni logout`
 revokes the key and forgets it.
+
+The server URL must be `https://`: the API key goes with every request,
+and the GitHub tokens with sign-in and refreshes. Plain `http://` is only
+accepted to this machine itself (`localhost`, `*.localhost`, `127.0.0.0/8`
+or `[::1]`), for a server running under `wrangler dev`.
 
 To run your own server, with your own GitHub App, on Cloudflare's free
 plan: `watcheroni selfhost` in a clone of the repository (see

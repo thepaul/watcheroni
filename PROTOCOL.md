@@ -13,7 +13,7 @@ The words MUST, SHOULD and MAY are used as in RFC 2119.
 
 - **Account.** One GitHub user. Created the first time that user logs in.
 - **API key.** The service's own credential for an account
-  (`wk1_...`). A user may have several (one per machine or client), each
+  (`wk2_...`). A user may have several (one per machine or client), each
   revocable.
 - **Inbox.** A named, ordered log of events belonging to an account, with
   a cursor. One consumer reads one inbox. A Claude Code session, a chat
@@ -75,6 +75,11 @@ with no GitHub App configured leaves out `github` and doesn't offer
 sign-in. `github.app_slug` and `github.install_url` are present only when
 the server knows its App's slug (each copy of the server, self-hosted
 ones included, has its own App); clients MUST cope without them.
+Clients SHOULD NOT open a URL, or offer it as a place to sign in or
+install the App, unless it's an `https://github.com/` page. The
+watcheroni CLI runs the device flow on github.com whatever `web_url`
+says, refuses a `verification_uri` anywhere else, and leaves out any
+other `install_url`.
 
 ## Authentication
 
@@ -105,7 +110,7 @@ user is, once, and exchanges that for an API key.
 
    ```json
    {
-     "api_key": "wk1_1234567_Q2hhbmdlIG1lIHRvIGEgcmVhbCByYW5kb20ga2V5",
+     "api_key": "wk2_1234567_ml_7EFrJhBuG47RnIM7bUuFVWadusxzuk0f0j5fTYuI_Kp5gKQx1yzem2TnsXSs-5vgqvYQTiIV1I5KScGY3hC0",
      "key_id": "key_01JBQ3...",
      "account": {"id": 1234567, "login": "paul"}
    }
@@ -114,7 +119,11 @@ user is, once, and exchanges that for an API key.
    The key is shown only once. `label` is optional (at most 100
    characters are kept). A failure to reach GitHub is `503 unavailable`
    with `Retry-After`. An account with `limits.keys_per_account` live keys
-   already gets `422 quota_exceeded`; revoke one first (see "Keys").
+   already gets `422 quota_exceeded`; revoke one first (see "Keys"). Too
+   many logins from one IPv4 address or IPv6 /64 are `429 rate_limited`
+   with `Retry-After`, and no `RateLimit-*` headers (they describe an
+   account's budget); the GitHub token is still good, so the client can
+   wait and send it again.
 
 3. The client keeps the GitHub token and refresh token **locally**. It
    needs them again only to subscribe to private repositories (see
@@ -125,11 +134,11 @@ user is, once, and exchanges that for an API key.
 Every other request carries:
 
 ```
-Authorization: Bearer wk1_...
+Authorization: Bearer wk2_...
 ```
 
-The key's format is `wk1_<account id>_<secret>`; clients MUST treat it as
-opaque.
+The key's format is `wk2_<account id>_<secret>_<tag>`; clients MUST treat
+it as opaque.
 
 ### Refreshing the GitHub token
 
@@ -146,6 +155,10 @@ The response is GitHub's own status and body (`access_token`,
 `refresh_token`, `expires_in`, ...), passed through unchanged; note that
 GitHub reports a bad or expired refresh token as `200` with an `error`
 field. No API key is needed, since the refresh token is the credential.
+Too many refreshes from one IPv4 address or IPv6 /64 are the server's
+own `429 rate_limited` with `Retry-After` (and no `RateLimit-*`
+headers), not GitHub's answer; the refresh token hasn't been used, so it
+can be sent again later.
 
 ### Keys
 
@@ -362,7 +375,7 @@ WebSocket instead.
    ```
 
    Clients that can set headers on a WebSocket handshake MAY instead send
-   `Authorization: Bearer wk1_...` to the `ws` URL directly.
+   `Authorization: Bearer wk2_...` to the `ws` URL directly.
 2. Connect to `url` with subprotocol `watcheroni.v1`.
 3. Messages are JSON text frames.
 

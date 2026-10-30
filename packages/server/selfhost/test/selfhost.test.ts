@@ -28,8 +28,9 @@ function fake(
     loggedIn?: boolean;
     workerExists?: boolean;
     // The Worker's deployment history on Cloudflare (null: no Worker),
-    // shared between runs that pass the same object.
-    cloud?: { history: string[] | null };
+    // and the names of its secrets, shared between runs that pass the
+    // same object.
+    cloud?: { history: string[] | null; secrets?: string[] };
     // What's typed at --trust-worker's question; null: no terminal.
     answer?: string | null;
     deviceFlowAfter?: number;
@@ -61,9 +62,15 @@ function fake(
           const stdout = JSON.stringify(cloud.history.map((id, i) => ({ created_on: `2026-10-29T00:00:${String(i).padStart(2, "0")}Z`, versions: [{ version_id: id }] })));
           return { code: 0, output: stdout, stdout };
         }
-        case "secret":
+        case "secret": {
+          if (args[1] === "list") {
+            const stdout = JSON.stringify((cloud.secrets ?? []).map((name) => ({ name, type: "secret_text" })));
+            return { code: 0, output: stdout, stdout };
+          }
+          (cloud.secrets ??= []).push(args[2]);
           (cloud.history ??= []).push(randomUUID());
           return { code: 0, output: "" };
+        }
         case "deploy":
           (cloud.history ??= []).push(randomUUID());
           return { code: 0, output: `Uploaded\n  ${URL_}\nCurrent Version ID: ${cloud.history.at(-1)}\n` };
@@ -102,6 +109,7 @@ describe("selfhost", () => {
       "secret put GITHUB_CLIENT_SECRET",
       "secret put GITHUB_WEBHOOK_SECRET",
       "secret put TICKET_KEY",
+      "secret put API_KEY_SECRET",
       "secret put STORAGE_KEY",
       "deployments list --name",
       `deploy -c ${CONFIG_FILE}`,
@@ -130,7 +138,8 @@ describe("selfhost", () => {
     expect(secrets.GITHUB_WEBHOOK_SECRET).toBe("webhook-secret");
     expect(Buffer.from(secrets.TICKET_KEY, "base64")).toHaveLength(32);
     expect(Buffer.from(secrets.STORAGE_KEY, "base64")).toHaveLength(32);
-    expect(secrets.TICKET_KEY).not.toBe(secrets.STORAGE_KEY);
+    expect(Buffer.from(secrets.API_KEY_SECRET, "base64")).toHaveLength(32);
+    expect(new Set([secrets.TICKET_KEY, secrets.STORAGE_KEY, secrets.API_KEY_SECRET]).size).toBe(3);
     for (const c of f.wrangler) for (const value of Object.values(secrets)) expect(c.args.join(" ")).not.toContain(value);
 
     // Device flow was off once, so it asked.
@@ -162,7 +171,25 @@ describe("selfhost", () => {
     const secrets = Object.fromEntries(second.wrangler.filter((c) => c.args[0] === "secret").map((c) => [c.args[2], c.input]));
     expect(secrets.TICKET_KEY).toBe(pending.ticket_key);
     expect(secrets.STORAGE_KEY).toBe(pending.storage_key);
+    expect(secrets.API_KEY_SECRET).toBe(pending.api_key_secret);
     expect(second.files[PENDING_FILE]).toBeUndefined();
+  });
+
+  it("--update gives a server set up before API_KEY_SECRET one", async () => {
+    const done = fake();
+    await selfhost(OPTIONS, done.deps);
+    done.cloud.secrets = done.cloud.secrets!.filter((s) => s !== "API_KEY_SECRET");
+    const update = fake({ cloud: done.cloud, files: { [CONFIG_FILE]: done.files[CONFIG_FILE], [WORKER_FILE]: done.files[WORKER_FILE] } });
+    await selfhost({ ...OPTIONS, update: true }, update.deps);
+    expect(update.wrangler.map((c) => c.args.slice(0, 3).join(" "))).toEqual([
+      "whoami --json",
+      "deployments list --name",
+      "secret list -c",
+      "secret put API_KEY_SECRET",
+      `deploy -c ${CONFIG_FILE}`,
+    ]);
+    expect(Buffer.from(update.wrangler[3].input!, "base64")).toHaveLength(32);
+    expect(JSON.parse(update.files[WORKER_FILE]).version_id).toBe(done.cloud.history!.at(-1));
   });
 
   it("--update remakes the configuration and deploys, and a finished setup isn't redone", async () => {
@@ -174,8 +201,8 @@ describe("selfhost", () => {
 
     const update = fake({ cloud: done.cloud, files: { [CONFIG_FILE]: config, [WORKER_FILE]: done.files[WORKER_FILE] } });
     await selfhost({ ...OPTIONS, update: true }, update.deps);
-    expect(update.wrangler.map((c) => c.args[0])).toEqual(["whoami", "deployments", "deploy"]);
-    expect(update.wrangler[2].config).toMatchObject({ name: "watcheroni", vars: { GITHUB_APP_SLUG: "watcheroni-acme" } });
+    expect(update.wrangler.map((c) => c.args.slice(0, 2).join(" "))).toEqual(["whoami --json", "deployments list", "secret list", "deploy -c"]);
+    expect(update.wrangler[3].config).toMatchObject({ name: "watcheroni", vars: { GITHUB_APP_SLUG: "watcheroni-acme" } });
     expect(JSON.parse(update.files[WORKER_FILE]).version_id).toBe(done.cloud.history!.at(-1));
 
     // A configuration edited to point at another Worker, which has its own

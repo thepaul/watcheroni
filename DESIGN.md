@@ -114,8 +114,8 @@ which never change when a repo or user is renamed or transferred:
 | `Installation` | `inst:<installation.id>` | `inst:55501234` |
 | `Control` | `control` | `control` |
 
-The account ID is in every API key (`wk1_<user id>_<secret>`) and every
-WebSocket ticket, so the Worker can route a request to the right
+The account ID is in every API key (`wk2_<user id>_<secret>_<tag>`) and
+every WebSocket ticket, so the Worker can route a request to the right
 `Account` without looking anything up.
 
 All classes use the SQLite storage backend (`new_sqlite_classes` in the
@@ -699,6 +699,7 @@ server can be down without losing events.
 | `GITHUB_APP_PRIVATE_KEY` | secret | Signs App JWTs (RS256). Stored as PKCS#8 PEM, since Web Crypto can't import GitHub's PKCS#1; setup converts it. |
 | `GITHUB_CLIENT_SECRET` | secret | Checking user tokens (`POST /applications/{client_id}/token`) and the refresh proxy |
 | `GITHUB_WEBHOOK_SECRET` | secret | Webhook HMAC. `GITHUB_WEBHOOK_SECRET_OLD` during rotation. |
+| `API_KEY_SECRET` | secret | HMAC for the tag on API keys, so the Worker turns away made-up keys before any Durable Object. Changing it invalidates every key; there is no `_OLD`, since keys live until revoked. Without it, login answers 503 and no key is accepted. |
 | `TICKET_KEY` | secret | HMAC for WebSocket tickets. `TICKET_KEY_OLD` during rotation; tickets live 60 seconds, so it can go a minute after the switch. |
 | `DEBUG_TOKEN` | secret | Development only: turns on the `/debug` routes. Unset in production. |
 | `STORAGE_KEY` | secret | AES-256-GCM key for installation tokens cached in storage |
@@ -726,10 +727,16 @@ Derived and cached:
 
 ### API keys and tickets
 
-- Key: `wk1_<user id>_<base64url of 32 random bytes>`. The Worker routes
-  on the user ID and sends the hash to `Account.authenticate`, which
-  compares it with stored hashes and updates `last_used_at` at most once
-  an hour.
+- Key: `wk2_<user id>_<secret>_<tag>`, where the secret is base64url of
+  32 random bytes and the tag is base64url of the HMAC-SHA256, under
+  `API_KEY_SECRET`, of `wk2_<user id>_<secret>`. The Worker checks the
+  tag without any storage, comparing it as text with the one it would
+  write, so a made-up key never reaches a Durable Object; then it routes
+  on the user ID and sends the secret's hash to `Account.authenticate`,
+  which compares it with stored hashes and updates `last_used_at` at
+  most once an hour. As a second line of defence, `Account` writes
+  nothing, not even its tables, until login creates the account or a
+  key matches. Keys from before the tag (`wk1_...`) aren't accepted.
 - WebSocket ticket: `wt1.<base64url payload>.<HMAC>`, where the payload
   is the JSON `{acct, inbox, key, exp, nonce}` (`exp` in Unix seconds,
   60 seconds ahead) and the HMAC is SHA-256 over `wt1.<payload>`, in
@@ -905,15 +912,15 @@ differs from the above:
 
 ## Limits
 
-Rate limits are token buckets kept in SQLite (`buckets` tables), refilled
-by elapsed time when read. That makes them exact and free: they live in an
-object that's already being called. Caps on what an account holds are
-counts: rows in its SQLite, or its sockets by tag
-(`ctx.getWebSockets("mode:client")`, `"mode:bridge"`), which the runtime
-keeps across hibernation. A long poll is counted by its bridge socket, so
-it stops counting however its request ends. Defaults below; a deployment changes
-them with Worker vars, and `Control` can override them for one repo or
-account.
+Rate limits, except the per-IP ones, are token buckets kept in SQLite
+(`buckets` tables), refilled by elapsed time when read. That makes them
+exact and free: they live in an object that's already being called. Caps
+on what an account holds are counts: rows in its SQLite, or its sockets
+by tag (`ctx.getWebSockets("mode:client")`, `"mode:bridge"`), which the
+runtime keeps across hibernation. A long poll is counted by its bridge
+socket, so it stops counting however its request ends. Defaults below; a
+deployment changes them with Worker vars, and `Control` can override
+them for one repo or account.
 
 ### Per repository (in RepoHub)
 
@@ -947,10 +954,37 @@ but unwatched repo is never throttled; it only costs one cheap call.
 | Long polls waiting at once | 50 (`429 too_many_connections` with `Retry-After` beyond) |
 | Events delivered | 10,000 a day; beyond that the inbox gets `inbox.gap` |
 
-### Per IP address (Rate Limiting binding)
+### Per IPv4 address or IPv6 /64 (Rate Limiting binding)
 
-`/v1/login` and `/v1/github/refresh`: 10 a minute. `/v1/meta`: 60 a
-minute.
+`/v1/login` and `/v1/github/refresh` need no API key, and each costs a
+GitHub call made with the App's client secret, so a flood of them could
+get the App throttled by GitHub and stop everyone signing in. Each has
+its own Rate Limiting binding (`LOGIN_RATE_LIMIT`, `REFRESH_RATE_LIMIT`
+in `wrangler.jsonc`), counting per IPv4 address or IPv6 /64 from
+`CF-Connecting-IP` (`src/ip.ts`). An IPv6 connection usually comes with
+a whole /64, so counting single IPv6 addresses would let one client take
+a new one for every request; an IPv4-mapped IPv6 address counts as its
+IPv4 address.
+
+| Endpoint | Limit | When exceeded |
+|---|---|---|
+| `/v1/login` | 10 a minute | `429 rate_limited`, `Retry-After: 60`, before any GitHub call |
+| `/v1/github/refresh` | 10 a minute | the same |
+
+A person signs in a handful of times ever, and a CLI refreshes its token
+at most every 8 hours (when it next needs one for a private repo), so
+these leave room for a large office behind one address while holding a
+single address to well under GitHub's budget for the App. The binding's
+counts are kept per Cloudflare location and are approximate, which is
+enough for this. A flood from many addresses isn't stopped by it.
+
+`wrangler dev` and the tests simulate the bindings locally. They fail
+open: without the binding (a self-hosted config from before it), without
+`CF-Connecting-IP`, or when the limiter errors, the request goes through. The limit guards GitHub's
+budget, not access (each request still needs a token GitHub issued to
+this App), and failing closed would turn a missing binding into the
+outage the limit is there to prevent. `/v1/meta` makes no GitHub call
+and isn't limited.
 
 ## Capacity
 
@@ -1121,7 +1155,8 @@ server doesn't send it, with a `--jq` filter that keeps just the text.
 ### Local state
 
 - `~/.config/watcheroni/config.json`: server URL (default the hosted
-  copy) and default options.
+  copy) and default options. The URL must be https, since secrets go to
+  it; plain http only to a loopback host, for development.
 - `~/.config/watcheroni/credentials.json` (mode 0600): per server, the API
   key, and the GitHub user token, refresh token and expiry. Overridable
   with `WATCHERONI_API_KEY` and `WATCHERONI_SERVER` for CI. OS keychain
@@ -1182,8 +1217,9 @@ npm run selfhost            # or `watcheroni selfhost`, in the clone
    it opens a browser to a pre-filled "create App" page with the right
    permissions, events and URLs; the user clicks once; GitHub returns the
    App ID, client ID and secret, private key and webhook secret.
-3. Converting the key to PKCS#8, generating `TICKET_KEY` and
-   `STORAGE_KEY`, and storing everything with `wrangler secret put`.
+3. Converting the key to PKCS#8, generating `TICKET_KEY`,
+   `API_KEY_SECRET` and `STORAGE_KEY`, and storing everything with
+   `wrangler secret put`.
 4. `wrangler deploy`, then pointing the CLI at the new server.
 
 It runs on the deployer's own Cloudflare account, free plan included.

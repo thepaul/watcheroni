@@ -5,21 +5,36 @@ import { API_KEY, TICKET_TTL_SECONDS } from "./protocol";
 
 const encoder = new TextEncoder();
 
-// A new key for an account. Only `hash` is ever stored; `key` is shown to
-// the user once.
-export async function newApiKey(accountId: number): Promise<{ key: string; hash: ArrayBuffer }> {
+// A new key for an account, tagged with an HMAC under API_KEY_SECRET so
+// the Worker can turn away made-up keys without waking an Account object.
+// Only `hash` is ever stored; `key` is shown to the user once.
+export async function newApiKey(accountId: number, apiKeySecret: string): Promise<{ key: string; hash: ArrayBuffer }> {
   const secret = base64url(crypto.getRandomValues(new Uint8Array(32)));
-  return { key: `wk1_${accountId}_${secret}`, hash: await sha256(secret) };
+  const body = `wk2_${accountId}_${secret}`;
+  return { key: `${body}_${await keyTag(body, apiKeySecret)}`, hash: await sha256(secret) };
 }
 
 // Splits a key into the account it belongs to and the hash to look up.
-// Null if it isn't shaped like a key.
-export async function parseApiKey(key: string): Promise<{ accountId: number; hash: ArrayBuffer } | null> {
+// Null if it isn't shaped like a key or its tag doesn't check out
+// (always, without API_KEY_SECRET).
+export async function parseApiKey(
+  key: string,
+  apiKeySecret: string | undefined,
+): Promise<{ accountId: number; hash: ArrayBuffer } | null> {
   const m = API_KEY.exec(key);
-  if (!m) return null;
-  const accountId = Number(m[1]);
+  if (!m || !apiKeySecret) return null;
+  const [, id, secret, tag] = m;
+  const accountId = Number(id);
   if (!Number.isSafeInteger(accountId)) return null;
-  return { accountId, hash: await sha256(m[2]) };
+  // Compared as text, not decoded: base64url has more than one spelling
+  // of the same bytes, and only the one the server wrote is a key.
+  if (!(await secretsEqual(tag, await keyTag(`wk2_${id}_${secret}`, apiKeySecret)))) return null;
+  return { accountId, hash: await sha256(secret) };
+}
+
+async function keyTag(body: string, apiKeySecret: string): Promise<string> {
+  const mac = await crypto.subtle.sign("HMAC", await hmacKey(apiKeySecret), encoder.encode(body));
+  return base64url(new Uint8Array(mac));
 }
 
 export function bearer(request: Request): string | null {

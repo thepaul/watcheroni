@@ -24,6 +24,7 @@ import {
 } from "./subscriptions";
 import pkg from "../package.json";
 import { image } from "./images";
+import { ipLimitKey } from "./ip";
 import { landingPage, setupPage } from "./pages";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
@@ -84,8 +85,8 @@ export default {
     if (img) return img;
     if (route === "GET /v1/meta") return json(meta(env));
     if (route === "POST /github/webhook") return webhook(request, env);
-    if (route === "POST /v1/login") return login(request, env);
-    if (route === "POST /v1/github/refresh") return refresh(request, env);
+    if (route === "POST /v1/login") return (await ipLimited(env.LOGIN_RATE_LIMIT, request)) ?? login(request, env);
+    if (route === "POST /v1/github/refresh") return (await ipLimited(env.REFRESH_RATE_LIMIT, request)) ?? refresh(request, env);
     if (pathname.startsWith("/debug/")) return debug(request, url, env);
 
     const inboxMatch = pathname.match(/^\/v1\/inboxes\/([^/]+)(?:(\/[a-z]+)(?:\/([^/]+)(\/[a-z]+)?)?)?$/);
@@ -100,7 +101,8 @@ export default {
       return connectWithTicket(request, env, inbox, ticket);
     }
 
-    const parsed = await parseApiKey(bearer(request) ?? "");
+    // A forged key stops here, before any Durable Object.
+    const parsed = await parseApiKey(bearer(request) ?? "", env.API_KEY_SECRET);
     if (!parsed) return problem(401, "unauthorized", "Missing or malformed API key");
     const account = accountStub(env, parsed.accountId);
     const auth = await account.authenticate(parsed.hash);
@@ -229,7 +231,7 @@ async function login(request: Request, env: Env): Promise<Response> {
   if (body.label !== undefined && typeof body.label !== "string") {
     return problem(400, "invalid_request", "label must be a string");
   }
-  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET) {
+  if (!env.GITHUB_CLIENT_ID || !env.GITHUB_CLIENT_SECRET || !env.API_KEY_SECRET) {
     return problem(503, "unavailable", "Sign-in isn't configured on this server");
   }
   const check = await checkUserToken(env, body.github_token);
@@ -239,7 +241,7 @@ async function login(request: Request, env: Env): Promise<Response> {
       : withRetryAfter(problem(503, "unavailable", "Couldn't check the token with GitHub"), 30);
   }
   const { id, login } = check.user;
-  const { key, hash } = await newApiKey(id);
+  const { key, hash } = await newApiKey(id, env.API_KEY_SECRET);
   const keyId = newKeyId();
   const created = await accountStub(env, id).createKey(keyId, hash, body.label?.slice(0, MAX_LABEL_LENGTH) || null, login);
   if (!created.ok) return problem(created.status, created.code, created.detail);
@@ -260,6 +262,36 @@ async function refresh(request: Request, env: Env): Promise<Response> {
   } catch {
     return withRetryAfter(problem(503, "unavailable", "Couldn't reach GitHub"), 30);
   }
+}
+
+// The Retry-After on their 429s. It must match the `period` of
+// LOGIN_RATE_LIMIT and REFRESH_RATE_LIMIT in wrangler.jsonc (both
+// environments).
+const IP_LIMIT_PERIOD_SECONDS = 60;
+
+// A 429 if the caller's IPv4 address or IPv6 /64 is over `limiter`'s
+// limit, else null. For /v1/login and /v1/github/refresh, which need no
+// API key but each cost a GitHub call with the App's client secret: a
+// flood of them could get the App throttled by GitHub and stop everyone
+// signing in. (wrangler dev and the tests simulate the bindings locally.)
+//
+// It fails open. Without the binding (a self-hosted config made before
+// it existed), without CF-Connecting-IP (which Cloudflare always sets),
+// or when the limiter itself fails, the request goes through. The limit
+// protects GitHub's budget for the App, not access to anything: each
+// request still needs a GitHub token or refresh token issued to this App,
+// so failing closed would only turn a missing binding into the outage the
+// limit is there to prevent.
+async function ipLimited(limiter: RateLimit | undefined, request: Request): Promise<Response | null> {
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (!limiter || !ip) return null;
+  try {
+    if ((await limiter.limit({ key: ipLimitKey(ip) })).success) return null;
+  } catch (e) {
+    console.error("rate limiter failed", e);
+    return null;
+  }
+  return withRetryAfter(problem(429, "rate_limited", "Too many sign-in requests from this address"), IP_LIMIT_PERIOD_SECONDS);
 }
 
 async function connectWithTicket(request: Request, env: Env, inbox: string, ticket: string): Promise<Response> {
@@ -320,8 +352,9 @@ async function debug(request: Request, url: URL, env: Env): Promise<Response> {
   const rest = m[2];
 
   if (rest === "/keys" && request.method === "POST") {
+    if (!env.API_KEY_SECRET) return problem(503, "unavailable", "API_KEY_SECRET isn't set on this server");
     const body = (await readJson<{ label?: string; login?: string }>(request)) ?? {};
-    const { key, hash } = await newApiKey(accountId);
+    const { key, hash } = await newApiKey(accountId, env.API_KEY_SECRET);
     const keyId = newKeyId();
     const login = body.login ?? `debug-${accountId}`;
     const created = await account.createKey(keyId, hash, body.label ?? "debug", login);

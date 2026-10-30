@@ -5,8 +5,9 @@
 //   1. checks `wrangler login`, and pins one Cloudflare account;
 //   2. after checking no Worker of that name exists, deploys the Worker once without an App, to learn its workers.dev URL;
 //   3. creates the GitHub App with GitHub's manifest flow, for that URL;
-//   4. converts the App's key to PKCS#8, generates TICKET_KEY and
-//      STORAGE_KEY, and sets every secret with `wrangler secret put`;
+//   4. converts the App's key to PKCS#8, generates TICKET_KEY,
+//      API_KEY_SECRET and STORAGE_KEY, and sets every secret with
+//      `wrangler secret put`;
 //   5. deploys again with the App's ID, client ID and slug as vars;
 //   6. has you turn on device flow (a manifest can't), and points the CLI
 //      at the new server.
@@ -82,6 +83,7 @@ interface State {
   version_id?: string;
   app?: NewApp;
   ticket_key?: string;
+  api_key_secret?: string;
   storage_key?: string;
 }
 
@@ -241,6 +243,21 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     }
     return url;
   };
+  // Values go to wrangler on stdin, never on a command line.
+  const putSecret = async (secret: string, value: string) => {
+    print(`Setting ${secret}...`);
+    const { code } = await wrangler(["secret", "put", secret, "-c", CONFIG_FILE], { input: value });
+    if (code !== 0) throw new SelfhostFailed(`wrangler secret put ${secret} failed (exit ${code}); run selfhost again to carry on`);
+  };
+  const secretNames = async (): Promise<string[]> => {
+    const { code, stdout } = await wrangler(["secret", "list", "-c", CONFIG_FILE, "--format", "json"], { quiet: true });
+    try {
+      if (code !== 0) throw new Error();
+      return (JSON.parse(stdout ?? "") as { name?: string }[]).map((s) => String(s.name));
+    } catch {
+      throw new SelfhostFailed(`couldn't list the secrets of the Worker ${name}`);
+    }
+  };
   const recordWorker = (versionId: string) =>
     deps.writeFile(WORKER_FILE, `${JSON.stringify({ name, account_id: accountId, version_id: versionId } satisfies WorkerRecord, null, 2)}\n`);
 
@@ -286,6 +303,9 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
     await confirm(record.version_id, `Otherwise check ${CONFIG_FILE}; it won't deploy until that's sorted out.`);
     print(`Remaking ${CONFIG_FILE} from wrangler.jsonc and deploying ${name}...`);
     writeConfig(saved);
+    // A server set up before API keys were tagged has no API_KEY_SECRET,
+    // and can't sign anyone in until it does.
+    if (!(await secretNames()).includes("API_KEY_SECRET")) await putSecret("API_KEY_SECRET", newKey());
     const url = await deploy(recordWorker);
     print(`Deployed ${url}.`);
     return url;
@@ -328,32 +348,34 @@ export async function selfhost(o: Options, deps: Deps): Promise<string> {
   // 3. The GitHub App.
   if (state.app && state.ticket_key && state.storage_key) {
     print(`Carrying on with the GitHub App ${state.app.name} from the last run (${PENDING_FILE}).`);
+    // A run from before API keys were tagged didn't make this one.
+    if (!state.api_key_secret) {
+      state = { ...state, api_key_secret: newKey() };
+      saveState();
+    }
   } else {
     const appName = o.appName ?? defaultAppName(url);
     print("");
     print(`Creating the GitHub App. In the browser, check the name (${appName} unless you change it;`);
     print("App names are unique across GitHub) and click \"Create GitHub App\".");
     const app = await deps.createApp((redirectUrl) => ({ ...appManifest({ server: url, appName, public: o.public }), redirect_url: redirectUrl }), o.org);
-    state = { ...state, app, ticket_key: newKey(), storage_key: newKey() };
+    state = { ...state, app, ticket_key: newKey(), api_key_secret: newKey(), storage_key: newKey() };
     // Before anything else can fail: GitHub shows the key only once.
     saveState();
     print(`Created ${app.html_url}.`);
   }
   const app = state.app!;
 
-  // 4. Secrets. Values go to wrangler on stdin, never on a command line.
+  // 4. Secrets.
   const secrets: [string, string][] = [
     ["GITHUB_APP_PRIVATE_KEY", toPkcs8(app.pem)],
     ["GITHUB_CLIENT_SECRET", app.client_secret],
     ["GITHUB_WEBHOOK_SECRET", app.webhook_secret],
     ["TICKET_KEY", state.ticket_key!],
+    ["API_KEY_SECRET", state.api_key_secret!],
     ["STORAGE_KEY", state.storage_key!],
   ];
-  for (const [secret, value] of secrets) {
-    print(`Setting ${secret}...`);
-    const { code } = await wrangler(["secret", "put", secret, "-c", CONFIG_FILE], { input: value });
-    if (code !== 0) throw new SelfhostFailed(`wrangler secret put ${secret} failed (exit ${code}); run selfhost again to carry on`);
-  }
+  for (const [secret, value] of secrets) await putSecret(secret, value);
   // Each secret made a new version; remember the newest.
   state = { ...state, version_id: await newestVersion() };
   saveState();
@@ -440,6 +462,9 @@ export function dryRunDeps(real: Pick<Deps, "readFile" | "print">): Deps {
         if (!ids.length) return { code: 1, output: "This Worker does not exist on your account. [code: 10007]" };
         const stdout = JSON.stringify(ids.map((id, i) => ({ created_on: String(i), versions: [{ version_id: id }] })));
         return { code: 0, output: stdout, stdout };
+      }
+      if (args[0] === "secret" && args[1] === "list") {
+        return { code: 0, output: "[]", stdout: "[]" };
       }
       if (args[0] === "deploy") {
         deployed.push(`00000000-0000-0000-0000-${String(deployed.length + 1).padStart(12, "0")}`);
@@ -573,7 +598,8 @@ Options:
                     workers.dev subdomain>); it must be unique on GitHub
   --public          let anyone install the App (by default only its owner)
   --update          after a git pull: remake wrangler.selfhost.json from
-                    wrangler.jsonc and deploy
+                    wrangler.jsonc, add any secret a newer version needs,
+                    and deploy
   --trust-worker    when selfhost won't touch the Worker because its
                     deployment history no longer has the version selfhost
                     recorded: shows the deployments and, once you type the
