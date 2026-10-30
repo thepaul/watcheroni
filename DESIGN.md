@@ -906,10 +906,10 @@ differs from the above:
 ## Limits
 
 All limits but the per-IP ones are token buckets kept in SQLite
-(`buckets` tables), refilled by elapsed time when read. That makes them exact and free: they live in an
-object that's already being called. Defaults below; a deployment changes
-them with Worker vars, and `Control` can override them for one repo or
-account.
+(`buckets` tables), refilled by elapsed time when read. That makes them
+exact and free: they live in an object that's already being called.
+Defaults below; a deployment changes them with Worker vars, and
+`Control` can override them for one repo or account.
 
 ### Per repository (in RepoHub)
 
@@ -941,13 +941,17 @@ but unwatched repo is never throttled; it only costs one cheap call.
 | Open WebSockets and long-polls together | 20 (`4029` / `429` beyond) |
 | Events delivered | 10,000 a day; beyond that the inbox gets `inbox.gap` |
 
-### Per IP address (Rate Limiting binding)
+### Per IPv4 address or IPv6 /64 (Rate Limiting binding)
 
 `/v1/login` and `/v1/github/refresh` need no API key, and each costs a
 GitHub call made with the App's client secret, so a flood of them could
 get the App throttled by GitHub and stop everyone signing in. Each has
 its own Rate Limiting binding (`LOGIN_RATE_LIMIT`, `REFRESH_RATE_LIMIT`
-in `wrangler.jsonc`), keyed by `CF-Connecting-IP`:
+in `wrangler.jsonc`), counting per IPv4 address or IPv6 /64 from
+`CF-Connecting-IP` (`src/ip.ts`). An IPv6 connection usually comes with
+a whole /64, so counting single IPv6 addresses would let one client take
+a new one for every request; an IPv4-mapped IPv6 address counts as its
+IPv4 address.
 
 | Endpoint | Limit | When exceeded |
 |---|---|---|
@@ -961,9 +965,9 @@ single address to well under GitHub's budget for the App. The binding's
 counts are kept per Cloudflare location and are approximate, which is
 enough for this. A flood from many addresses isn't stopped by it.
 
-They fail open: without the binding (`wrangler dev`, the tests, a
-self-hosted config from before it), without `CF-Connecting-IP`, or when
-the limiter errors, the request goes through. The limit guards GitHub's
+`wrangler dev` and the tests simulate the bindings locally. They fail
+open: without the binding (a self-hosted config from before it), without
+`CF-Connecting-IP`, or when the limiter errors, the request goes through. The limit guards GitHub's
 budget, not access (each request still needs a token GitHub issued to
 this App), and failing closed would turn a missing binding into the
 outage the limit is there to prevent. `/v1/meta` makes no GitHub call

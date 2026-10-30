@@ -324,10 +324,25 @@ describe("per-IP limit on sign-in", () => {
     expect(res.headers.get("content-type")).toBe("application/problem+json");
     expect(await res.json()).toMatchObject({ status: 429, code: "rate_limited" });
 
-    // Another address has its own count, and a request without one (as
-    // under wrangler dev) isn't limited.
+    // Another address has its own count, and a request with no
+    // CF-Connecting-IP (which Cloudflare always sets) isn't limited.
     expect((await post("/v1/login", { github_token: "ghu_good" }, { "CF-Connecting-IP": newIp() })).status).toBe(200);
     expect((await post("/v1/login", { github_token: "ghu_good" })).status).toBe(200);
+  });
+
+  it("counts IPv6 addresses by their /64", async () => {
+    const id = nextAccount++;
+    mockGitHub({ [CHECK_URL]: tokenOk({ id, login: "octocat" }) });
+    // Every request from a different address in 2001:db8:0:1::/64,
+    // written every which way.
+    const sameSlash64 = (i: number) => (i % 2 ? `2001:db8:0:1::${i.toString(16)}` : `2001:DB8:0000:0001:0:0:0:${i.toString(16)}`);
+    let limited = false;
+    for (let i = 1; i <= 21 && !limited; i++) {
+      limited = (await post("/v1/login", { github_token: "ghu_good" }, { "CF-Connecting-IP": sameSlash64(i) })).status === 429;
+    }
+    expect(limited).toBe(true);
+    // A neighbouring /64 has its own count.
+    expect((await post("/v1/login", { github_token: "ghu_good" }, { "CF-Connecting-IP": "2001:db8:0:2::1" })).status).toBe(200);
   });
 
   it("limits /v1/github/refresh separately from /v1/login", async () => {

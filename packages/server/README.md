@@ -12,9 +12,10 @@ What's here, compared with the full design:
   stored in that user's `acct:<id>` object), `GET /v1/keys`,
   `DELETE /v1/keys/{id|current}`, the `POST /v1/github/refresh` proxy,
   WebSocket tickets (`TICKET_KEY`, `TICKET_KEY_OLD` for rotation), the
-  per-account limit of 120 requests a minute, and per-IP limits on
-  `/v1/login` and `/v1/github/refresh` (Rate Limiting bindings; without
-  them, as under `wrangler dev`, nothing is limited). Inboxes, numbered events
+  per-account limit of 120 requests a minute, and limits per IPv4
+  address or IPv6 /64 on `/v1/login` and `/v1/github/refresh` (Rate
+  Limiting bindings, which `wrangler dev` and the tests simulate
+  locally; a config without them limits nothing). Inboxes, numbered events
   with dedupe by `id`, `ack`, `GET .../events?after=&wait=&limit=`
   long-polling through the Worker bridge, the WebSocket protocol (`hello`,
   `ready`, `events`, `ack`, `ping`/`pong` answered by the runtime), and

@@ -24,6 +24,7 @@ import {
 } from "./subscriptions";
 import pkg from "../package.json";
 import { image } from "./images";
+import { ipLimitKey } from "./ip";
 import { landingPage, setupPage } from "./pages";
 import { normalise } from "./webhook/normalise";
 import { verifySignature } from "./webhook/signature";
@@ -245,26 +246,29 @@ async function refresh(request: Request, env: Env): Promise<Response> {
   }
 }
 
-// The period of LOGIN_RATE_LIMIT and REFRESH_RATE_LIMIT in wrangler.jsonc.
+// The Retry-After on their 429s. It must match the `period` of
+// LOGIN_RATE_LIMIT and REFRESH_RATE_LIMIT in wrangler.jsonc (both
+// environments).
 const IP_LIMIT_PERIOD_SECONDS = 60;
 
-// A 429 if the caller's IP address is over `limiter`'s limit, else null.
-// For /v1/login and /v1/github/refresh, which need no API key but each
-// cost a GitHub call with the App's client secret: a flood of them could
-// get the App throttled by GitHub and stop everyone signing in.
+// A 429 if the caller's IPv4 address or IPv6 /64 is over `limiter`'s
+// limit, else null. For /v1/login and /v1/github/refresh, which need no
+// API key but each cost a GitHub call with the App's client secret: a
+// flood of them could get the App throttled by GitHub and stop everyone
+// signing in. (wrangler dev and the tests simulate the bindings locally.)
 //
-// It fails open. Without the binding (wrangler dev, the tests, a
-// self-hosted config made before it existed), without CF-Connecting-IP
-// (which Cloudflare always sets), or when the limiter itself fails, the
-// request goes through. The limit protects GitHub's budget for the App,
-// not access to anything: each request still needs a GitHub token or
-// refresh token issued to this App, so failing closed would only turn a
-// missing binding into the outage the limit is there to prevent.
+// It fails open. Without the binding (a self-hosted config made before
+// it existed), without CF-Connecting-IP (which Cloudflare always sets),
+// or when the limiter itself fails, the request goes through. The limit
+// protects GitHub's budget for the App, not access to anything: each
+// request still needs a GitHub token or refresh token issued to this App,
+// so failing closed would only turn a missing binding into the outage the
+// limit is there to prevent.
 async function ipLimited(limiter: RateLimit | undefined, request: Request): Promise<Response | null> {
   const ip = request.headers.get("CF-Connecting-IP");
   if (!limiter || !ip) return null;
   try {
-    if ((await limiter.limit({ key: ip })).success) return null;
+    if ((await limiter.limit({ key: ipLimitKey(ip) })).success) return null;
   } catch (e) {
     console.error("rate limiter failed", e);
     return null;
