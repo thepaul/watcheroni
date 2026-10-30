@@ -321,8 +321,7 @@ A subscription ends, after delivering a final event, when:
 | The PR is closed | `pr.closed`, then `watch.ended` |
 | Nobody read the inbox for `ttl_seconds` | `watch.expired` |
 | Private access not re-verified | `watch.unverified` |
-| The App was uninstalled, or the repo removed from it | `watch.revoked` |
-| The repository was deleted or transferred away | `watch.revoked` |
+| The App was uninstalled or suspended, or the repo removed from it | `watch.revoked` |
 
 `watch.ended` tells an agent it can stop waiting. A client that wants to
 keep watching a reopened PR subscribes again.
@@ -437,7 +436,8 @@ event it gets is:
 ```
 
 The client should re-read the state of what it watches from GitHub
-directly.
+directly. (The watcheroni server doesn't send `inbox.gap` yet; it drops
+an inbox's oldest events without one.)
 
 ## Events
 
@@ -484,12 +484,16 @@ changing the protocol version.
 
 ### Kinds
 
+[docs/events.md](docs/events.md) says, for every kind, what it means,
+which GitHub webhook produces it, what change produces it in a client
+that polls GitHub itself, and what isn't tracked at all.
+
 **Pull requests** (from `pull_request`):
 
 | Kind | `data` |
 |---|---|
 | `pr.opened` | `head_sha`, `base`, `draft` |
-| `pr.pushed` | `before`, `after` (head SHAs), `forced` |
+| `pr.pushed` | `before`, `after` (head SHAs) |
 | `pr.ready_for_review` | |
 | `pr.converted_to_draft` | |
 | `pr.review_requested` | `reviewer` (login or `team:slug`) |
@@ -509,7 +513,7 @@ changing the protocol version.
 | `review_comment.created` | `comment_id`, `review_id`, `path`, `line`, `in_reply_to` |
 | `thread.resolved` | `thread_node_id`, `path`, `line`, `comment_id` (the thread's first comment) |
 | `thread.unresolved` | `thread_node_id`, `path`, `line`, `comment_id` |
-| `comment.created` | `comment_id` |
+| `comment.created` | `comment_id`; on an issue, also `issue` (number) |
 
 A review with several comments produces one `review.submitted` and one
 `review_comment.created` per comment. Since these arrive together,
@@ -632,7 +636,5 @@ both cases.
   CLI's local mode. A subscription that names them (or `merge.*`) is still
   accepted and simply never gets them. Use `check.completed` and
   `check.failed`, and ask GitHub about the rest.
-- Machine-readable definitions live in `packages/protocol/schema/`
-  (JSON Schema for every request, response, message and event kind), with
-  example payloads in `packages/protocol/fixtures/` that both the server
-  and the CLI test against.
+- TypeScript types for the requests, responses, messages and events
+  live in `packages/protocol` (published as `@watcheroni/protocol`).

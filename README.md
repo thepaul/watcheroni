@@ -20,6 +20,8 @@ a chat bot or a background service.
 
 - [The CLI](packages/cli/README.md): getting started, commands, server
   and local modes.
+- [Events](docs/events.md): every kind, where it comes from, and what
+  isn't tracked.
 - [Recipes](docs/recipes.md): notifications, Slack, `exec` as a service.
 - [The protocol](PROTOCOL.md), for writing your own client, and its
   types, [`@watcheroni/protocol`](packages/protocol/README.md).

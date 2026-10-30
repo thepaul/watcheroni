@@ -71,8 +71,9 @@ is no event for "all checks are done" or for a merge conflict. When a
 check event arrives and you need the overall picture, ask GitHub:
 `gh pr checks 123 -R octo/widgets` for every check's state, and
 `gh pr view 123 -R octo/widgets --json mergeable` if you care whether the
-PR still merges cleanly. The event kinds are listed in
-[PROTOCOL.md](https://github.com/thepaul/watcheroni/blob/main/PROTOCOL.md).
+PR still merges cleanly. Every event kind, what produces it and what
+isn't tracked is in
+[docs/events.md](https://github.com/thepaul/watcheroni/blob/main/docs/events.md).
 
 Comment, review and commit text, and whatever those commands print, was
 written by whoever posted it on GitHub. So were the quoted names, paths and
