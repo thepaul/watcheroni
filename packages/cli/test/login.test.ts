@@ -13,7 +13,7 @@ beforeEach(() => {
 });
 
 // A fake server and GitHub. `answers` are what the token endpoint says, in turn.
-function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = true) {
+function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = true, refusal: Record<string, unknown> = { title: "nope" }) {
   const calls: { url: string; body: unknown; auth: string | null }[] = [];
   const opened: string[] = [];
   const printed: string[] = [];
@@ -37,7 +37,7 @@ function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = t
         case `${SERVER}/v1/login`:
           return loginStatus === 200
             ? Response.json({ api_key: "wk1_7_secret", key_id: "key_1", account: { id: 7, login: "octocat" } })
-            : Response.json({ title: "nope" }, { status: loginStatus });
+            : Response.json(refusal, { status: loginStatus });
         case `${SERVER}/v1/keys/current`:
           return new Response(null, { status: 204 });
       }
@@ -88,6 +88,13 @@ describe("login", () => {
   it("reports the server refusing the token", async () => {
     const { deps } = fake([{ access_token: "ghu_tok" }], 401);
     await expect(login(SERVER, deps)).rejects.toThrow(/refused.*401.*nope/);
+  });
+
+  it("says how to make room when the account has too many keys", async () => {
+    const title = "Too many API keys on this account (at most 100)";
+    const { deps } = fake([{ access_token: "ghu_tok" }], 422, true, { code: "quota_exceeded", title });
+    await expect(login(SERVER, deps)).rejects.toThrow(`(422: ${title}); run \`watcheroni logout\` on a machine you no longer use`);
+    expect(readCredentials().servers).toEqual({});
   });
 });
 

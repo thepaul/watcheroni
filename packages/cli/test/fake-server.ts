@@ -88,6 +88,11 @@ export class FakeServer {
   readonly messages: string[] = [];
   // Refuse WebSocket upgrades, as a proxy might.
   refuseSockets = false;
+  // The account's caps: close new sockets with 4029, refuse polls that
+  // would wait with 429, refuse new inboxes with 422.
+  tooManySockets = false;
+  tooManyPolls = false;
+  tooManyInboxes = false;
   // Repos the App is installed on, and whether each is private.
   readonly repos = new Map<string, { private: boolean }>();
   // GitHub tokens accepted for private repos.
@@ -199,7 +204,9 @@ export class FakeServer {
       ...(offered.includes("watcheroni.v1") ? ["Sec-WebSocket-Protocol: watcheroni.v1"] : []),
       "", "",
     ].join("\r\n"));
-    this.sockets.add(new FakeSocket(socket, decodeURIComponent(m[1]), this));
+    const s = new FakeSocket(socket, decodeURIComponent(m[1]), this);
+    if (this.tooManySockets) return s.close(4029, "too many connections");
+    this.sockets.add(s);
   }
 
   private async handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -223,6 +230,9 @@ export class FakeServer {
     if (!m) return json(404, { status: 404, code: "not_found" });
     const name = decodeURIComponent(m[1]);
     const route = `${req.method} ${m[2] ?? ""}${m[3] ? `/{id}${m[4] ?? ""}` : ""}`;
+    if (this.tooManyInboxes && !this.inboxes.has(name)) {
+      return json(422, { status: 422, code: "quota_exceeded", title: "Too many inboxes on this account (at most 500)" });
+    }
     const inbox = this.inbox(name);
     if (route === "PUT ") return json(200, { name, head: inbox.head, acked: inbox.acked });
     if (route === "POST /subscriptions") {
@@ -271,6 +281,11 @@ export class FakeServer {
         const events = inbox.events.filter((e) => e.seq > after);
         return { events, next: events.length ? events[events.length - 1].seq : after, head: inbox.head, acked: inbox.acked };
       };
+      if (!page().events.length && wait > 0 && this.tooManyPolls) {
+        res.writeHead(429, { "content-type": "application/problem+json", "Retry-After": "1" });
+        res.end(JSON.stringify({ status: 429, code: "too_many_connections", title: "Too many long polls waiting on this account (at most 50)" }));
+        return;
+      }
       if (!page().events.length && wait > 0) {
         await new Promise<void>((resolve) => {
           const done = () => {
