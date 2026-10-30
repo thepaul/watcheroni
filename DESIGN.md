@@ -1115,7 +1115,8 @@ server doesn't send it, with a `--jq` filter that keeps just the text.
 ### Local state
 
 - `~/.config/watcheroni/config.json`: server URL (default the hosted
-  copy) and default options.
+  copy) and default options. The URL must be https, since secrets go to
+  it; plain http only to a loopback host, for development.
 - `~/.config/watcheroni/credentials.json` (mode 0600): per server, the API
   key, and the GitHub user token, refresh token and expiry. Overridable
   with `WATCHERONI_API_KEY` and `WATCHERONI_SERVER` for CI. OS keychain

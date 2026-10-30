@@ -1,6 +1,6 @@
 import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
-import type { ServerConfig } from "./config.ts";
+import { type ServerConfig, checkServerUrl } from "./config.ts";
 import { LoginNeeded } from "./github.ts";
 import { anyKey, isPr, type RepoTarget, type Target } from "./targets.ts";
 
@@ -36,7 +36,7 @@ export class ServerClient {
   private readonly apiKey: string;
 
   constructor(config: ServerConfig) {
-    this.url = config.url;
+    this.url = checkServerUrl(config.url);
     this.apiKey = config.apiKey;
   }
 
@@ -96,6 +96,7 @@ export class ServerClient {
   // connect to the URL it returns instead.
   async socket(name: string): Promise<{ url: string; headers: Record<string, string> }> {
     const url = new URL(`${this.url}/v1/inboxes/${name}/ws`);
+    // checkServerUrl has made sure plain http only goes to this machine.
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     return { url: url.href, headers: { Authorization: `Bearer ${this.apiKey}` } };
   }

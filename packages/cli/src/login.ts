@@ -7,7 +7,7 @@ import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "n
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import type { LoginResponse, Meta } from "@watcheroni/protocol";
-import { configDir, serverSetting } from "./config.ts";
+import { checkServerUrl, configDir, serverSetting } from "./config.ts";
 
 export const DEFAULT_SERVER = "https://watcheroni.dev";
 
@@ -66,7 +66,7 @@ function openUrl(url: string): boolean {
 }
 
 export function serverUrl(): string {
-  return (serverSetting() || DEFAULT_SERVER).replace(/\/+$/, "");
+  return checkServerUrl(serverSetting() || DEFAULT_SERVER);
 }
 
 export function credentialsPath(): string {
@@ -94,6 +94,7 @@ function writeCredentials(creds: Credentials, path = credentialsPath()): void {
 export class LoginFailed extends Error {}
 
 export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps): Promise<ServerCredentials> {
+  server = checkServerUrl(server);
   const { fetch, print } = deps;
   const metaRes = await fetch(`${server}/v1/meta`);
   if (!metaRes.ok) throw new LoginFailed(`${server}/v1/meta answered ${metaRes.status}`);
@@ -137,6 +138,7 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
 // Revokes this machine's key on the server and forgets the credentials.
 // False if there was nothing to forget.
 export async function logout(server = serverUrl(), deps: LoginDeps = defaultDeps): Promise<boolean> {
+  server = checkServerUrl(server);
   const creds = readCredentials();
   const entry = creds.servers[server];
   if (!entry) {
@@ -164,6 +166,7 @@ export async function logout(server = serverUrl(), deps: LoginDeps = defaultDeps
 // server's refresh proxy (PROTOCOL.md, "Refreshing the GitHub token") and
 // saved. Null if there's none, or it can't be renewed.
 export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetch" | "now"> = defaultDeps): Promise<string | null> {
+  server = checkServerUrl(server);
   const github = readCredentials().servers[server]?.github;
   if (!github?.access_token) return null;
   const now = deps.now();

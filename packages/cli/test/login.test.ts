@@ -2,8 +2,9 @@ import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { loadServer } from "../src/config.ts";
-import { DEFAULT_SERVER, type LoginDeps, LoginFailed, login, logout, readCredentials } from "../src/login.ts";
+import { checkServerUrl, loadServer } from "../src/config.ts";
+import { DEFAULT_SERVER, type LoginDeps, LoginFailed, githubTokenFor, login, logout, readCredentials, serverUrl } from "../src/login.ts";
+import { ServerClient } from "../src/server.ts";
 
 const SERVER = "https://watcheroni.test";
 const GITHUB = "https://github.test";
@@ -117,5 +118,82 @@ describe("choosing the server", () => {
     } finally {
       process.env = saved;
     }
+  });
+});
+
+describe("the server URL", () => {
+  it("is https, or plain http only to this machine", () => {
+    for (const url of [
+      "https://watcheroni.dev",
+      "HTTPS://watcheroni.dev",
+      "https://watcheroni.dev:8443/base",
+      "http://localhost:8787",
+      "HTTP://LOCALHOST:8787",
+      "http://dev.localhost",
+      "http://127.0.0.1:8787",
+      "http://127.1.2.3",
+      "http://127.1",
+      "http://0x7f.0.0.1",
+      "http://[::1]:8787",
+    ]) expect(checkServerUrl(url), url).toBe(url);
+    for (const url of [
+      "http://watcheroni.dev",
+      "HTTP://watcheroni.dev",
+      "http://localhost.evil.com",
+      "http://localhost.",
+      "http://127.0.0.1.nip.io",
+      "http://128.0.0.1",
+      "http://10.0.0.1",
+      "http://[::2]",
+      "http://[::ffff:127.0.0.1]",
+      "http://localhost@evil.com",
+      "http://127.0.0.1:80@evil.com",
+    ]) expect(() => checkServerUrl(url), url).toThrow(/must be https; plain http is only for localhost/);
+  });
+
+  it("refuses other schemes, non-URLs and credentials in the URL", () => {
+    for (const url of ["ws://localhost", "wss://watcheroni.dev", "ftp://watcheroni.dev", "file:///tmp/x", "watcheroni.dev", ""]) {
+      expect(() => checkServerUrl(url), url).toThrow(/must be an https URL/);
+    }
+    for (const url of ["https://me:pw@watcheroni.dev", "https://me@watcheroni.dev", "http://me:pw@localhost"]) {
+      expect(() => checkServerUrl(url), url).toThrow(/can't hold a user name or password/);
+    }
+  });
+
+  it("drops trailing slashes", () => {
+    expect(checkServerUrl("https://watcheroni.dev//")).toBe("https://watcheroni.dev");
+  });
+
+  it("is checked wherever one comes in", async () => {
+    const saved = { ...process.env };
+    try {
+      process.env.WATCHERONI_CONFIG_DIR = mkdtempSync(join(tmpdir(), "watcheroni-config-"));
+      process.env.WATCHERONI_API_KEY = "wk1_7_secret";
+      process.env.WATCHERONI_SERVER = "http://watcheroni.dev";
+      expect(() => loadServer()).toThrow(/^http:\/\/watcheroni\.dev: the server must be https/);
+      expect(() => serverUrl()).toThrow(/must be https/);
+      delete process.env.WATCHERONI_SERVER;
+      writeFileSync(join(process.env.WATCHERONI_CONFIG_DIR, "config.json"), JSON.stringify({ server: "http://localhost.evil.com" }));
+      expect(() => loadServer()).toThrow(/^http:\/\/localhost\.evil\.com: the server must be https/);
+      expect(() => new ServerClient({ url: "http://watcheroni.dev", apiKey: "wk1_7_secret" })).toThrow(/must be https/);
+
+      // Nor is anything sent to a server named outright.
+      const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
+      await expect(login("http://watcheroni.test", deps)).rejects.toThrow(/must be https/);
+      await expect(logout("http://watcheroni.test", deps)).rejects.toThrow(/must be https/);
+      writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({
+        servers: { "http://watcheroni.test": { api_key: "wk1_7_secret", github: { access_token: "ghu_old", refresh_token: "ghr_tok", expires_at: new Date(0).toISOString() } } },
+      }));
+      await expect(githubTokenFor("http://watcheroni.test", deps)).rejects.toThrow(/must be https/);
+      expect(calls).toEqual([]);
+    } finally {
+      process.env = saved;
+    }
+  });
+
+  it("gives a WebSocket URL to match", async () => {
+    const socket = (url: string) => new ServerClient({ url, apiKey: "k" }).socket("box").then((s) => s.url);
+    expect(await socket("https://watcheroni.dev")).toBe("wss://watcheroni.dev/v1/inboxes/box/ws");
+    expect(await socket("http://localhost:8787")).toBe("ws://localhost:8787/v1/inboxes/box/ws");
   });
 });
