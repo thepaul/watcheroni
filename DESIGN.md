@@ -1119,15 +1119,18 @@ watcheroni config [get | set] <key> [value]
   reads the *whole* inbox, not just the targets named, so use one inbox per
   consumer.
 - **`wait`** connects over WebSocket, waits for at least one event, then
-  keeps collecting for a short settle time (default 10 s, `--settle`) so a
-  review with ten comments arrives as one wake-up, not ten. It prints them,
-  acknowledges, and exits. Exit codes: `0` events, `2` timeout, `3` every
+  keeps collecting for a short settle time (default 5 s, `--settle`) so a
+  review with ten comments arrives as one wake-up, not ten; `--settle 0`
+  turns that off, returning with whatever the first read brought. Settling
+  only decides when `wait` returns, never which events it shows. It prints
+  them, acknowledges, and exits. Exit codes: `0` events, `2` timeout, `3` every
   watched PR has ended, `4` login needed, `1` other errors.
 - **`stream`** prints each event as a JSON line, acknowledging as it goes,
   and reconnects forever. For `jq`, scripts, chat bots and Claude Code's
   Monitor tool.
 - **`exec`** runs the command once per event (or per settled batch with
-  `--batch`), with the event as JSON on stdin and in environment variables
+  `--batch`; `--settle` as for `wait`, so `--settle 0` runs it once per
+  read), with the event as JSON on stdin and in environment variables
   (`WATCHERONI_KIND`, `WATCHERONI_REPO`, `WATCHERONI_PR`,
   `WATCHERONI_URL`, `WATCHERONI_EVENT_ID`). It acknowledges only after the
   command exits 0, so a failing command sees the event again. `--serial`
@@ -1337,11 +1340,11 @@ Setup URLs.
    "commented" `review.submitted` plus a `review_comment.created`, so
    three replies make six lines; `thread.resolved` doesn't say which
    thread; and the printed `gh api` commands return whole JSON objects
-   where a `--jq` filter for the body would do (all three fixed since:
-   `wait` prints a reply's body-less review only when its replies are
-   filtered out, threads carry `path`, `line` and their first
-   `comment_id`, and the commands filter with `--jq`; see PROTOCOL.md
-   "Kinds"). A failed
+   where a `--jq` filter for the body would do (the last two fixed
+   since: threads carry `path`, `line` and their first `comment_id`, and
+   the commands filter with `--jq`; see PROTOCOL.md "Kinds". For a while
+   `wait` hid a reply's body-less review, but it prints every event
+   again: the tool notifies, it doesn't interpret). A failed
    `checks.completed` now prints `gh pr checks`, since its individual
    `check.failed` events may predate the watch.
 2. **CLI in local mode only** (`wait`, `stream`, `exec` polling GitHub).

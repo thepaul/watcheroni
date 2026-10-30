@@ -11,10 +11,12 @@ the PRs it watches. The command gets:
   in its environment.
 
 With `--batch` it runs once per settled batch instead, with a JSON array
-of events on stdin and their number in `WATCHERONI_COUNT`. `--on` (or
-`--kinds`) picks the kinds, e.g. `--on check.*,review.submitted`;
-`watch.*` kinds, such as `watch.ended` when a PR is merged or closed,
-always come through.
+of events on stdin and their number in `WATCHERONI_COUNT`. A batch is
+everything that arrived within `--settle` (5 s by default) of its first
+event; `--settle 0` turns that off, so a batch is whatever one read of
+the inbox brought. `--on` (or `--kinds`) picks the kinds, e.g.
+`--on check.*,review.submitted`; `watch.*` kinds, such as `watch.ended`
+when a PR is merged or closed, always come through.
 
 **When the command fails.** An event is acknowledged only when the command
 exits 0. Otherwise watcheroni logs

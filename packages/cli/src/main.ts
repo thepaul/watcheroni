@@ -38,6 +38,9 @@ Options:
   --base BRANCH     owner/repo targets: only PRs against this branch
   --author LOGIN    owner/repo targets: only PRs opened by this GitHub user
   --interval TIME   how often to poll GitHub (default 2m, at least 10s)
+  --settle TIME     wait and exec --batch: after the first event, wait this
+                    long for more before returning (default 5s; 0 returns
+                    with what the first read brought)
 
 wait exits 0 after printing events, 2 on timeout, 3 when every watched PR
 has ended (never while a whole repository is watched), 4 when GitHub

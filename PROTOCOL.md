@@ -512,14 +512,14 @@ changing the protocol version.
 | `comment.created` | `comment_id` |
 
 A review with several comments produces one `review.submitted` and one
-`review_comment.created` per comment. Clients that wake an agent SHOULD
-debounce, since these arrive together.
+`review_comment.created` per comment. Since these arrive together,
+clients that wake an agent MAY wait a moment for the rest before waking
+it (the CLI's `--settle`).
 
 GitHub makes every reply in a review thread a `commented` review with
 no text (`has_body: false`) holding the reply, so a reply arrives as a
 `review.submitted` and a `review_comment.created`. Both are sent, so a
-`review.*` filter still sees every review; clients that show events to
-people or agents MAY show only the replies when both are at hand.
+`review.*` filter still sees every review.
 
 A review comment's or thread's `line` is its original line once the code
 under it has changed (`null` for a comment on the whole file). Fetch a
