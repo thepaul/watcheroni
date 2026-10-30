@@ -3,6 +3,7 @@ import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { newTicketPayload, parseApiKey, signTicket, verifyTicket } from "../src/auth";
 import { landingPage } from "../src/pages";
+import worker from "../src/worker";
 import type { KeysResponse, LoginResponse, Meta, TicketResponse } from "../src/protocol";
 
 const BASE = "https://watcheroni.test";
@@ -290,6 +291,74 @@ describe("refresh proxy", () => {
     const seen = mockGitHub({});
     expect((await post("/v1/github/refresh", {})).status).toBe(400);
     expect(seen).toHaveLength(0);
+  });
+});
+
+describe("per-IP limit on sign-in", () => {
+  const REFRESH_URL = "POST https://github.com/login/oauth/access_token";
+  // Each test gets its own addresses, so their counts don't leak.
+  let nextIp = 1;
+  const newIp = () => `203.0.113.${nextIp++}`;
+
+  // Posts from `ip` until the limit answers 429, and returns that answer.
+  // The limiter's windows are aligned to the clock, so one may roll over
+  // part way: hence up to two windows' worth.
+  async function untilLimited(path: string, body: unknown, ip: string): Promise<{ res: Response; ok: number }> {
+    let ok = 0;
+    for (let i = 0; i < 21; i++) {
+      const res = await post(path, body, { "CF-Connecting-IP": ip });
+      if (res.status === 429) return { res, ok };
+      ok++;
+    }
+    throw new Error(`${path} never answered 429`);
+  }
+
+  it("answers /v1/login with 429 and Retry-After past 10 a minute, without calling GitHub", async () => {
+    const id = nextAccount++;
+    const seen = mockGitHub({ [CHECK_URL]: tokenOk({ id, login: "octocat" }) });
+    const ip = newIp();
+    const { res, ok } = await untilLimited("/v1/login", { github_token: "ghu_good" }, ip);
+    expect(ok).toBeGreaterThanOrEqual(10);
+    expect(seen).toHaveLength(ok);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    expect(res.headers.get("content-type")).toBe("application/problem+json");
+    expect(await res.json()).toMatchObject({ status: 429, code: "rate_limited" });
+
+    // Another address has its own count, and a request without one (as
+    // under wrangler dev) isn't limited.
+    expect((await post("/v1/login", { github_token: "ghu_good" }, { "CF-Connecting-IP": newIp() })).status).toBe(200);
+    expect((await post("/v1/login", { github_token: "ghu_good" })).status).toBe(200);
+  });
+
+  it("limits /v1/github/refresh separately from /v1/login", async () => {
+    const id = nextAccount++;
+    mockGitHub({ [REFRESH_URL]: () => Response.json({ access_token: "ghu_new" }), [CHECK_URL]: tokenOk({ id, login: "octocat" }) });
+    const ip = newIp();
+    const { res } = await untilLimited("/v1/github/refresh", { refresh_token: "ghr_old" }, ip);
+    expect(res.headers.get("Retry-After")).toBe("60");
+    expect(await res.json()).toMatchObject({ status: 429, code: "rate_limited" });
+    expect((await post("/v1/login", { github_token: "ghu_good" }, { "CF-Connecting-IP": ip })).status).toBe(200);
+  });
+
+  it("lets requests through when the binding is missing or fails", async () => {
+    const id = nextAccount++;
+    mockGitHub({ [CHECK_URL]: tokenOk({ id, login: "octocat" }) });
+    const send = (e: Env) =>
+      worker.fetch(
+        new Request(`${BASE}/v1/login`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "CF-Connecting-IP": newIp() },
+          body: JSON.stringify({ github_token: "ghu_good" }),
+        }),
+        e,
+      );
+    const missing = { ...env, LOGIN_RATE_LIMIT: undefined } as unknown as Env;
+    for (let i = 0; i < 12; i++) expect((await send(missing)).status).toBe(200);
+    const broken = { ...env, LOGIN_RATE_LIMIT: { limit: () => Promise.reject(new Error("down")) } } as Env;
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    expect((await send(broken)).status).toBe(200);
+    const full = { ...env, LOGIN_RATE_LIMIT: { limit: async () => ({ success: false }) } } as Env;
+    expect((await send(full)).status).toBe(429);
   });
 });
 

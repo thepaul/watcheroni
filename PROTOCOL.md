@@ -110,7 +110,9 @@ user is, once, and exchanges that for an API key.
 
    The key is shown only once. `label` is optional (at most 100
    characters are kept). A failure to reach GitHub is `503 unavailable`
-   with `Retry-After`.
+   with `Retry-After`. Too many logins from one IP address are `429
+   rate_limited` with `Retry-After`; the GitHub token is still good, so
+   the client can wait and send it again.
 
 3. The client keeps the GitHub token and refresh token **locally**. It
    needs them again only to subscribe to private repositories (see
@@ -142,6 +144,9 @@ The response is GitHub's own status and body (`access_token`,
 `refresh_token`, `expires_in`, ...), passed through unchanged; note that
 GitHub reports a bad or expired refresh token as `200` with an `error`
 field. No API key is needed, since the refresh token is the credential.
+Too many refreshes from one IP address are the server's own `429
+rate_limited` with `Retry-After`, not GitHub's answer; the refresh token
+hasn't been used, so it can be sent again later.
 
 ### Keys
 

@@ -905,8 +905,8 @@ differs from the above:
 
 ## Limits
 
-All limits are token buckets kept in SQLite (`buckets` tables), refilled
-by elapsed time when read. That makes them exact and free: they live in an
+All limits but the per-IP ones are token buckets kept in SQLite
+(`buckets` tables), refilled by elapsed time when read. That makes them exact and free: they live in an
 object that's already being called. Defaults below; a deployment changes
 them with Worker vars, and `Control` can override them for one repo or
 account.
@@ -943,8 +943,31 @@ but unwatched repo is never throttled; it only costs one cheap call.
 
 ### Per IP address (Rate Limiting binding)
 
-`/v1/login` and `/v1/github/refresh`: 10 a minute. `/v1/meta`: 60 a
-minute.
+`/v1/login` and `/v1/github/refresh` need no API key, and each costs a
+GitHub call made with the App's client secret, so a flood of them could
+get the App throttled by GitHub and stop everyone signing in. Each has
+its own Rate Limiting binding (`LOGIN_RATE_LIMIT`, `REFRESH_RATE_LIMIT`
+in `wrangler.jsonc`), keyed by `CF-Connecting-IP`:
+
+| Endpoint | Limit | When exceeded |
+|---|---|---|
+| `/v1/login` | 10 a minute | `429 rate_limited`, `Retry-After: 60`, before any GitHub call |
+| `/v1/github/refresh` | 10 a minute | the same |
+
+A person signs in a handful of times ever, and a CLI refreshes its token
+at most every 8 hours (when it next needs one for a private repo), so
+these leave room for a large office behind one address while holding a
+single address to well under GitHub's budget for the App. The binding's
+counts are kept per Cloudflare location and are approximate, which is
+enough for this. A flood from many addresses isn't stopped by it.
+
+They fail open: without the binding (`wrangler dev`, the tests, a
+self-hosted config from before it), without `CF-Connecting-IP`, or when
+the limiter errors, the request goes through. The limit guards GitHub's
+budget, not access (each request still needs a token GitHub issued to
+this App), and failing closed would turn a missing binding into the
+outage the limit is there to prevent. `/v1/meta` makes no GitHub call
+and isn't limited.
 
 ## Capacity
 
