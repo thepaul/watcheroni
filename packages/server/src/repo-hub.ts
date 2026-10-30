@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import type { Delivery } from "./account";
 import { BUCKETS_TABLE, msUntil, take, type BucketSpec } from "./limits";
 import { GITHUB_WEB_URL } from "./github";
+import { INTERNAL_KINDS as INTERNAL, type HubKind } from "./kinds";
 import { DEFAULT_TTL_SECONDS, matchesKind, type UnsequencedEvent } from "./protocol";
 
 // One per repository, named `repo:<repository.id>`. Knows who watches the
@@ -33,10 +34,10 @@ const GIVE_UP_MS = 24 * 3600_000;
 const DELIVERIES_KEPT_MS = 3 * 24 * 3600_000;
 const PRUNE_EVERY_MS = 24 * 3600_000;
 
-// The one kind the normaliser produces for RepoHub's own use, never
-// delivered: `pr.seen` carries a PR's base, author and state for the
-// `base` and `author` filters.
-const INTERNAL_KINDS = new Set(["pr.seen"]);
+// What the normaliser produces for RepoHub's own use, never delivered:
+// `pr.seen` carries a PR's base, author and state for the `base` and
+// `author` filters.
+const INTERNAL_KINDS: ReadonlySet<string> = new Set(INTERNAL);
 
 // How long a check run's completion is remembered, so the same completion
 // sent twice (GitHub may send a run created already finished as `created`
@@ -376,7 +377,7 @@ export class RepoHub extends DurableObject<Env> {
 
   // RPC: ends one subscription with a final `kind` event, e.g.
   // `watch.unverified` when its user turns out to have lost access.
-  async endSubscription(subId: string, kind: string, reason: string): Promise<boolean> {
+  async endSubscription(subId: string, kind: HubKind, reason: string): Promise<boolean> {
     const row = this.sql.exec<SubRow>("SELECT * FROM subscriptions WHERE id = ?", subId).toArray()[0];
     if (!row) return false;
     const now = this.now();
@@ -417,7 +418,7 @@ export class RepoHub extends DurableObject<Env> {
 
   // Queues a final `kind` event for each subscription and forgets them.
   // Event IDs are `${idBase}.${sub id}`, stable across retries.
-  private endWith(rows: SubRow[], kind: string, reason: string, idBase: string, now: number, outgoing: Map<number, Delivery[]>): void {
+  private endWith(rows: SubRow[], kind: HubKind, reason: string, idBase: string, now: number, outgoing: Map<number, Delivery[]>): void {
     const at = new Date(now).toISOString();
     const repo = { id: Number(this.getMeta("repo_id")), full_name: this.getMeta("full_name") ?? "" };
     for (const row of rows) {
@@ -780,7 +781,7 @@ export class RepoHub extends DurableObject<Env> {
           v: 1,
           id: `repo:${repoId}.${what}.${since}`,
           sub: sub.id,
-          kind: `repo.${what}`,
+          kind: `repo.${what}` satisfies HubKind,
           at,
           received_at: at,
           repo: { id: repoId, full_name: this.getMeta("full_name") ?? "" },
@@ -970,7 +971,7 @@ function watchEnded(e: UnsequencedEvent): UnsequencedEvent {
     v: 1,
     id: `${e.id}.ended`,
     sub: null,
-    kind: "watch.ended",
+    kind: "watch.ended" satisfies HubKind,
     at: e.at,
     received_at: e.received_at,
     repo: e.repo,

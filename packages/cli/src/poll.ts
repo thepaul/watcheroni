@@ -1,5 +1,5 @@
 import type { WatchEvent } from "@watcheroni/protocol";
-import { diff } from "./diff.ts";
+import { diff, type LocalKind } from "./diff.ts";
 import { GitHubError, LoginNeeded } from "./github.ts";
 import type { Inbox } from "./inbox.ts";
 import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
@@ -38,7 +38,7 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
           v: 1,
           id: `local:${key}:watch.ended:${reason}`,
           sub: null,
-          kind: "watch.ended",
+          kind: "watch.ended" satisfies LocalKind,
           at: next.fetchedAt,
           received_at: next.fetchedAt,
           repo: next.repo,

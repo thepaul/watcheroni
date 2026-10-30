@@ -8,12 +8,38 @@ import type { Actor, Check, Snapshot } from "./snapshot.ts";
 
 const FAILED = new Set(["failure", "timed_out", "action_required", "startup_failure"]);
 
+// Every kind local mode can produce: these, and poll.ts's `watch.ended`
+// for a PR that had already ended when first polled. A test checks
+// docs/events.md against this list and the server's.
+export const LOCAL_KINDS = [
+  "pr.pushed",
+  "pr.base_changed",
+  "pr.ready_for_review",
+  "pr.converted_to_draft",
+  "pr.reopened",
+  "pr.review_requested",
+  "pr.merged",
+  "pr.closed",
+  "review.submitted",
+  "review.dismissed",
+  "review_comment.created",
+  "thread.resolved",
+  "thread.unresolved",
+  "comment.created",
+  "check.completed",
+  "check.failed",
+  "workflow.completed",
+  "watch.ended",
+] as const;
+
+export type LocalKind = (typeof LOCAL_KINDS)[number];
+
 export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
   const events: UnsequencedEvent[] = [];
   const full = next.repo.full_name;
   const api = `https://api.github.com/repos/${full}`;
   const emit = (
-    kind: string,
+    kind: LocalKind,
     discriminator: string,
     data: { [key: string]: DataValue },
     opts: { actor?: Actor | null; at?: string | null; html?: string | null; api?: string } = {},

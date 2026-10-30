@@ -1,3 +1,4 @@
+import type { InternalKind, WebhookKind } from "../kinds";
 import type { DataValue, UnsequencedEvent } from "../protocol";
 
 // Turns one GitHub webhook into protocol events: IDs, SHAs, states and the
@@ -5,10 +6,11 @@ import type { DataValue, UnsequencedEvent } from "../protocol";
 // step. `sub` is filled in later, when an event is matched to a
 // subscription.
 //
-// Besides protocol kinds this emits one internal kind that RepoHub uses
-// and never delivers, last so the other events' IDs don't move: `pr.seen`,
-// from any payload that describes the PR (its head, base, author and
-// state), for repository-wide subscriptions' `base` and `author` filters.
+// The kinds it can emit are listed in ../kinds.ts. Besides protocol kinds
+// this emits one internal kind that RepoHub uses and never delivers, last
+// so the other events' IDs don't move: `pr.seen`, from any payload that
+// describes the PR (its head, base, author and state), for
+// repository-wide subscriptions' `base` and `author` filters.
 
 // Only the fields read below. Everything is optional because GitHub's
 // payloads vary by event, action and age.
@@ -100,7 +102,7 @@ export function normalise(
     : null;
   const out: UnsequencedEvent[] = [];
   const emit = (
-    kind: string,
+    kind: WebhookKind | InternalKind,
     pr: number | null,
     data: { [key: string]: DataValue },
     at: string | null | undefined,
@@ -133,8 +135,8 @@ export function normalise(
           emit("pr.opened", pr.number, { head_sha: pr.head?.sha ?? null, base: pr.base?.ref ?? null, draft: !!pr.draft }, at, links);
           break;
         case "synchronize":
-          // The payload doesn't say whether it was a force-push; RepoHub
-          // works that out from the old and new heads when it can.
+          // The payload doesn't say whether it was a force-push, and
+          // nothing works it out.
           emit("pr.pushed", pr.number, { before: payload.before ?? null, after: payload.after ?? null }, at, links);
           break;
         case "ready_for_review":
