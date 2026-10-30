@@ -20,7 +20,7 @@ const HELP = `watcheroni ${pkg.version}: wait for, stream, or act on what happen
 Usage:
   watcheroni wait   [target...] [--timeout 1h] [--settle 5s] [--format text|json]
   watcheroni stream [target...]
-  watcheroni exec   [target...] [--on kinds] [--batch] -- command [args...]
+  watcheroni exec   [target...] [--on kinds] [--batch] [--settle 5s] -- command [args...]
   watcheroni watch  [target...]
   watcheroni unwatch <target...>
   watcheroni ls
@@ -39,8 +39,8 @@ Options:
   --author LOGIN    owner/repo targets: only PRs opened by this GitHub user
   --interval TIME   how often to poll GitHub (default 2m, at least 10s)
   --settle TIME     wait and exec --batch: after the first event, wait this
-                    long for more before returning (default 5s; 0 returns
-                    with what the first read brought)
+                    long for more before printing or running the command
+                    (default 5s; 0 goes with what the first read brought)
 
 wait exits 0 after printing events, 2 on timeout, 3 when every watched PR
 has ended (never while a whole repository is watched), 4 when GitHub

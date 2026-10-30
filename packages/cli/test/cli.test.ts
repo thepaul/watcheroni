@@ -330,8 +330,10 @@ describe("exec against a server", () => {
     const log = join(cwd, "ran");
     const run = cli(["exec", "--batch", "--settle", "0", "--", "sh", "-c", `echo "$WATCHERONI_COUNT" >> ${log}`]);
     await until(() => fake.sockets.size === 1);
+    const sent = Date.now();
     fake.injectTogether("box", ["review.submitted"], ["review_comment.created"]);
     await until(() => fake.inbox("box").acked === 2);
+    expect(Date.now() - sent).toBeLessThan(3000);
     fake.inject("box", "comment.created");
     await until(() => fake.inbox("box").acked === 3);
     run.kill();

@@ -195,7 +195,7 @@ describe("text output", () => {
     inbox.close();
   });
 
-  it("keeps a \"commented\" review with no text when its comments are new, not replies", async () => {
+  it("prints a \"commented\" review with no text and its comment", async () => {
     const inbox = open();
     const target = { owner: "octo", name: "widgets", number: 7 };
     inbox.watch(targetKey(target), target);
