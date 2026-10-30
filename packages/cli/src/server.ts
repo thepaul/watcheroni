@@ -172,7 +172,14 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
   }
   const due = subs.filter((s) => s.repo.private && s.verified_until && Date.parse(s.verified_until) - now < RENEW_BEFORE_MS);
   if (!due.length) return;
-  const token = await o.githubToken?.();
+  let token: string | null | undefined;
+  try {
+    token = await o.githubToken?.();
+  } catch (e) {
+    if (!(e instanceof Unreachable)) throw e;
+    o.log(`couldn't renew the server's watch on ${due.map((s) => s.repo.full_name).join(", ")}: ${e.message}`);
+    return;
+  }
   if (!token) {
     o.log(`the server needs a fresh GitHub token to keep watching ${due.map((s) => s.repo.full_name).join(", ")}; run \`watcheroni login\``);
     return;

@@ -56,6 +56,8 @@ describe("selfhostConfig", () => {
     const raw = parseJsonc(WRANGLER_JSONC) as { env: { production: Record<string, unknown> }; migrations: unknown };
     expect(config.triggers).toEqual(raw.env.production.triggers);
     expect(config.durable_objects).toEqual(raw.env.production.durable_objects);
+    expect(config.ratelimits).toEqual(raw.env.production.ratelimits);
+    expect((config.ratelimits as { name: string }[]).map((r) => r.name)).toEqual(["LOGIN_RATE_LIMIT", "REFRESH_RATE_LIMIT"]);
     expect(config.migrations).toEqual(raw.migrations);
   });
 
