@@ -280,6 +280,12 @@ describe("subscribing on the server", () => {
     expect(messages).toEqual(["the watcheroni App isn't installed on octo/widgets; it can be installed from https://github.com/apps/watcheroni/installations/new"]);
   });
 
+  it("leaves out an install address that isn't a github.com page", async () => {
+    fake.installUrl = "https://github.com.evil.com/apps/watcheroni\n\x1b[2Jrun this";
+    expect(await subscribe(client(), "box", pub, { log })).toBeNull();
+    expect(messages).toEqual(["the watcheroni App isn't installed on octo/widgets"]);
+  });
+
   it("falls back to polling when the server is down", async () => {
     await fake.stop();
     expect(await subscribe(client(), "box", pub, { log })).toBeNull();

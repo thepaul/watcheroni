@@ -45,24 +45,58 @@ const defaultDeps: LoginDeps = {
   openUrl,
 };
 
-// Only for someone at this machine's own screen: not when output goes to
-// a file or another program, not over SSH, and not when turned off.
-function openUrl(url: string): boolean {
-  if (!process.stderr.isTTY || process.env.SSH_CONNECTION || process.env.SSH_TTY || process.env.WATCHERONI_NO_BROWSER) return false;
-  const [cmd, ...args] =
-    process.platform === "darwin" ? ["open", url]
-    : process.platform === "win32" ? ["cmd", "/c", "start", "", url]
-    : process.env.DISPLAY || process.env.WAYLAND_DISPLAY ? ["xdg-open", url]
-    : [];
-  if (!cmd) return false;
+// The only host the CLI sends anyone to. The server names GitHub's web
+// URL in /v1/meta, but neither it nor anyone between it and us gets to
+// choose what this machine opens. The server only speaks to github.com,
+// so there's no Enterprise host to allow.
+const GITHUB_HOST = "github.com";
+
+// `url` normalised, if it's an https page on github.com with no user or
+// password in it; null otherwise. Anything else could be a local file or
+// app (`open /Applications/...`), another scheme, or a look-alike host.
+export function githubUrl(url: unknown): string | null {
+  if (typeof url !== "string") return null;
+  let parsed: URL;
   try {
-    const child = spawn(cmd, args, { stdio: "ignore", detached: true });
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.hostname !== GITHUB_HOST || parsed.port || parsed.username || parsed.password) return null;
+  return parsed.href;
+}
+
+// The program and arguments that open `href` in a browser: the URL is
+// one argument, and no shell (such as `cmd /c start`) gets to read `&`
+// or quotes in it. Null where there's no way to.
+export function browserCommand(href: string, platform: string, env: NodeJS.ProcessEnv): string[] | null {
+  if (platform === "darwin") return ["open", href];
+  if (platform === "win32") return ["rundll32", "url.dll,FileProtocolHandler", href];
+  if (env.DISPLAY || env.WAYLAND_DISPLAY) return ["xdg-open", href];
+  return null;
+}
+
+// Starts `command` in the background, never through a shell.
+export function launch(command: string[], run: typeof spawn = spawn): boolean {
+  const [cmd, ...args] = command;
+  try {
+    const child = run(cmd, args, { stdio: "ignore", detached: true, shell: false });
     child.on("error", () => {});
     child.unref();
     return true;
   } catch {
     return false;
   }
+}
+
+// Only for someone at this machine's own screen: not when output goes to
+// a file or another program, not over SSH, and not when turned off. And
+// only a github.com page.
+function openUrl(url: string): boolean {
+  if (!process.stderr.isTTY || process.env.SSH_CONNECTION || process.env.SSH_TTY || process.env.WATCHERONI_NO_BROWSER) return false;
+  const href = githubUrl(url);
+  const command = href && browserCommand(href, process.platform, process.env);
+  return command ? launch(command) : false;
 }
 
 export function serverUrl(): string {
@@ -224,7 +258,15 @@ async function deviceFlow(webUrl: string, clientId: string, deps: LoginDeps): Pr
 
   const code = await post("/login/device/code", { client_id: clientId });
   if (typeof code.device_code !== "string") throw new LoginFailed(`GitHub didn't start the device flow: ${JSON.stringify(code)}`);
-  const uri = String(code.verification_uri);
+  // This answer comes from wherever the server's web_url points, so it's
+  // checked before the user is sent anywhere. GitHub's code page is
+  // always on github.com; any other address stops the sign-in rather than
+  // leaving the user to judge it.
+  const uri = githubUrl(code.verification_uri);
+  if (!uri) throw new LoginFailed(`refusing to send you to ${JSON.stringify(String(code.verification_uri))}: it isn't an https page on ${GITHUB_HOST}`);
+  if (typeof code.user_code !== "string" || !/^[\w-]{1,32}$/.test(code.user_code)) {
+    throw new LoginFailed(`GitHub sent an odd one-time code: ${JSON.stringify(String(code.user_code))}`);
+  }
   deps.print(`Your one-time code: ${code.user_code}`);
   deps.print(deps.openUrl(uri)
     ? `Opening ${uri} in your browser; enter the code there. (If it doesn't open, go there yourself.)`

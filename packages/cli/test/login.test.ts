@@ -1,19 +1,31 @@
+import type { spawn, SpawnOptions } from "node:child_process";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 import { loadServer } from "../src/config.ts";
-import { DEFAULT_SERVER, type LoginDeps, LoginFailed, login, logout, readCredentials } from "../src/login.ts";
+import {
+  browserCommand,
+  DEFAULT_SERVER,
+  githubUrl,
+  launch,
+  type LoginDeps,
+  LoginFailed,
+  login,
+  logout,
+  readCredentials,
+} from "../src/login.ts";
 
 const SERVER = "https://watcheroni.test";
 const GITHUB = "https://github.test";
+const DEVICE_PAGE = "https://github.com/login/device";
 
 beforeEach(() => {
   process.env.WATCHERONI_CREDENTIALS = join(mkdtempSync(join(tmpdir(), "watcheroni-cred-")), "credentials.json");
 });
 
 // A fake server and GitHub. `answers` are what the token endpoint says, in turn.
-function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = true) {
+function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = true, page: unknown = DEVICE_PAGE, userCode: unknown = "ABCD-1234") {
   const calls: { url: string; body: unknown; auth: string | null }[] = [];
   const opened: string[] = [];
   const printed: string[] = [];
@@ -31,7 +43,7 @@ function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = t
         case `${SERVER}/v1/meta`:
           return Response.json({ protocol: 1, server: "t", features: [], limits: {}, github: { client_id: "Iv23cli", web_url: GITHUB, api_url: "" } });
         case `${GITHUB}/login/device/code`:
-          return Response.json({ device_code: "dc", user_code: "ABCD-1234", verification_uri: `${GITHUB}/login/device`, expires_in: 900, interval: 5 });
+          return Response.json({ device_code: "dc", user_code: userCode, verification_uri: page, expires_in: 900, interval: 5 });
         case `${GITHUB}/login/oauth/access_token`:
           return Response.json(answers.shift());
         case `${SERVER}/v1/login`:
@@ -52,14 +64,84 @@ describe("login", () => {
     const done = { access_token: "ghu_tok" };
     const a = fake([done]);
     await login(SERVER, a.deps);
-    expect(a.opened).toEqual([`${GITHUB}/login/device`]);
+    expect(a.opened).toEqual([DEVICE_PAGE]);
     expect(a.printed.slice(0, 2)).toEqual([
       "Your one-time code: ABCD-1234",
-      `Opening ${GITHUB}/login/device in your browser; enter the code there. (If it doesn't open, go there yourself.)`,
+      `Opening ${DEVICE_PAGE} in your browser; enter the code there. (If it doesn't open, go there yourself.)`,
     ]);
     const b = fake([done], 200, false);
     await login(SERVER, b.deps);
-    expect(b.printed[1]).toBe(`Open ${GITHUB}/login/device and enter the code there.`);
+    expect(b.printed[1]).toBe(`Open ${DEVICE_PAGE} and enter the code there.`);
+  });
+
+  it("refuses a code page that isn't on github.com, opening and saving nothing", async () => {
+    for (const page of [
+      "file:///etc/passwd",
+      "/Applications/Calculator.app",
+      "javascript:alert(1)",
+      "http://github.com/login/device",
+      "https://github.com.evil.com/login/device",
+      "https://evil.com/github.com",
+      "https://user@github.com/login/device",
+      null,
+    ]) {
+      const { deps, opened, printed } = fake([{ access_token: "ghu_tok" }], 200, true, page);
+      await expect(login(SERVER, deps)).rejects.toThrow(/refusing to send you to .*github\.com/);
+      expect(opened).toEqual([]);
+      expect(printed).toEqual([]);
+      expect(readCredentials().servers).toEqual({});
+    }
+  });
+
+  it("refuses a one-time code that isn't a plain code", async () => {
+    const { deps, printed } = fake([{ access_token: "ghu_tok" }], 200, true, DEVICE_PAGE, "\x1b]8;;https://evil.com\x07ABCD");
+    await expect(login(SERVER, deps)).rejects.toThrow(/odd one-time code/);
+    expect(printed).toEqual([]);
+  });
+});
+
+describe("opening the browser", () => {
+  it("allows only https pages on github.com, normalised", () => {
+    expect(githubUrl("https://github.com/login/device")).toBe("https://github.com/login/device");
+    expect(githubUrl("https://GitHub.com/login/device")).toBe("https://github.com/login/device");
+    expect(githubUrl("https://github.com:443/login/device")).toBe("https://github.com/login/device");
+    // Quotes and spaces come out encoded; `&` stays, which is harmless
+    // without a shell.
+    expect(githubUrl(`https://github.com/a"b c?x=1&y='2'"`)).toBe("https://github.com/a%22b%20c?x=1&y=%272%27%22");
+    for (const bad of [
+      "file:///Applications/Calculator.app",
+      "/Applications/Calculator.app",
+      "Calculator.app",
+      "javascript:alert(1)",
+      "http://github.com/login/device",
+      "https://github.com.evil.com/login/device",
+      "https://evil.com/github.com",
+      "https://evil.com/?https://github.com",
+      "https://user@github.com/login/device",
+      "https://user:pw@github.com/login/device",
+      "https://github.com:8443/login/device",
+      "",
+      42,
+      null,
+    ]) {
+      expect(githubUrl(bad), String(bad)).toBeNull();
+    }
+  });
+
+  it("passes the URL as one argument, with no cmd or shell", () => {
+    const href = githubUrl("https://github.com/login/device?a=1&b=\"2\"")!;
+    expect(browserCommand(href, "darwin", {})).toEqual(["open", href]);
+    expect(browserCommand(href, "win32", {})).toEqual(["rundll32", "url.dll,FileProtocolHandler", href]);
+    expect(browserCommand(href, "linux", { DISPLAY: ":0" })).toEqual(["xdg-open", href]);
+    expect(browserCommand(href, "linux", {})).toBeNull();
+
+    const runs: { cmd: string; args: readonly string[]; options: SpawnOptions }[] = [];
+    const run = ((cmd: string, args: readonly string[], options: SpawnOptions) => {
+      runs.push({ cmd, args, options });
+      return { on: () => {}, unref: () => {} };
+    }) as unknown as typeof spawn;
+    expect(launch(["rundll32", "url.dll,FileProtocolHandler", href], run)).toBe(true);
+    expect(runs).toEqual([{ cmd: "rundll32", args: ["url.dll,FileProtocolHandler", href], options: expect.objectContaining({ shell: false }) }]);
   });
 
   it("runs the device flow, trades the token for a key, and keeps both locally", async () => {
