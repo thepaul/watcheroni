@@ -45,7 +45,7 @@ interface FakeRepo {
   id: number;
   private?: boolean;
   installation: number | null;
-  prs: Record<number, { state?: "open" | "closed"; merged?: boolean; mergeable?: boolean | null; base?: string; author?: string }>;
+  prs: Record<number, { state?: "open" | "closed"; merged?: boolean; base?: string; author?: string }>;
   // User IDs whose tokens can read it (private repos).
   readers?: number[];
   // Listing its open PRs fails.
@@ -67,7 +67,7 @@ interface Seen {
 
 function newRepo(o: Partial<FakeRepo> = {}): FakeRepo {
   const id = fresh();
-  return { owner: "octo", name: `widgets-${id}`, id, installation: fresh(), prs: { 7: { state: "open", mergeable: true } }, ...o };
+  return { owner: "octo", name: `widgets-${id}`, id, installation: fresh(), prs: { 7: { state: "open" } }, ...o };
 }
 
 const fullName = (r: FakeRepo) => `${r.owner}/${r.name}`;
@@ -132,7 +132,6 @@ function mockGitHub(gh: FakeGitHub): Seen[] {
         state: pr.state ?? "open",
         merged: !!pr.merged,
         draft: false,
-        mergeable: pr.mergeable ?? null,
         head: { sha: SHA },
         base: { ref: "main" },
       });
@@ -234,7 +233,7 @@ describe("subscribing to a public repo", () => {
       expires_at: expect.any(String),
       verified_until: null,
       state: "active",
-      baseline: { state: "open", head_sha: SHA, mergeable: "mergeable" },
+      baseline: { state: "open", head_sha: SHA },
     });
     expect(Date.parse(sub.expires_at) - Date.parse(sub.created_at)).toBe(7 * 24 * 3600_000);
 
@@ -252,7 +251,7 @@ describe("subscribing to a public repo", () => {
     // RepoHub has the routing copy, with the baseline.
     const stats = await hubStats(repo.id);
     expect(stats.subscriptions.map((s) => [s.id, s.account, s.inbox, s.pr])).toEqual([[sub.id, user.id, "box", 7]]);
-    expect(stats.prs).toEqual([{ number: 7, state: "open", draft: 0, head_sha: SHA, base_ref: "main", mergeable: "mergeable", author: null }]);
+    expect(stats.prs).toEqual([{ number: 7, state: "open", draft: 0, head_sha: SHA, base_ref: "main", author: null }]);
     expect((await installation(repo.installation!).stats()).repos).toEqual([repo.id]);
 
     // A review on the PR reaches the inbox.

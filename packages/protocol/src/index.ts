@@ -129,7 +129,7 @@ export interface SubscriptionInfo {
   verified_until: string | null;
   state: "active";
   // Only in the answer to creating one.
-  baseline?: { state: "open" | "closed" | "merged"; head_sha: string | null; mergeable: "mergeable" | "conflicting" | "unknown" };
+  baseline?: { state: "open" | "closed" | "merged"; head_sha: string | null };
 }
 
 export interface SubscriptionsResponse {

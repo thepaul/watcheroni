@@ -30,7 +30,8 @@ describe("appManifest", () => {
     expect(Object.keys(m.default_permissions).sort()).toEqual(["actions", "checks", "issues", "metadata", "pull_requests", "statuses"]);
     expect(m.default_events).toContain("pull_request_review_thread");
     expect(m.default_events).toContain("workflow_run");
-    expect(m.default_events).toHaveLength(10);
+    expect(m.default_events).not.toContain("check_suite");
+    expect(m.default_events).toHaveLength(9);
   });
 
   it("posts to the person's account or an organization, whose settings page is elsewhere too", () => {

@@ -114,10 +114,30 @@ describe("normalising", () => {
   it("checks", async () => {
     const run = example("check_run", "completed");
     const out = await events("check_run", run);
-    expect(out[0]).toMatchObject({ kind: "check.completed", data: { check_run_id: expect.any(Number), name: expect.any(String) } });
+    const r = run.check_run as { id: number; name: string; head_sha: string; conclusion: string; html_url: string; url: string };
+    expect(out[0]).toMatchObject({
+      kind: "check.completed",
+      data: { head_sha: r.head_sha, name: r.name, check_run_id: r.id, conclusion: r.conclusion },
+      links: { html: r.html_url, api: r.url },
+    });
+    expect(Object.keys(out[0].data).sort()).toEqual(["check_run_id", "conclusion", "head_sha", "name"]);
     const failed = structuredClone(run);
     (failed.check_run as { conclusion: string }).conclusion = "failure";
-    expect((await events("check_run", failed)).map((e) => e.kind)).toContain("check.failed");
+    const both = await events("check_run", failed);
+    expect(both.map((e) => e.kind)).toEqual(["check.completed", "check.failed"]);
+    expect(both[1].data).toEqual(both[0].data);
+    // A run starting, a pending status and a check suite say nothing.
+    const started = structuredClone(example("check_run", "created"));
+    Object.assign(started.check_run as object, { status: "queued", conclusion: null });
+    expect(await events("check_run", started)).toEqual([]);
+    const statusExample = byEvent.get("status")![0];
+    expect(await events("status", { ...statusExample, state: "pending" })).toEqual([]);
+    expect(await events("check_suite", example("check_suite", "completed"))).toEqual([]);
+    const status = await events("status", { ...statusExample, state: "error", context: "ci/x" });
+    expect(status.map((e) => [e.kind, e.data])).toEqual([
+      ["check.completed", { head_sha: expect.any(String), name: "ci/x", status_context: "ci/x", conclusion: "failure" }],
+      ["check.failed", { head_sha: expect.any(String), name: "ci/x", status_context: "ci/x", conclusion: "failure" }],
+    ]);
     const wf = await events("workflow_run", example("workflow_run", "completed"));
     expect(wf[0]).toMatchObject({ kind: "workflow.completed", data: { run_id: expect.any(Number) } });
   });
