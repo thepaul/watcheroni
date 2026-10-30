@@ -161,7 +161,7 @@ describe("text output", () => {
     inbox.close();
   });
 
-  it("prints a reply once, and says which thread was resolved", async () => {
+  it("prints a reply and its review, and says which thread was resolved", async () => {
     const inbox = open();
     const target = { owner: "octo", name: "widgets", number: 7 };
     inbox.watch(targetKey(target), target);
@@ -183,6 +183,8 @@ describe("text output", () => {
     const events = await pollOnce(inbox, () => {}, async () => list.shift()!);
     expect(formatText(events, ["octo/widgets#7"])).toBe([
       "octo/widgets#7: 3 new events",
+      "- review.submitted by bob: commented",
+      "  gh api repos/octo/widgets/pulls/7/reviews/11 --jq '.state, .body'",
       "- review_comment.created by bob on a.ts:3 (a reply)",
       "  gh api repos/octo/widgets/pulls/comments/21 --jq .body",
       "- thread.resolved on a.ts:3",

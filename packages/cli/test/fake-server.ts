@@ -116,6 +116,7 @@ export class FakeServer {
   readonly refreshed: string[] = [];
   private http: Server | null = null;
   private waiting = new Set<() => void>();
+  private holding = false;
   port = 0;
 
   get url(): string {
@@ -153,9 +154,24 @@ export class FakeServer {
       repo: { id: 1, full_name: "octo/widgets" }, pr, actor: null, data, links: {},
     };
     inbox.events.push(event);
+    if (!this.holding) this.deliver(name);
+    return event;
+  }
+
+  // Several events that reach a reader in one message or page.
+  injectTogether(name: string, ...events: [kind: string, data?: WatchEvent["data"]][]): void {
+    this.holding = true;
+    try {
+      for (const [kind, data] of events) this.inject(name, kind, data);
+    } finally {
+      this.holding = false;
+    }
+    this.deliver(name);
+  }
+
+  private deliver(name: string): void {
     for (const s of this.sockets) if (s.inbox === name && s.pos !== null) this.sendFrom(s);
     for (const w of [...this.waiting]) w();
-    return event;
   }
 
   closeSockets(code: number, reason = ""): void {
