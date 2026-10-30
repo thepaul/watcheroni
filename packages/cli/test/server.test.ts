@@ -6,7 +6,7 @@ import { Feed } from "../src/feed.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
-import { ServerClient, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
+import { ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -106,6 +106,41 @@ describe("server reader", () => {
     await until(() => fake.inbox("box").acked === 1);
     // The next poll starts after what it has.
     await until(() => fake.requests.includes("GET /v1/inboxes/box/events?wait=300&after=1"));
+  });
+
+  it("long-polls when the account has too many WebSockets", async () => {
+    fake.tooManySockets = true;
+    const r = reader();
+    expect(await r.start()).toBe(true);
+    expect(messages).toEqual([`${fake.url} has too many connections for this account; long-polling instead`]);
+    fake.inject("box", "comment.created");
+    expect(await r.changed(1000)).toBe(true);
+    expect(r.pending().map((e) => e.kind)).toEqual(["comment.created"]);
+  });
+
+  it("asks less often when the account has too many long polls waiting", async () => {
+    fake.refuseSockets = true;
+    fake.tooManyPolls = true;
+    const r = reader();
+    expect(await r.start()).toBe(true);
+    await until(() => fake.requests.filter((q) => q.includes("wait=300")).length === 1);
+    expect(messages.at(-1)).toBe(`${fake.url} has too many long polls waiting for this account; asking every 1 s instead`);
+    expect(r.connected).toBe(true);
+    // Events still come, on the next ask.
+    fake.inject("box", "comment.created");
+    fake.tooManyPolls = false;
+    expect(await r.changed(2000)).toBe(true);
+    expect(r.pending().map((e) => e.kind)).toEqual(["comment.created"]);
+    expect(fake.requests.filter((q) => q.includes("wait=300"))).toHaveLength(2);
+    expect(messages.filter((m) => m.includes("too many long polls"))).toHaveLength(1);
+  });
+
+  it("says when the account has too many inboxes", async () => {
+    fake.tooManyInboxes = true;
+    const client = new ServerClient({ url: fake.url, apiKey: fake.token });
+    const err = await client.ensureInbox("box").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ServerError);
+    expect((err as ServerError).message).toBe(`${fake.url}: PUT /v1/inboxes/box: 422 Too many inboxes on this account (at most 500)`);
   });
 
   it("keeps trying while the server is down", async () => {

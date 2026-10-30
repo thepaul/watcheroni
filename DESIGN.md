@@ -377,7 +377,7 @@ RPC methods:
 ```ts
 interface Account {
   // From the Worker.
-  createKey(id: string, hash: ArrayBuffer, label: string | null, login: string): KeyInfo;  // at login
+  createKey(id: string, hash: ArrayBuffer, label: string | null, login: string): KeyInfo | Refusal;  // at login; Refusal at the key cap
   authenticate(keyHash: ArrayBuffer): Promise<AuthResult>;  // live key? takes one request token
   listKeys(): KeyInfo[];
   revokeKey(id: string): boolean;   // also closes that key's sockets with 4001
@@ -407,7 +407,7 @@ reading stays cheap.
 `authenticate` returns the key's ID and the account's request budget
 (the `RateLimit-*` headers), or why not (`unauthorized`, `rate_limited`
 with a retry time), so one call both authenticates and rate-limits.
-(The prototype calls separate inbox methods, such as `ensureInbox` and
+(The prototype calls separate inbox methods, such as `openInbox` and
 `readEvents`, instead of one `handle`.)
 
 **WebSockets.** Each client socket is accepted with
@@ -912,11 +912,15 @@ differs from the above:
 
 ## Limits
 
-All limits but the per-IP ones are token buckets kept in SQLite
+Rate limits, except the per-IP ones, are token buckets kept in SQLite
 (`buckets` tables), refilled by elapsed time when read. That makes them
-exact and free: they live in an object that's already being called.
-Defaults below; a deployment changes them with Worker vars, and
-`Control` can override them for one repo or account.
+exact and free: they live in an object that's already being called. Caps
+on what an account holds are counts: rows in its SQLite, or its sockets
+by tag (`ctx.getWebSockets("mode:client")`, `"mode:bridge"`), which the
+runtime keeps across hibernation. A long poll is counted by its bridge
+socket, so it stops counting however its request ends. Defaults below; a
+deployment changes them with Worker vars, and `Control` can override
+them for one repo or account.
 
 ### Per repository (in RepoHub)
 
@@ -943,9 +947,11 @@ but unwatched repo is never throttled; it only costs one cheap call.
 | Limit | Default |
 |---|---|
 | API requests | 120 a minute |
-| Inboxes | 50 |
-| Subscriptions | 200 |
-| Open WebSockets and long-polls together | 20 (`4029` / `429` beyond) |
+| Inboxes | 500; at the cap, inboxes unread for 30 days with no subscriptions or sockets are deleted to make room, else `422 quota_exceeded` |
+| Subscriptions | 200 (`422 quota_exceeded`) |
+| Live API keys | 100 (`422 quota_exceeded` at login) |
+| Open WebSockets | 50 (closed with `4029` beyond) |
+| Long polls waiting at once | 50 (`429 too_many_connections` with `Retry-After` beyond) |
 | Events delivered | 10,000 a day; beyond that the inbox gets `inbox.gap` |
 
 ### Per IPv4 address or IPv6 /64 (Rate Limiting binding)

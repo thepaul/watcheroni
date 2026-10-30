@@ -140,3 +140,23 @@ export const DEFAULT_TTL_SECONDS = 7 * 24 * 3600;
 export const MAX_TTL_SECONDS = 30 * 24 * 3600;
 export const PRIVATE_VERIFY_SECONDS = 7 * 24 * 3600;
 export const ACCOUNT_MAX_SUBSCRIPTIONS = 200;
+
+// The other per-account caps (PROTOCOL.md, "Limits"). Each is far above
+// what one person uses, and there to bound what a leaked or misbehaving key
+// can hold open or store.
+//
+// Inboxes: the CLI makes one per Claude Code session that watches
+// something. One nobody has read for INBOX_IDLE_DAYS, with no
+// subscriptions or connections left, is deleted to make room, so this
+// allows about 16 new sessions a day, every day.
+export const ACCOUNT_MAX_INBOXES = 500;
+export const INBOX_IDLE_DAYS = 30;
+// Live keys: one per machine signed in, plus scripts and bots.
+export const ACCOUNT_MAX_KEYS = 100;
+// Open WebSockets: one per running `watcheroni wait` or `watch`, so one
+// per busy session.
+export const ACCOUNT_MAX_SOCKETS = 50;
+// Long polls waiting at once: what clients that can't open a WebSocket
+// use instead, so the same number. Without it, the request budget allows
+// about 600, each held for up to MAX_WAIT_SECONDS.
+export const ACCOUNT_MAX_LONG_POLLS = 50;

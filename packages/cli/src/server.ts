@@ -10,7 +10,20 @@ import { anyKey, isPr, type RepoTarget, type Target } from "./targets.ts";
 // can't be opened.
 
 // The server can't be reached, or answered 5xx or 429. Worth retrying.
-export class Unreachable extends Error {}
+// `code` and `retryAfter` (seconds) are the server's, when it answered.
+export class Unreachable extends Error {
+  readonly code: string | null;
+  readonly retryAfter: number | null;
+  constructor(message: string, o: { code?: string; retryAfter?: number | null } = {}) {
+    super(message);
+    this.code = o.code ?? null;
+    this.retryAfter = o.retryAfter ?? null;
+  }
+}
+
+// A long poll refused because too many are already waiting on the account
+// is asked again this often, unless the server says otherwise.
+const CROWDED_RETRY_SECONDS = 30;
 
 // Any other error the server answered with. Not worth retrying.
 export class ServerError extends Error {
@@ -72,7 +85,13 @@ export class ServerClient {
     if (res.status === 401 && !GITHUB_TOKEN_CODES.has(code)) {
       throw new LoginNeeded(`${this.url} rejected the API key (${code}); check WATCHERONI_API_KEY`);
     }
-    if (res.status >= 500 || res.status === 429) throw new Unreachable(`${this.url} answered ${res.status} (${code})`);
+    if (res.status >= 500 || res.status === 429) {
+      const retryAfter = Number(res.headers.get("Retry-After"));
+      throw new Unreachable(`${this.url} answered ${res.status} (${code}${problem.title ? `: ${problem.title}` : ""})`, {
+        code,
+        retryAfter: retryAfter > 0 ? retryAfter : null,
+      });
+    }
     throw new ServerError(`${this.url}: ${method} ${path}: ${res.status} ${problem.detail ?? problem.title ?? code}`, res.status, code, problem);
   }
 
@@ -338,7 +357,20 @@ export class ServerReader {
           throw new Unreachable(`lost the connection to ${this.client.url} (${code}${reason ? ` ${reason}` : ""})`);
         } else {
           // Ask without waiting first, so a (re)connection shows at once.
-          const page = await this.client.events(this.name, this.pos, this.connected ? WAIT_SECONDS : 0, this.abort.signal);
+          let page: EventsPage;
+          try {
+            page = await this.client.events(this.name, this.pos, this.connected ? WAIT_SECONDS : 0, this.abort.signal);
+          } catch (e) {
+            // Too many long polls already waiting on this account: still
+            // connected, but ask again later rather than at once.
+            if (!(e instanceof Unreachable && e.code === "too_many_connections")) throw e;
+            const seconds = e.retryAfter ?? CROWDED_RETRY_SECONDS;
+            if (!this.crowded) this.o.log(`${this.client.url} has too many long polls waiting for this account; asking every ${seconds} s instead`);
+            this.crowded = true;
+            await this.pause(seconds * 1000);
+            continue;
+          }
+          this.crowded = false;
           this.markConnected();
           if (this.pos === null) this.pos = page.acked;
           this.add(page.events);
@@ -367,6 +399,20 @@ export class ServerReader {
 
   private wasConnected = false;
   private outage = false;
+  private crowded = false;
+
+  // Sleeps for `ms`, or until close().
+  private pause(ms: number): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.abort.signal.removeEventListener("abort", done);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
+      this.abort.signal.addEventListener("abort", done, { once: true });
+    });
+  }
 
   private markConnected(): void {
     if (this.outage) this.o.log(`${this.wasConnected ? "reconnected" : "connected"} to ${this.client.url}`);

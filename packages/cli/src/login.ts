@@ -162,8 +162,12 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
     if (res.status === 429) throw new LoginFailed(signInsLimited(server, retryAfter(res)));
   }
   if (!res.ok) {
-    const problem = (await res.json().catch(() => ({}))) as { title?: string };
-    throw new LoginFailed(`the server refused the login (${res.status}${problem.title ? `: ${problem.title}` : ""})`);
+    const problem = (await res.json().catch(() => ({}))) as { title?: string; code?: string };
+    // The only quota on login is the account's live keys.
+    const hint = problem.code === "quota_exceeded"
+      ? "; run `watcheroni logout` on a machine you no longer use, or revoke the App's authorization in GitHub's settings to revoke every key"
+      : "";
+    throw new LoginFailed(`the server refused the login (${res.status}${problem.title ? `: ${problem.title}` : ""})${hint}`);
   }
   const body = (await res.json()) as LoginResponse;
   const now = deps.now();
