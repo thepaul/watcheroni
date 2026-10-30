@@ -6,7 +6,7 @@ import { Feed } from "../src/feed.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
-import { ServerClient, ServerReader, renewSubscriptions, subscribe } from "../src/server.ts";
+import { ServerClient, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -280,6 +280,16 @@ describe("subscribing on the server", () => {
       `couldn't renew the server's watch on octo/secret: ${fake.url} is limiting GitHub token refreshes from this address; try again in 60 seconds`,
     ]);
     expect(fake.verified).toEqual([]);
+  });
+
+  it("says the server can't be reached, not to sign in again, when a refresh gets no answer", async () => {
+    signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    const down = async () => {
+      throw new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED") });
+    };
+    const refreshing = githubTokenFor(fake.url, { fetch: down, now: Date.now });
+    await expect(refreshing).rejects.toThrow(Unreachable);
+    await expect(refreshing).rejects.toThrow(`can't reach ${fake.url} to refresh the GitHub token: connect ECONNREFUSED`);
   });
 
   it("renews private subscriptions due within two days, and only those", async () => {

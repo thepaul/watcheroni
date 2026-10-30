@@ -190,8 +190,8 @@ export async function logout(server = serverUrl(), deps: LoginDeps = defaultDeps
 // subscribing to private repos. An expired one is renewed through the
 // server's refresh proxy (PROTOCOL.md, "Refreshing the GitHub token") and
 // saved. Null if there's none, or it can't be renewed. Throws
-// Unreachable when the server can't refresh it just now (a 429 or 5xx),
-// which `watcheroni login` wouldn't fix.
+// Unreachable when the server can't refresh it just now (no answer, a
+// 429 or a 5xx), which `watcheroni login` wouldn't fix.
 export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetch" | "now"> = defaultDeps): Promise<string | null> {
   const github = readCredentials().servers[server]?.github;
   if (!github?.access_token) return null;
@@ -200,20 +200,25 @@ export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetc
   if (expiresAt - now > TOKEN_MARGIN_MS) return github.access_token;
   const refreshExpiresAt = github.refresh_token_expires_at ? Date.parse(github.refresh_token_expires_at) : Infinity;
   if (!github.refresh_token || refreshExpiresAt <= now) return null;
-  let token: Partial<TokenResponse> & { error?: string };
+  let res: Response;
   try {
-    const res = await deps.fetch(`${server}/v1/github/refresh`, {
+    res = await deps.fetch(`${server}/v1/github/refresh`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ refresh_token: github.refresh_token }),
     });
-    if (res.status === 429) {
-      throw new Unreachable(`${server} is limiting GitHub token refreshes from this address; try again in ${retryAfter(res)} seconds`);
-    }
-    if (res.status >= 500) throw new Unreachable(`${server} couldn't refresh the GitHub token (${res.status})`);
-    token = (await res.json()) as typeof token;
   } catch (e) {
-    if (e instanceof Unreachable) throw e;
+    const cause = (e as Error & { cause?: Error }).cause;
+    throw new Unreachable(`can't reach ${server} to refresh the GitHub token: ${cause?.message ?? (e as Error).message}`);
+  }
+  if (res.status === 429) {
+    throw new Unreachable(`${server} is limiting GitHub token refreshes from this address; try again in ${retryAfter(res)} seconds`);
+  }
+  if (res.status >= 500) throw new Unreachable(`${server} couldn't refresh the GitHub token (${res.status})`);
+  let token: Partial<TokenResponse> & { error?: string };
+  try {
+    token = (await res.json()) as typeof token;
+  } catch {
     return null;
   }
   if (typeof token.access_token !== "string") return null;
