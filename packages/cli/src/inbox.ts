@@ -2,7 +2,6 @@ import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, w
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { INBOX_NAME, type UnsequencedEvent, type WatchEvent } from "@watcheroni/protocol";
-import type { Memory } from "./diff.ts";
 import type { Snapshot } from "./snapshot.ts";
 import { UsageError, type RepoTarget, type Target } from "./targets.ts";
 
@@ -16,7 +15,6 @@ export interface Watched {
   target: Target;
   addedAt: string;
   snapshot: Snapshot | null;
-  memory: Memory | null;
   // The server subscription watching it, if the server does; otherwise
   // this machine polls GitHub for it.
   sub?: string;
@@ -117,7 +115,7 @@ export class Inbox {
 
   watch(key: string, target: Target, sub: string | null = null): boolean {
     if (this.state.watched[key]) return false;
-    this.state.watched[key] = { target, addedAt: new Date().toISOString(), snapshot: null, memory: null, ...(sub ? { sub } : {}) };
+    this.state.watched[key] = { target, addedAt: new Date().toISOString(), snapshot: null, ...(sub ? { sub } : {}) };
     this.save();
     return true;
   }
@@ -163,9 +161,13 @@ export class Inbox {
     return "pr";
   }
 
-  update(key: string, snapshot: Snapshot, memory: Memory): void {
+  update(key: string, snapshot: Snapshot): void {
     const w = this.state.watched[key];
-    if (w) Object.assign(w, { snapshot, memory });
+    if (w) {
+      w.snapshot = snapshot;
+      // What older versions kept for checks.completed and merge.*.
+      delete (w as { memory?: unknown }).memory;
+    }
   }
 
   // Numbers and saves new events, dropping any seen before.

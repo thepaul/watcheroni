@@ -1,5 +1,5 @@
 import type { WatchEvent } from "@watcheroni/protocol";
-import { diff, initialMemory } from "./diff.ts";
+import { diff } from "./diff.ts";
 import { GitHubError, LoginNeeded } from "./github.ts";
 import type { Inbox } from "./inbox.ts";
 import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
@@ -30,8 +30,8 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       log(`${key}: ${(e as Error).message}; trying again next time`);
       continue;
     }
-    if (!w.snapshot || !w.memory) {
-      inbox.update(key, next, initialMemory(next));
+    if (!w.snapshot) {
+      inbox.update(key, next);
       if (next.state !== "OPEN") {
         const reason = next.state === "MERGED" ? "merged" : "closed";
         added.push(...inbox.append([{
@@ -53,8 +53,8 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       }
       continue;
     }
-    const { events, memory } = diff(w.snapshot, next, w.memory);
-    inbox.update(key, next, memory);
+    const events = diff(w.snapshot, next);
+    inbox.update(key, next);
     added.push(...inbox.append(events));
     if (events.some((e) => e.kind === "watch.ended")) inbox.unwatch(key);
   }

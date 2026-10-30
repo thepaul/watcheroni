@@ -79,10 +79,10 @@ describe("wait against a server", () => {
     await until(() => fake.sockets.size === 1);
     fake.inject("box", "check.failed");
     await new Promise((r) => setTimeout(r, 300));
-    fake.inject("box", "checks.completed");
+    fake.inject("box", "check.completed");
     expect(await run.code).toBe(0);
     const out = JSON.parse(run.stdout()) as { events: { kind: string }[]; watching: string[] };
-    expect(out.events.map((e) => e.kind)).toEqual(["check.failed", "checks.completed"]);
+    expect(out.events.map((e) => e.kind)).toEqual(["check.failed", "check.completed"]);
     expect(out.watching).toEqual([]);
     expect(fake.inbox("box").acked).toBe(2);
   });

@@ -102,25 +102,19 @@ function describe(e: WatchEvent): [string, string | null] {
       const where = d.path ? ` on ${location(d)}` : "";
       return [`${e.kind}${by(e)}${where}`, cmd(api, "/pulls/comments/", id(d.comment_id), ` ${BODY}`)];
     }
+    case "check.completed":
     case "check.failed": {
       // A commit status has no ID to fetch; its link is shown as a link,
-      // never as a command.
+      // never as a command. A failure's run is shown with its failed logs.
+      const failed = e.kind === "check.failed" ? " --log-failed" : "";
       const command = id(d.workflow_run_id)
-        ? cmd("gh run view ", id(d.workflow_run_id), " -R ", full, " --log-failed")
+        ? cmd("gh run view ", id(d.workflow_run_id), " -R ", full, failed)
         : cmd(api, "/check-runs/", id(d.check_run_id));
       const details = command ? null : link(e.links.html);
-      return [`check.failed: ${quoted(d.name)} (${word(d.conclusion)}) on ${short(d.head_sha)}${details ? `; details: ${details}` : ""}`, command];
-    }
-    case "checks.completed": {
-      const failed = Array.isArray(d.failed) && d.failed.length ? `; failed: ${d.failed.slice(0, MAX_LISTED).map(quoted).join(", ")}${d.failed.length > MAX_LISTED ? `, and ${d.failed.length - MAX_LISTED} more` : ""}` : "";
-      return [`checks.completed on ${short(d.head_sha)}: ${word(d.result)}${failed}`, failed ? cmd("gh pr checks ", pr, " -R ", full) : null];
+      return [`${e.kind}: ${quoted(d.name)} (${word(d.conclusion)}) on ${short(d.head_sha)}${details ? `; details: ${details}` : ""}`, command];
     }
     case "workflow.completed":
       return [`workflow.completed: ${quoted(d.workflow)} ${word(d.conclusion)}`, d.conclusion === "success" ? null : cmd("gh run view ", id(d.run_id), " -R ", full, " --log-failed")];
-    case "merge.conflict":
-      return [`merge.conflict with the base branch (head ${short(d.head_sha)}, base ${short(d.base_sha)})`, null];
-    case "merge.clean":
-      return ["merge.clean: the conflict is gone", null];
     case "pr.pushed":
       return [`pr.pushed: ${short(d.before)} -> ${short(d.after)}`, null];
     case "pr.base_changed":
@@ -169,7 +163,6 @@ function repoPath(e: WatchEvent): string | null {
 const REPO_NAME = /^[A-Za-z0-9-]{1,39}\/[\w.-]{1,100}$/;
 const PLAIN = /^[\w.\/@+:-]+$/;
 const MAX_LENGTH = 100;
-const MAX_LISTED = 10;
 // C0 and C1 controls, line and paragraph separators, zero-width and
 // bidirectional formatting characters.
 const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
