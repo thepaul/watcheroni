@@ -5,21 +5,39 @@ import { API_KEY, TICKET_TTL_SECONDS } from "./protocol";
 
 const encoder = new TextEncoder();
 
-// A new key for an account. Only `hash` is ever stored; `key` is shown to
-// the user once.
-export async function newApiKey(accountId: number): Promise<{ key: string; hash: ArrayBuffer }> {
+// A new key for an account, tagged with an HMAC under API_KEY_SECRET so
+// the Worker can turn away made-up keys without waking an Account object.
+// Only `hash` is ever stored; `key` is shown to the user once.
+export async function newApiKey(accountId: number, apiKeySecret: string): Promise<{ key: string; hash: ArrayBuffer }> {
   const secret = base64url(crypto.getRandomValues(new Uint8Array(32)));
-  return { key: `wk1_${accountId}_${secret}`, hash: await sha256(secret) };
+  const body = `wk2_${accountId}_${secret}`;
+  const tag = await crypto.subtle.sign("HMAC", await hmacKey(apiKeySecret), encoder.encode(body));
+  return { key: `${body}_${base64url(new Uint8Array(tag))}`, hash: await sha256(secret) };
 }
 
 // Splits a key into the account it belongs to and the hash to look up.
-// Null if it isn't shaped like a key.
-export async function parseApiKey(key: string): Promise<{ accountId: number; hash: ArrayBuffer } | null> {
+// Null if it isn't shaped like a key, or if it's a wk2 key whose tag
+// doesn't check out (always, without API_KEY_SECRET). A wk1 key, from
+// before tags, has nothing to check here: the Account object looks up its
+// hash, and writes nothing unless it matches.
+export async function parseApiKey(
+  key: string,
+  apiKeySecret: string | undefined,
+): Promise<{ accountId: number; hash: ArrayBuffer } | null> {
   const m = API_KEY.exec(key);
   if (!m) return null;
-  const accountId = Number(m[1]);
+  const [, version, id, secret, tag] = m;
+  const accountId = Number(id);
   if (!Number.isSafeInteger(accountId)) return null;
-  return { accountId, hash: await sha256(m[2]) };
+  if (version === "1" ? tag !== undefined : !(await tagValid(`wk2_${id}_${secret}`, tag, apiKeySecret))) return null;
+  return { accountId, hash: await sha256(secret) };
+}
+
+async function tagValid(body: string, tag: string | undefined, apiKeySecret: string | undefined): Promise<boolean> {
+  const mac = tag === undefined ? null : fromBase64url(tag);
+  if (!mac || !apiKeySecret) return false;
+  // subtle.verify compares in constant time.
+  return crypto.subtle.verify("HMAC", await hmacKey(apiKeySecret), mac, encoder.encode(body));
 }
 
 export function bearer(request: Request): string | null {

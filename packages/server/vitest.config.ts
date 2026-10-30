@@ -27,6 +27,7 @@ export default defineConfig({
           GITHUB_WEBHOOK_SECRET: "test-secret",
           TICKET_KEY: "test-ticket-key",
           TICKET_KEY_OLD: "old-ticket-key",
+          API_KEY_SECRET: "test-api-key-secret",
           DEBUG_TOKEN: "test-debug-token",
         },
       },
