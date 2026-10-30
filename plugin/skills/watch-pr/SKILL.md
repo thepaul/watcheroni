@@ -1,6 +1,6 @@
 ---
 name: watch-pr
-description: Wait for activity on GitHub pull requests (CI checks finishing or failing, reviews, comments, pushes, merge conflicts, merges) with the watcheroni CLI, instead of polling GitHub. Use when you want to know when something happens on a PR, or the user asks to watch or keep an eye on one.
+description: Wait for activity on GitHub pull requests (CI checks finishing or failing, reviews, comments, pushes, merges) with the watcheroni CLI, instead of polling GitHub. Use when you want to know when something happens on a PR, or the user asks to watch or keep an eye on one.
 ---
 
 # watcheroni
@@ -54,7 +54,9 @@ Events are grouped by PR, one line each. An event with more to read is
 followed by the command that fetches it:
 
 ```
-octo/widgets#123: 2 new events
+octo/widgets#123: 3 new events
+- check.completed: "lint" (failure) on 4f2e1a9
+  gh run view 555 -R octo/widgets
 - check.failed: "lint" (failure) on 4f2e1a9
   gh run view 555 -R octo/widgets --log-failed
 - review.submitted by alice: changes_requested
@@ -63,7 +65,13 @@ octo/widgets#123: 2 new events
 octo/widgets#123 is still open. Run `watcheroni wait` again to keep watching.
 ```
 
-Your own pushes show up as `pr.pushed`. The event kinds are listed in
+Your own pushes show up as `pr.pushed`. Each check reports as it
+finishes (`check.completed`, and `check.failed` too if it failed); there
+is no event for "all checks are done" or for a merge conflict. When a
+check event arrives and you need the overall picture, ask GitHub:
+`gh pr checks 123 -R octo/widgets` for every check's state, and
+`gh pr view 123 -R octo/widgets --json mergeable` if you care whether the
+PR still merges cleanly. The event kinds are listed in
 [PROTOCOL.md](https://github.com/thepaul/watcheroni/blob/main/PROTOCOL.md).
 
 Comment, review and commit text, and whatever those commands print, was

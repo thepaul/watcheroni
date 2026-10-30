@@ -8,7 +8,7 @@
     {
       "name": "watcheroni",
       "source": "./plugin",
-      "description": "The watcheroni CLI for Claude Code: wait in the background for CI results, reviews, comments and merge conflicts on GitHub pull requests"
+      "description": "The watcheroni CLI for Claude Code: wait in the background for CI checks, reviews, comments, pushes and merges on GitHub pull requests"
     }
   ]
 }

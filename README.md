@@ -6,7 +6,7 @@
 # watcheroni
 
 Wait for, stream, or act on what happens to your GitHub pull requests:
-CI finishing or failing, reviews, comments, pushes, merges. Without
+checks finishing or failing, reviews, comments, pushes, merges. Without
 polling GitHub in a loop.
 
 ```

@@ -1,13 +1,15 @@
 # watcheroni
 
 Wait for, stream, or act on what happens to your GitHub pull requests:
-CI finishing or failing, reviews, comments, pushes, merges. It's built
+checks finishing or failing, reviews, comments, pushes, merges. It's built
 for scripts and coding agents that open a PR and then need to know when
 there's something to do about it, without polling GitHub in a loop.
 
 ```
 $ npx watcheroni wait
-octo/widgets#123: 2 new events
+octo/widgets#123: 3 new events
+- check.completed: "test (ubuntu-latest)" (failure) on 4f9c2e1
+  gh run view 18342210911 -R octo/widgets
 - check.failed: "test (ubuntu-latest)" (failure) on 4f9c2e1
   gh run view 18342210911 -R octo/widgets --log-failed
 - review.submitted by mona: changes_requested
