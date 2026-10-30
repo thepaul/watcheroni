@@ -95,7 +95,7 @@ export default {
       return connectWithTicket(request, env, inbox, ticket);
     }
 
-    // A forged wk2 key stops here, before any Durable Object.
+    // A forged key stops here, before any Durable Object.
     const parsed = await parseApiKey(bearer(request) ?? "", env.API_KEY_SECRET);
     if (!parsed) return problem(401, "unauthorized", "Missing or malformed API key");
     const account = accountStub(env, parsed.accountId);

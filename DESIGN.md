@@ -699,7 +699,7 @@ server can be down without losing events.
 | `GITHUB_APP_PRIVATE_KEY` | secret | Signs App JWTs (RS256). Stored as PKCS#8 PEM, since Web Crypto can't import GitHub's PKCS#1; setup converts it. |
 | `GITHUB_CLIENT_SECRET` | secret | Checking user tokens (`POST /applications/{client_id}/token`) and the refresh proxy |
 | `GITHUB_WEBHOOK_SECRET` | secret | Webhook HMAC. `GITHUB_WEBHOOK_SECRET_OLD` during rotation. |
-| `API_KEY_SECRET` | secret | HMAC for the tag on API keys, so the Worker turns away made-up keys before any Durable Object. Changing it invalidates every `wk2` key; there is no `_OLD`, since keys live until revoked. Without it, login answers 503 and only `wk1` keys work. |
+| `API_KEY_SECRET` | secret | HMAC for the tag on API keys, so the Worker turns away made-up keys before any Durable Object. Changing it invalidates every key; there is no `_OLD`, since keys live until revoked. Without it, login answers 503 and no key is accepted. |
 | `TICKET_KEY` | secret | HMAC for WebSocket tickets. `TICKET_KEY_OLD` during rotation; tickets live 60 seconds, so it can go a minute after the switch. |
 | `DEBUG_TOKEN` | secret | Development only: turns on the `/debug` routes. Unset in production. |
 | `STORAGE_KEY` | secret | AES-256-GCM key for installation tokens cached in storage |
@@ -730,16 +730,13 @@ Derived and cached:
 - Key: `wk2_<user id>_<secret>_<tag>`, where the secret is base64url of
   32 random bytes and the tag is base64url of the HMAC-SHA256, under
   `API_KEY_SECRET`, of `wk2_<user id>_<secret>`. The Worker checks the
-  tag without any storage, so a made-up key never reaches a Durable
-  Object; then it routes on the user ID and sends the secret's hash to
-  `Account.authenticate`, which compares it with stored hashes and
-  updates `last_used_at` at most once an hour.
-- Keys issued before the tag, `wk1_<user id>_<secret>`, are still
-  accepted, so nobody has to log in again. The Worker can't check them,
-  so a made-up one does reach `Account`, but costs nothing lasting:
-  `Account` writes nothing, not even its tables, until login creates
-  the account or a key matches. Once the `wk1` keys still in use have
-  been replaced, accepting them can stop.
+  tag without any storage, comparing it as text with the one it would
+  write, so a made-up key never reaches a Durable Object; then it routes
+  on the user ID and sends the secret's hash to `Account.authenticate`,
+  which compares it with stored hashes and updates `last_used_at` at
+  most once an hour. As a second line of defence, `Account` writes
+  nothing, not even its tables, until login creates the account or a
+  key matches. Keys from before the tag (`wk1_...`) aren't accepted.
 - WebSocket ticket: `wt1.<base64url payload>.<HMAC>`, where the payload
   is the JSON `{acct, inbox, key, exp, nonce}` (`exp` in Unix seconds,
   60 seconds ahead) and the HMAC is SHA-256 over `wt1.<payload>`, in

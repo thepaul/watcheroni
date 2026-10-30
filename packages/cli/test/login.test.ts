@@ -36,7 +36,7 @@ function fake(answers: Record<string, unknown>[], loginStatus = 200, canOpen = t
           return Response.json(answers.shift());
         case `${SERVER}/v1/login`:
           return loginStatus === 200
-            ? Response.json({ api_key: "wk1_7_secret", key_id: "key_1", account: { id: 7, login: "octocat" } })
+            ? Response.json({ api_key: "wk2_7_secret_tag", key_id: "key_1", account: { id: 7, login: "octocat" } })
             : Response.json({ title: "nope" }, { status: loginStatus });
         case `${SERVER}/v1/keys/current`:
           return new Response(null, { status: 204 });
@@ -72,7 +72,7 @@ describe("login", () => {
     expect(calls.find((c) => c.url === `${SERVER}/v1/login`)?.body).toMatchObject({ github_token: "ghu_tok" });
     const creds = readCredentials();
     expect(creds.servers[SERVER]).toMatchObject({
-      api_key: "wk1_7_secret",
+      api_key: "wk2_7_secret_tag",
       account: { id: 7, login: "octocat" },
       github: { access_token: "ghu_tok", refresh_token: "ghr_tok" },
     });
@@ -96,7 +96,7 @@ describe("logout", () => {
     const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
     await login(SERVER, deps);
     expect(await logout(SERVER, deps)).toBe(true);
-    expect(calls.at(-1)).toMatchObject({ url: `${SERVER}/v1/keys/current`, auth: "Bearer wk1_7_secret" });
+    expect(calls.at(-1)).toMatchObject({ url: `${SERVER}/v1/keys/current`, auth: "Bearer wk2_7_secret_tag" });
     expect(JSON.parse(readFileSync(process.env.WATCHERONI_CREDENTIALS!, "utf8")).servers).toEqual({});
     expect(await logout(SERVER, deps)).toBe(false);
   });
@@ -110,8 +110,8 @@ describe("choosing the server", () => {
       delete process.env.WATCHERONI_SERVER;
       delete process.env.WATCHERONI_API_KEY;
       expect(loadServer()).toBeNull();
-      writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { [DEFAULT_SERVER]: { api_key: "wk1_7_secret" } } }));
-      expect(loadServer()).toEqual({ url: DEFAULT_SERVER, apiKey: "wk1_7_secret" });
+      writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { [DEFAULT_SERVER]: { api_key: "wk2_7_secret_tag" } } }));
+      expect(loadServer()).toEqual({ url: DEFAULT_SERVER, apiKey: "wk2_7_secret_tag" });
       process.env.WATCHERONI_SERVER = "";
       expect(loadServer()).toBeNull();
     } finally {

@@ -11,33 +11,30 @@ const encoder = new TextEncoder();
 export async function newApiKey(accountId: number, apiKeySecret: string): Promise<{ key: string; hash: ArrayBuffer }> {
   const secret = base64url(crypto.getRandomValues(new Uint8Array(32)));
   const body = `wk2_${accountId}_${secret}`;
-  const tag = await crypto.subtle.sign("HMAC", await hmacKey(apiKeySecret), encoder.encode(body));
-  return { key: `${body}_${base64url(new Uint8Array(tag))}`, hash: await sha256(secret) };
+  return { key: `${body}_${await keyTag(body, apiKeySecret)}`, hash: await sha256(secret) };
 }
 
 // Splits a key into the account it belongs to and the hash to look up.
-// Null if it isn't shaped like a key, or if it's a wk2 key whose tag
-// doesn't check out (always, without API_KEY_SECRET). A wk1 key, from
-// before tags, has nothing to check here: the Account object looks up its
-// hash, and writes nothing unless it matches.
+// Null if it isn't shaped like a key or its tag doesn't check out
+// (always, without API_KEY_SECRET).
 export async function parseApiKey(
   key: string,
   apiKeySecret: string | undefined,
 ): Promise<{ accountId: number; hash: ArrayBuffer } | null> {
   const m = API_KEY.exec(key);
-  if (!m) return null;
-  const [, version, id, secret, tag] = m;
+  if (!m || !apiKeySecret) return null;
+  const [, id, secret, tag] = m;
   const accountId = Number(id);
   if (!Number.isSafeInteger(accountId)) return null;
-  if (version === "1" ? tag !== undefined : !(await tagValid(`wk2_${id}_${secret}`, tag, apiKeySecret))) return null;
+  // Compared as text, not decoded: base64url has more than one spelling
+  // of the same bytes, and only the one the server wrote is a key.
+  if (!(await secretsEqual(tag, await keyTag(`wk2_${id}_${secret}`, apiKeySecret)))) return null;
   return { accountId, hash: await sha256(secret) };
 }
 
-async function tagValid(body: string, tag: string | undefined, apiKeySecret: string | undefined): Promise<boolean> {
-  const mac = tag === undefined ? null : fromBase64url(tag);
-  if (!mac || !apiKeySecret) return false;
-  // subtle.verify compares in constant time.
-  return crypto.subtle.verify("HMAC", await hmacKey(apiKeySecret), mac, encoder.encode(body));
+async function keyTag(body: string, apiKeySecret: string): Promise<string> {
+  const mac = await crypto.subtle.sign("HMAC", await hmacKey(apiKeySecret), encoder.encode(body));
+  return base64url(new Uint8Array(mac));
 }
 
 export function bearer(request: Request): string | null {

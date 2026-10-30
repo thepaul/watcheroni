@@ -95,10 +95,11 @@ export class Account extends DurableObject<Env> {
   private readonly instance = crypto.randomUUID();
   private readonly startedAt = Date.now();
   private readonly sql: SqlStorage;
-  // Whether this account's tables exist. The Worker gets an Account object
-  // for whatever id a key names before the key has been checked, so the
-  // object writes nothing until login makes the account (createKey) or a
-  // key is accepted: a made-up key leaves no storage behind.
+  // Whether this account's tables exist. The Worker turns away keys
+  // without a valid tag, but checking the key's hash is this object's job;
+  // as a second line of defence, it writes nothing until login makes the
+  // account (createKey) or a key is accepted, so a request that gets this
+  // far with a bad key leaves no storage behind.
   private created: boolean;
   private opened = false;
 

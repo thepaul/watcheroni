@@ -1,7 +1,7 @@
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { base64url, newTicketPayload, parseApiKey, sha256, signTicket, verifyTicket } from "../src/auth";
+import { base64url, newApiKey, newTicketPayload, parseApiKey, signTicket, verifyTicket } from "../src/auth";
 import worker from "../src/worker";
 import { landingPage } from "../src/pages";
 import type { KeysResponse, LoginResponse, Meta, TicketResponse } from "../src/protocol";
@@ -32,6 +32,8 @@ const randomSecret = () => base64url(crypto.getRandomValues(new Uint8Array(32)))
 const noAccount = () => {
   throw new Error("no Account objects here");
 };
+// The test env, but with an ACCOUNT binding that throws if touched.
+const untouchable = () => ({ ...env, ACCOUNT: { get: noAccount, idFromName: noAccount, idFromString: noAccount } }) as unknown as Env;
 
 // Every row of every table in an account's storage, by table.
 function storedRows(accountId: number): Promise<Record<string, unknown[]>> {
@@ -225,37 +227,33 @@ describe("API keys", () => {
     const { api_key } = await mintKey();
     const [, id, secret, tag] = api_key.match(/^wk2_(\d+)_(.{43})_(.{43})$/)!;
     const made = `wk2_${nextAccount++}_${randomSecret()}`;
-    const untouchable = { ...env, ACCOUNT: { get: noAccount, idFromName: noAccount, idFromString: noAccount } } as unknown as Env;
+    // The tag's last character carries two unused bits; flipping one
+    // decodes to the same bytes, but isn't the tag the server wrote.
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const respelt = tag.slice(0, -1) + alphabet[alphabet.indexOf(tag.at(-1)!) ^ 1];
     for (const key of [
       `${made}_${tag}`,
       `${made}_${"A".repeat(43)}`,
       made,
       `wk2_${id}_${secret}_${tag.slice(0, -4)}${tag.endsWith("AAAA") ? "BBBB" : "AAAA"}`,
       `wk2_${id}_${randomSecret()}_${tag}`,
-      // A wk1 key never has a tag.
+      `wk2_${id}_${secret}_${respelt}`,
+      // Keys from before tags aren't accepted at all.
+      `wk1_${id}_${secret}`,
       `wk1_${id}_${secret}_${tag}`,
     ]) {
-      const res = await worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(key) }), untouchable);
+      const res = await worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(key) }), untouchable());
       expect(res.status, key).toBe(401);
     }
     // And the real key gets as far as the Account object.
-    await expect(worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(api_key) }), untouchable)).rejects.toThrow(/no Account/);
+    await expect(worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(api_key) }), untouchable())).rejects.toThrow(/no Account/);
   });
 
-  it("still accepts wk1 keys, from before tags", async () => {
-    const accountId = nextAccount++;
-    const secret = randomSecret();
-    await accountStub(accountId).createKey("key_wk1", await sha256(secret), null, "old-timer");
-    const res = await call("/v1/keys", { headers: bearer(`wk1_${accountId}_${secret}`) });
-    expect(res.status).toBe(200);
-    expect((await res.json<KeysResponse>()).keys.map((k) => k.id)).toEqual(["key_wk1"]);
-    expect((await call("/v1/keys", { headers: bearer(`wk1_${accountId}_${randomSecret()}`) })).status).toBe(401);
-  });
-
-  it("leaves nothing in storage for a made-up account or key", async () => {
-    // A wk1 key gets as far as the Account object, which has to look it up.
+  it("leaves nothing in storage for a key the Account object doesn't know", async () => {
+    // A correctly tagged key for an account that was never made.
     const madeUp = nextAccount++;
-    expect((await call("/v1/keys", { headers: bearer(`wk1_${madeUp}_${randomSecret()}`) })).status).toBe(401);
+    const { key } = await newApiKey(madeUp, env.API_KEY_SECRET);
+    expect((await call("/v1/keys", { headers: bearer(key) })).status).toBe(401);
     expect(await storedRows(madeUp)).toEqual({});
 
     // Nor does a wrong key for a real account, even in a new instance of
@@ -266,15 +264,14 @@ describe("API keys", () => {
     const before = await storedRows(real);
     expect(before.keys).toHaveLength(1);
     await evictDurableObject(accountStub(real));
-    expect((await call("/v1/keys", { headers: bearer(`wk1_${real}_${randomSecret()}`) })).status).toBe(401);
+    const { key: unknown } = await newApiKey(real, env.API_KEY_SECRET);
+    expect((await call("/v1/keys", { headers: bearer(unknown) })).status).toBe(401);
     expect(await storedRows(real)).toEqual(before);
   });
 
-  it("aren't issued, and wk2 keys aren't accepted, without API_KEY_SECRET", async () => {
+  it("aren't issued or accepted without API_KEY_SECRET", async () => {
     const accountId = nextAccount++;
     const { api_key } = await mintKey(accountId);
-    const secret = randomSecret();
-    await accountStub(accountId).createKey("key_wk1", await sha256(secret), null, "old-timer");
     const unset = { ...env, API_KEY_SECRET: undefined } as unknown as Env;
     const send = (path: string, init: RequestInit = {}) => worker.fetch(new Request(`${BASE}${path}`, init), unset);
 
@@ -283,8 +280,9 @@ describe("API keys", () => {
     expect(login.status).toBe(503);
     expect(seen).toHaveLength(0);
     expect((await send(`/debug/accounts/${accountId}/keys`, { method: "POST", headers: DEBUG })).status).toBe(503);
-    expect((await send("/v1/keys", { headers: bearer(api_key) })).status).toBe(401);
-    expect((await send("/v1/keys", { headers: bearer(`wk1_${accountId}_${secret}`) })).status).toBe(200);
+    // A real key is turned away before any Account object.
+    const res = await worker.fetch(new Request(`${BASE}/v1/keys`, { headers: bearer(api_key) }), { ...untouchable(), API_KEY_SECRET: undefined } as unknown as Env);
+    expect(res.status).toBe(401);
   });
 
   it("lists keys and revokes them by ID or as current", async () => {

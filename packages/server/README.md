@@ -70,9 +70,9 @@ openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put STORAGE_KEY --env
 ```
 
 And `API_KEY_SECRET` (the same), the HMAC key for the tag on API keys.
-Without it, login and `/debug` key minting answer 503 and only keys from
-before the tag (`wk1_...`) work. Changing it invalidates every key
-issued under the old one, so set it once:
+Without it, login and `/debug` key minting answer 503 and no key is
+accepted. Changing it invalidates every key issued under the old one,
+so set it once:
 
 ```
 openssl rand -base64 32 | tr -d '\n' | npx wrangler secret put API_KEY_SECRET

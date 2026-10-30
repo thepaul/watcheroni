@@ -102,7 +102,7 @@ user is, once, and exchanges that for an API key.
 
    ```json
    {
-     "api_key": "wk2_1234567_Q2hhbmdlIG1lIHRvIGEgcmVhbCByYW5kb20ga2V5_U2VydmVyIHRhZzogSE1BQyBvZiB0aGUgcmVzdCBvZiB",
+     "api_key": "wk2_1234567_ml_7EFrJhBuG47RnIM7bUuFVWadusxzuk0f0j5fTYuI_Kp5gKQx1yzem2TnsXSs-5vgqvYQTiIV1I5KScGY3hC0",
      "key_id": "key_01JBQ3...",
      "account": {"id": 1234567, "login": "paul"}
    }
@@ -125,8 +125,7 @@ Authorization: Bearer wk2_...
 ```
 
 The key's format is `wk2_<account id>_<secret>_<tag>`; clients MUST treat
-it as opaque. Keys issued before the tag was added (`wk1_...`) are still
-accepted.
+it as opaque.
 
 ### Refreshing the GitHub token
 
