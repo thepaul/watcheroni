@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { diff, initialMemory } from "../src/diff.ts";
+import { diff } from "../src/diff.ts";
 import { HEAD1, HEAD2, alice, check, snap } from "./fixtures.ts";
 
 const kinds = (events: { kind: string }[]) => events.map((e) => e.kind);
 
 describe("diff", () => {
   it("reports nothing for what was already true", () => {
-    const s = snap({ mergeable: "CONFLICTING", checks: [check("lint", { conclusion: "failure" })] });
-    const { events } = diff(s, { ...s, fetchedAt: "2026-10-27T00:02:00Z" }, initialMemory(s));
+    const s = snap({ checks: [check("lint", { conclusion: "failure" })] });
+    const events = diff(s, { ...s, fetchedAt: "2026-10-27T00:02:00Z" });
     expect(events).toEqual([]);
   });
 
@@ -21,7 +21,7 @@ describe("diff", () => {
       threads: [{ id: "T1", resolved: false, path: "a.ts", line: 3, commentId: 20 }],
       comments: [{ id: 30, at: "2026-10-27T00:01:00Z", url: "https://x/c30", author: alice }],
     });
-    const { events } = diff(prev, next, initialMemory(prev));
+    const events = diff(prev, next);
     expect(kinds(events)).toEqual(["review.submitted", "review_comment.created", "comment.created"]);
     expect(events[0]).toMatchObject({
       id: "local:octo/widgets#7:review.submitted:10",
@@ -32,14 +32,14 @@ describe("diff", () => {
     });
     expect(events[1].data).toEqual({ comment_id: 20, review_id: 10, path: "a.ts", line: 3, in_reply_to: null });
 
-    const resolved = diff(next, { ...next, threads: [{ ...next.threads[0], resolved: true }] }, initialMemory(next));
-    expect(kinds(resolved.events)).toEqual(["thread.resolved"]);
-    expect(resolved.events[0]).toMatchObject({
+    const resolved = diff(next, { ...next, threads: [{ ...next.threads[0], resolved: true }] });
+    expect(kinds(resolved)).toEqual(["thread.resolved"]);
+    expect(resolved[0]).toMatchObject({
       data: { thread_node_id: "T1", path: "a.ts", line: 3, comment_id: 20 },
       links: { api: "https://api.github.com/repos/octo/widgets/pulls/comments/20" },
     });
-    const dismissed = diff(next, { ...next, reviews: [{ ...next.reviews[0], state: "DISMISSED" }] }, initialMemory(next));
-    expect(kinds(dismissed.events)).toEqual(["review.dismissed"]);
+    const dismissed = diff(next, { ...next, reviews: [{ ...next.reviews[0], state: "DISMISSED" }] });
+    expect(kinds(dismissed)).toEqual(["review.dismissed"]);
   });
 
   it("every review is reported, saying whether it has text", () => {
@@ -55,94 +55,87 @@ describe("diff", () => {
       ],
       reviewComments: [reply(21, 11), reply(22, 12)],
     });
-    const { events } = diff(prev, next, initialMemory(prev));
+    const events = diff(prev, next);
     expect(events.map((e) => [e.kind, e.data.review_id, e.data.has_body])).toEqual([
       ["review.submitted", 11, false], ["review.submitted", 12, true], ["review.submitted", 13, false],
       ["review_comment.created", 11, undefined], ["review_comment.created", 12, undefined],
     ]);
   });
 
-  it("checks: failures, workflow runs and the rollup", () => {
+  it("checks: each one finishing, failures and workflow runs", () => {
     const prev = snap({ checks: [check("lint"), check("test")] });
-    let memory = initialMemory(prev);
-    expect(memory.rollup).toMatchObject({ head: HEAD1, result: "success" });
 
     // A push: the new head's checks start running.
     const pushed = snap({ head: HEAD2, checks: [check("lint", { done: false, conclusion: null }), check("test", { done: false, conclusion: null })] });
-    let r = diff(prev, pushed, memory);
-    expect(kinds(r.events)).toEqual(["pr.pushed"]);
-    expect(r.events[0].data).toEqual({ before: HEAD1, after: HEAD2 });
-    memory = r.memory;
+    let events = diff(prev, pushed);
+    expect(kinds(events)).toEqual(["pr.pushed"]);
+    expect(events[0].data).toEqual({ before: HEAD1, after: HEAD2 });
 
     // One fails while the other runs.
     const oneFailed = snap({ head: HEAD2, checks: [check("lint", { conclusion: "failure" }), check("test", { done: false, conclusion: null })] });
-    r = diff(pushed, oneFailed, memory);
-    expect(kinds(r.events)).toEqual(["check.failed"]);
-    expect(r.events[0].data).toMatchObject({ head_sha: HEAD2, name: "lint", conclusion: "failure", check_run_id: 4, workflow_run_id: 500 });
-    memory = r.memory;
-
-    // All done: the workflow run and the rollup, once.
-    const allDone = snap({ head: HEAD2, checks: [check("lint", { conclusion: "failure" }), check("test")] });
-    r = diff(oneFailed, allDone, memory);
-    expect(kinds(r.events)).toEqual(["workflow.completed", "checks.completed"]);
-    expect(r.events[0].data).toMatchObject({ run_id: 500, workflow: "CI", conclusion: "failure" });
-    expect(r.events[1].data).toEqual({
-      head_sha: HEAD2, result: "failure", failed: ["lint"], counts: { success: 1, failure: 1, cancelled: 0, skipped: 0, neutral: 0 },
+    events = diff(pushed, oneFailed);
+    expect(kinds(events)).toEqual(["check.completed", "check.failed"]);
+    const data = { head_sha: HEAD2, name: "lint", conclusion: "failure", check_run_id: 4, workflow_run_id: 500 };
+    expect(events[0]).toMatchObject({
+      id: `local:octo/widgets#7:check.completed:${HEAD2}:check_run:lint:failure`,
+      data,
+      links: { html: "https://github.com/octo/widgets/actions/runs/500/job/lint", api: "https://api.github.com/repos/octo/widgets/check-runs/4" },
     });
-    memory = r.memory;
-    expect(diff(allDone, { ...allDone }, memory).events).toEqual([]);
+    expect(events[0].data).toEqual(data);
+    expect(events[1].data).toEqual(data);
 
-    // A re-run of lint (new check run ID) passes: the rollup changes.
-    const rerun = snap({ head: HEAD2, checks: [check("lint", { key: "check_run:lint-2", checkRunId: 41 }), check("test")] });
-    r = diff(allDone, rerun, memory);
-    expect(kinds(r.events)).toEqual(["checks.completed"]);
-    expect(r.events[0].data.result).toBe("success");
-    memory = r.memory;
+    // The other finishes, and with it the workflow run.
+    const allDone = snap({ head: HEAD2, checks: [check("lint", { conclusion: "failure" }), check("test")] });
+    events = diff(oneFailed, allDone);
+    expect(kinds(events)).toEqual(["check.completed", "workflow.completed"]);
+    expect(events[0].data).toMatchObject({ name: "test", conclusion: "success" });
+    expect(events[1].data).toMatchObject({ run_id: 500, workflow: "CI", conclusion: "failure" });
+    expect(diff(allDone, { ...allDone })).toEqual([]);
 
-    // A check that started late finishes: same result, more checks.
-    const late = snap({ head: HEAD2, checks: [...rerun.checks, check("cla", { key: "status:cla", type: "status", checkRunId: null, workflowRunId: null })] });
-    r = diff(rerun, late, memory);
-    expect(kinds(r.events)).toEqual(["checks.completed"]);
-    expect(r.events[0].data).toMatchObject({ result: "success", counts: { success: 3 } });
-    expect(diff(late, { ...late }, r.memory).events).toEqual([]);
+    // A re-run of lint is a new check run (in the same workflow run): it
+    // counts again when it finishes.
+    const rerun = snap({ head: HEAD2, checks: [check("lint", { key: "check_run:lint-2", checkRunId: 41, done: false, conclusion: null }), check("test")] });
+    expect(diff(allDone, rerun)).toEqual([]);
+    const rerunDone = snap({ head: HEAD2, checks: [check("lint", { key: "check_run:lint-2", checkRunId: 41 }), check("test")] });
+    events = diff(rerun, rerunDone);
+    expect(kinds(events)).toEqual(["check.completed", "workflow.completed"]);
+    expect(events[0].data).toMatchObject({ name: "lint", check_run_id: 41, conclusion: "success" });
 
-    // State saved before `data` was kept: only the result counts.
-    expect(diff(late, { ...late }, { ...r.memory, rollup: { head: HEAD2, result: "success" } }).events).toEqual([]);
+    // A run completed again with another conclusion counts; the same one doesn't.
+    const changed = snap({ head: HEAD2, checks: [check("lint", { key: "check_run:lint-2", checkRunId: 41, conclusion: "failure" }), check("test")] });
+    expect(kinds(diff(rerunDone, changed))).toEqual(["check.completed", "check.failed"]);
+    expect(diff(changed, { ...changed })).toEqual([]);
   });
 
   it("commit statuses", () => {
     const prev = snap({ checks: [check("ci/x", { type: "status", key: "status:ci/x", checkRunId: null, workflowRunId: null, done: false, conclusion: null })] });
-    const next = snap({ checks: [check("ci/x", { type: "status", key: "status:ci/x", checkRunId: null, workflowRunId: null, conclusion: "failure" })] });
-    const { events } = diff(prev, next, initialMemory(prev));
-    expect(kinds(events)).toEqual(["check.failed", "checks.completed"]);
-    expect(events[0].data).toMatchObject({ status_context: "ci/x" });
+    const next = snap({ checks: [check("ci/x", { type: "status", key: "status:ci/x", checkRunId: null, workflowRunId: null, conclusion: "failure", url: "https://ci.example/1" })] });
+    const events = diff(prev, next);
+    expect(kinds(events)).toEqual(["check.completed", "check.failed"]);
+    expect(events[0].data).toEqual({ head_sha: HEAD1, name: "ci/x", status_context: "ci/x", conclusion: "failure" });
+    expect(events[0].links).toEqual({ html: "https://ci.example/1" });
   });
 
-  it("merge conflicts come and go; UNKNOWN changes nothing", () => {
-    const clean = snap();
-    let memory = initialMemory(clean);
-    let r = diff(clean, snap({ mergeable: "UNKNOWN" }), memory);
-    expect(r.events).toEqual([]);
-    r = diff(clean, snap({ mergeable: "CONFLICTING" }), r.memory);
-    expect(kinds(r.events)).toEqual(["merge.conflict"]);
-    memory = r.memory;
-    r = diff(snap({ mergeable: "CONFLICTING" }), snap({ mergeable: "UNKNOWN" }), memory);
-    expect(r.events).toEqual([]);
-    r = diff(snap({ mergeable: "UNKNOWN" }), snap({ mergeable: "MERGEABLE" }), r.memory);
-    expect(kinds(r.events)).toEqual(["merge.clean"]);
+  it("a commit status set again to the same state is a new event", () => {
+    const status = (o: Partial<Parameters<typeof check>[1]>) =>
+      snap({ checks: [check("ci/x", { type: "status", key: "status:ci/x", checkRunId: null, workflowRunId: null, conclusion: "success", ...o })] });
+    const first = diff(status({ done: false, conclusion: null }), status({ at: "2026-10-30T01:00:00Z" }));
+    const again = diff(status({ done: false, conclusion: null }), status({ at: "2026-10-30T02:00:00Z" }));
+    expect(kinds(again)).toEqual(["check.completed"]);
+    expect(again[0].id).not.toBe(first[0].id);
   });
 
   it("ends with the PR", () => {
     const open = snap();
     const merged = snap({ state: "MERGED", mergeSha: "m".repeat(40), comments: [{ id: 1, at: "t", url: "u", author: alice }] });
-    expect(kinds(diff(open, merged, initialMemory(open)).events)).toEqual(["comment.created", "pr.merged", "watch.ended"]);
-    expect(kinds(diff(open, snap({ state: "CLOSED" }), initialMemory(open)).events)).toEqual(["pr.closed", "watch.ended"]);
+    expect(kinds(diff(open, merged))).toEqual(["comment.created", "pr.merged", "watch.ended"]);
+    expect(kinds(diff(open, snap({ state: "CLOSED" })))).toEqual(["pr.closed", "watch.ended"]);
   });
 
   it("PR state changes", () => {
     const prev = snap({ draft: true });
     const next = snap({ draft: false, base: "release", requested: ["bob", "team:core"] });
-    expect(kinds(diff(prev, next, initialMemory(prev)).events)).toEqual([
+    expect(kinds(diff(prev, next))).toEqual([
       "pr.base_changed", "pr.ready_for_review", "pr.review_requested", "pr.review_requested",
     ]);
   });

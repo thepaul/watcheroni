@@ -47,7 +47,6 @@ export function appManifest(o: ManifestOptions) {
       "pull_request_review_thread",
       "issue_comment",
       "issues",
-      "check_suite",
       "check_run",
       "status",
       "workflow_run",

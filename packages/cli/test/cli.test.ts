@@ -79,10 +79,10 @@ describe("wait against a server", () => {
     await until(() => fake.sockets.size === 1);
     fake.inject("box", "check.failed");
     await new Promise((r) => setTimeout(r, 300));
-    fake.inject("box", "checks.completed");
+    fake.inject("box", "check.completed");
     expect(await run.code).toBe(0);
     const out = JSON.parse(run.stdout()) as { events: { kind: string }[]; watching: string[] };
-    expect(out.events.map((e) => e.kind)).toEqual(["check.failed", "checks.completed"]);
+    expect(out.events.map((e) => e.kind)).toEqual(["check.failed", "check.completed"]);
     expect(out.watching).toEqual([]);
     expect(fake.inbox("box").acked).toBe(2);
   });
@@ -96,28 +96,37 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(2);
   });
 
-  it("shows a reply once, but its review to a review.* filter", async () => {
-    const reply = () => {
-      fake.inject("box", "review.submitted", { review_id: 5, state: "commented", has_body: false });
-      fake.inject("box", "review_comment.created", { comment_id: 6, review_id: 5, path: "a.ts", line: 3, in_reply_to: 4 });
-    };
-    reply();
-    let run = cli(["wait", "--settle", "0"]);
+  it("shows a reply and the review GitHub makes for it", async () => {
+    fake.inject("box", "review.submitted", { review_id: 5, state: "commented", has_body: false });
+    fake.inject("box", "review_comment.created", { comment_id: 6, review_id: 5, path: "a.ts", line: 3, in_reply_to: 4 });
+    const run = cli(["wait", "--settle", "0"]);
     expect(await run.code).toBe(0);
-    expect(run.stdout().split("\n").slice(0, 3)).toEqual([
+    expect(run.stdout().split("\n").slice(0, 5)).toEqual([
       "octo/widgets#7: 2 new events",
+      "- review.submitted: commented",
+      "  gh api repos/octo/widgets/pulls/7/reviews/5 --jq '.state, .body'",
       "- review_comment.created on a.ts:3 (a reply)",
       "  gh api repos/octo/widgets/pulls/comments/6 --jq .body",
     ]);
-    // Filtering on review.* leaves the reply out, so its review shows.
-    reply();
-    run = cli(["wait", "--settle", "0", "--kinds", "review.*"]);
+  });
+
+  it("with --settle 0, prints what one read brought as soon as it arrives", async () => {
+    // A lone comment: printed at once, not after the default 5 s.
+    let run = cli(["wait", "--settle", "0", "--format", "json"]);
+    await until(() => fake.sockets.size === 1);
+    const sent = Date.now();
+    fake.inject("box", "comment.created");
     expect(await run.code).toBe(0);
-    expect(run.stdout().split("\n").slice(0, 3)).toEqual([
-      "octo/widgets#7: 1 new event",
-      "- review.submitted: commented",
-      "  gh api repos/octo/widgets/pulls/7/reviews/5 --jq '.state, .body'",
-    ]);
+    expect(Date.now() - sent).toBeLessThan(3000);
+    expect((JSON.parse(run.stdout()) as { events: { kind: string }[] }).events.map((e) => e.kind)).toEqual(["comment.created"]);
+    // Events that come in one read are printed together.
+    await until(() => fake.sockets.size === 0);
+    run = cli(["wait", "--settle", "0", "--format", "json"]);
+    await until(() => fake.sockets.size === 1);
+    fake.injectTogether("box", ["review.submitted", { review_id: 5 }], ["review_comment.created", { comment_id: 6, review_id: 5 }]);
+    expect(await run.code).toBe(0);
+    expect((JSON.parse(run.stdout()) as { events: { kind: string }[] }).events.map((e) => e.kind)).toEqual(["review.submitted", "review_comment.created"]);
+    expect(fake.inbox("box").acked).toBe(3);
   });
 
   it("subscribes its targets on the server, and stops watching when the server ends the watch", async () => {
@@ -315,6 +324,21 @@ describe("exec against a server", () => {
     run.kill();
     await run.code;
     expect(readFileSync(log, "utf8")).toBe("comment.created\ncheck.failed\n");
+  });
+
+  it("with --batch --settle 0, runs once per read", async () => {
+    const log = join(cwd, "ran");
+    const run = cli(["exec", "--batch", "--settle", "0", "--", "sh", "-c", `echo "$WATCHERONI_COUNT" >> ${log}`]);
+    await until(() => fake.sockets.size === 1);
+    const sent = Date.now();
+    fake.injectTogether("box", ["review.submitted"], ["review_comment.created"]);
+    await until(() => fake.inbox("box").acked === 2);
+    expect(Date.now() - sent).toBeLessThan(3000);
+    fake.inject("box", "comment.created");
+    await until(() => fake.inbox("box").acked === 3);
+    run.kill();
+    await run.code;
+    expect(readFileSync(log, "utf8")).toBe("2\n1\n");
   });
 });
 

@@ -15,7 +15,9 @@ const RECIPES_URL = `${REPO_URL}/blob/main/docs/recipes.md`;
 // What `watcheroni wait` prints (packages/cli/src/format.ts), as in the
 // CLI's README.
 const WAIT_EXAMPLE = `$ npx watcheroni wait
-octo/widgets#123: 2 new events
+octo/widgets#123: 3 new events
+- check.completed: "test (ubuntu-latest)" (failure) on 4f9c2e1
+  gh run view 18342210911 -R octo/widgets
 - check.failed: "test (ubuntu-latest)" (failure) on 4f9c2e1
   gh run view 18342210911 -R octo/widgets --log-failed
 - review.submitted by mona: changes_requested
@@ -30,7 +32,7 @@ export function landingPage(installUrl: string | undefined): Response {
     `<header>
 ${LOGO}
 <h1>watcheroni</h1>
-<p class="lead">Wait for what happens to your GitHub pull requests: CI finishing or failing, reviews, comments, pushes, merges. Built for scripts and coding agents that open a PR and then need to know when there's something to do about it, without polling GitHub in a loop.</p>
+<p class="lead">Wait for what happens to your GitHub pull requests: checks finishing or failing, reviews, comments, pushes, merges. Built for scripts and coding agents that open a PR and then need to know when there's something to do about it, without polling GitHub in a loop.</p>
 </header>
 <pre><code>${escape(WAIT_EXAMPLE)}</code></pre>
 <p>Events with more to read come with the command that fetches it. <code>wait</code> exits once there's news, so run it again to keep watching.</p>

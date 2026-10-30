@@ -1,3 +1,4 @@
+import type { InternalKind, WebhookKind } from "../kinds";
 import type { DataValue, UnsequencedEvent } from "../protocol";
 
 // Turns one GitHub webhook into protocol events: IDs, SHAs, states and the
@@ -5,16 +6,11 @@ import type { DataValue, UnsequencedEvent } from "../protocol";
 // step. `sub` is filled in later, when an event is matched to a
 // subscription.
 //
-// Besides protocol kinds this emits internal kinds that RepoHub uses and
-// never delivers, after the delivered events of each payload so their IDs
-// don't move: `check.completed` for every finished check run or status,
-// failed or not, `check.started` for check runs created and pending
-// statuses, `check_suite.updated` for check suites (all three feed the
-// `checks.completed` rollup), `base.advanced` when a PR is merged into a
-// branch, which may have given other PRs on that base a conflict, and
-// `pr.seen`, last, from any payload that describes the PR (its head, base,
-// author and state), for repository-wide subscriptions' `base` and
-// `author` filters.
+// The kinds it can emit are listed in ../kinds.ts. Besides protocol kinds
+// this emits one internal kind that RepoHub uses and never delivers, last
+// so the other events' IDs don't move: `pr.seen`, from any payload that
+// describes the PR (its head, base, author and state), for
+// repository-wide subscriptions' `base` and `author` filters.
 
 // Only the fields read below. Everything is optional because GitHub's
 // payloads vary by event, action and age.
@@ -72,19 +68,8 @@ interface Payload {
     url?: string;
     completed_at?: string | null;
     pull_requests?: { number: number }[];
-    check_suite?: { id: number };
-    app?: { id: number };
   };
-  check_suite?: {
-    id: number;
-    head_sha: string;
-    status: string | null;
-    conclusion: string | null;
-    updated_at?: string;
-    app?: { id: number };
-  };
-  // `status` events. `id` increases with each status on a commit.
-  id?: number;
+  // `status` events.
   sha?: string;
   state?: string;
   context?: string;
@@ -117,7 +102,7 @@ export function normalise(
     : null;
   const out: UnsequencedEvent[] = [];
   const emit = (
-    kind: string,
+    kind: WebhookKind | InternalKind,
     pr: number | null,
     data: { [key: string]: DataValue },
     at: string | null | undefined,
@@ -150,8 +135,8 @@ export function normalise(
           emit("pr.opened", pr.number, { head_sha: pr.head?.sha ?? null, base: pr.base?.ref ?? null, draft: !!pr.draft }, at, links);
           break;
         case "synchronize":
-          // The payload doesn't say whether it was a force-push; RepoHub
-          // works that out from the old and new heads when it can.
+          // The payload doesn't say whether it was a force-push, and
+          // nothing works it out.
           emit("pr.pushed", pr.number, { before: payload.before ?? null, after: payload.after ?? null }, at, links);
           break;
         case "ready_for_review":
@@ -166,10 +151,8 @@ export function normalise(
           break;
         }
         case "closed":
-          if (pr.merged) {
-            emit("pr.merged", pr.number, { merge_sha: pr.merge_commit_sha ?? null }, at, links);
-            if (pr.base?.ref) emit("base.advanced", null, { base: pr.base.ref }, at);
-          } else emit("pr.closed", pr.number, {}, at, links);
+          if (pr.merged) emit("pr.merged", pr.number, { merge_sha: pr.merge_commit_sha ?? null }, at, links);
+          else emit("pr.closed", pr.number, {}, at, links);
           break;
         case "edited": {
           const from = payload.changes?.base?.ref?.from;
@@ -245,58 +228,31 @@ export function normalise(
     case "check_run": {
       const run = payload.check_run;
       if (!run) break;
-      const links = { html: run.html_url, api: run.url };
-      const suite = { suite_id: run.check_suite?.id ?? null, app_id: run.app?.id ?? null };
       // Apps can create a run that has already finished; that counts as
-      // its completion.
-      if (action === "created" && run.status !== "completed") {
-        emit("check.started", null, {
-          head_sha: run.head_sha, name: run.name, check_run_id: run.id, status: run.status, ...suite,
-        }, null, links);
-        break;
-      }
-      if (action !== "completed" && action !== "created") break;
+      // its completion. (GitHub may then send `completed` as well; RepoHub
+      // passes the same completion on once.)
+      const finished = action === "completed" || (action === "created" && run.status === "completed");
+      if (!finished) break;
+      const links = { html: run.html_url, api: run.url };
       // A check run can belong to several PRs (or none, if it ran on a
       // branch without one; RepoHub then matches on head_sha).
       const prs = run.pull_requests?.length ? run.pull_requests.map((p) => p.number) : [null];
       for (const pr of prs) {
-        const base = { head_sha: run.head_sha, name: run.name, check_run_id: run.id, conclusion: run.conclusion };
-        emit("check.completed", pr, { ...base, ...suite }, run.completed_at, links);
-        if (run.conclusion && FAILED.has(run.conclusion)) emit("check.failed", pr, base, run.completed_at, links);
+        const data = { head_sha: run.head_sha, name: run.name, check_run_id: run.id, conclusion: run.conclusion };
+        emit("check.completed", pr, data, run.completed_at, links);
+        if (run.conclusion && FAILED.has(run.conclusion)) emit("check.failed", pr, data, run.completed_at, links);
       }
-      break;
-    }
-
-    case "check_suite": {
-      // GitHub sends `requested` and `rerequested` only to the suite's own
-      // App, so mostly these are `completed`.
-      const suite = payload.check_suite;
-      if (!suite || !action || !["requested", "rerequested", "completed"].includes(action)) break;
-      emit("check_suite.updated", null, {
-        head_sha: suite.head_sha,
-        suite_id: suite.id,
-        app_id: suite.app?.id ?? null,
-        status: action === "completed" ? "completed" : "queued",
-        conclusion: action === "completed" ? suite.conclusion : null,
-      }, suite.updated_at);
       break;
     }
 
     case "status": {
       // Commit statuses carry no PR; RepoHub matches on head_sha.
-      if (!payload.sha || !payload.context || !payload.state) break;
-      if (payload.state === "pending") {
-        emit("check.started", null, {
-          head_sha: payload.sha, name: payload.context, status_context: payload.context, status: "pending",
-          status_id: payload.id ?? null,
-        }, payload.updated_at, payload.target_url ? { html: payload.target_url } : {});
-        break;
-      }
+      if (!payload.sha || !payload.context || !payload.state || payload.state === "pending") break;
       const conclusion = payload.state === "success" ? "success" : "failure";
-      const base = { head_sha: payload.sha, name: payload.context, status_context: payload.context, conclusion };
+      const data = { head_sha: payload.sha, name: payload.context, status_context: payload.context, conclusion };
       const links = payload.target_url ? { html: payload.target_url } : {};
-      emit("check.completed", null, { ...base, status_id: payload.id ?? null }, payload.updated_at, links);
-      if (conclusion === "failure") emit("check.failed", null, base, payload.updated_at, links);
+      emit("check.completed", null, data, payload.updated_at, links);
+      if (conclusion === "failure") emit("check.failed", null, data, payload.updated_at, links);
       break;
     }
 

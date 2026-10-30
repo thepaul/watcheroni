@@ -2,33 +2,44 @@ import type { DataValue, UnsequencedEvent } from "@watcheroni/protocol";
 import type { Actor, Check, Snapshot } from "./snapshot.ts";
 
 // Turns the change between two snapshots of a PR into the same event kinds
-// the server sends (PROTOCOL.md, "Kinds"), with IDs prefixed `local:`.
-//
-// What it remembers beyond the last snapshot, for the derived kinds.
-export interface Memory {
-  // The last checks.completed reported, so a rollup whose data changes
-  // (a re-run with another result, or checks that started late) is
-  // reported again but an unchanged one isn't. `data` is its JSON; state
-  // saved by older versions lacks it, and then only the result counts.
-  rollup: { head: string; result: string; data?: string } | null;
-  conflict: boolean;
-}
-
-export function initialMemory(s: Snapshot): Memory {
-  // The first snapshot is the starting point: what is already true when
-  // watching starts isn't reported, as with a server subscription.
-  const rollup = rollupOf(s);
-  return { rollup: rollup ? { head: s.head, result: rollup.result, data: JSON.stringify(rollup) } : null, conflict: s.mergeable === "CONFLICTING" };
-}
+// the server sends (PROTOCOL.md, "Kinds"), with IDs prefixed `local:`. The
+// first snapshot is the starting point: what is already true when watching
+// starts isn't reported, as with a server subscription.
 
 const FAILED = new Set(["failure", "timed_out", "action_required", "startup_failure"]);
 
-export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: UnsequencedEvent[]; memory: Memory } {
+// Every kind local mode can produce: these, and poll.ts's `watch.ended`
+// for a PR that had already ended when first polled. A test checks
+// docs/events.md against this list and the server's.
+export const LOCAL_KINDS = [
+  "pr.pushed",
+  "pr.base_changed",
+  "pr.ready_for_review",
+  "pr.converted_to_draft",
+  "pr.reopened",
+  "pr.review_requested",
+  "pr.merged",
+  "pr.closed",
+  "review.submitted",
+  "review.dismissed",
+  "review_comment.created",
+  "thread.resolved",
+  "thread.unresolved",
+  "comment.created",
+  "check.completed",
+  "check.failed",
+  "workflow.completed",
+  "watch.ended",
+] as const;
+
+export type LocalKind = (typeof LOCAL_KINDS)[number];
+
+export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
   const events: UnsequencedEvent[] = [];
   const full = next.repo.full_name;
   const api = `https://api.github.com/repos/${full}`;
   const emit = (
-    kind: string,
+    kind: LocalKind,
     discriminator: string,
     data: { [key: string]: DataValue },
     opts: { actor?: Actor | null; at?: string | null; html?: string | null; api?: string } = {},
@@ -96,18 +107,24 @@ export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: 
   }
 
   // Checks on the head commit. After a push, prev's checks belong to the
-  // old head, so every check on the new head counts as new.
+  // old head, so every check on the new head counts as new. A check has
+  // finished when it's done and wasn't, or is done with another conclusion
+  // (an App completing a run again). A re-run is a new check run, so its
+  // finishing counts too.
   const prevChecks = new Map(next.head === prev.head ? prev.checks.map((c) => [c.key, c]) : []);
   for (const c of next.checks) {
     const before = prevChecks.get(c.key);
-    if (!isFailed(c) || (before && isFailed(before) && before.conclusion === c.conclusion)) continue;
+    if (!c.done || (before?.done && before.conclusion === c.conclusion)) continue;
     const data: { [key: string]: DataValue } = { head_sha: next.head, name: c.name, conclusion: c.conclusion };
     if (c.checkRunId !== null) data.check_run_id = c.checkRunId;
     else data.status_context = c.name;
     if (c.workflowRunId !== null) data.workflow_run_id = c.workflowRunId;
-    emit("check.failed", `${next.head}:${c.key}:${c.conclusion}`, data, {
-      at: c.at, html: c.url, api: c.checkRunId !== null ? `${api}/check-runs/${c.checkRunId}` : undefined,
-    });
+    const opts = { at: c.at, html: c.url, api: c.checkRunId !== null ? `${api}/check-runs/${c.checkRunId}` : undefined };
+    // A commit status set again, even to the same state, is a new status
+    // (as on the server), so its time tells the two apart.
+    const discriminator = `${next.head}:${c.key}:${c.conclusion}${c.checkRunId === null ? `:${c.at}` : ""}`;
+    emit("check.completed", discriminator, data, opts);
+    if (isFailed(c)) emit("check.failed", discriminator, data, opts);
   }
   for (const [runId, run] of workflowRuns(next.checks)) {
     const before = workflowRuns([...prevChecks.values()]).get(runId);
@@ -115,23 +132,6 @@ export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: 
     emit("workflow.completed", String(runId), {
       head_sha: next.head, run_id: runId, workflow: run.workflow, conclusion: run.conclusion,
     }, { html: `https://github.com/${full}/actions/runs/${runId}`, api: `${api}/actions/runs/${runId}` });
-  }
-  let { rollup } = memory;
-  const now = rollupOf(next);
-  const data = now && JSON.stringify(now);
-  if (now && (rollup?.head !== next.head || rollup.result !== now.result || (rollup.data !== undefined && rollup.data !== data))) {
-    emit("checks.completed", `${next.head}:${now.result}:${next.fetchedAt}`, { head_sha: next.head, ...now }, prLinks);
-    rollup = { head: next.head, result: now.result, data: data! };
-  }
-
-  // Mergeability. UNKNOWN means GitHub is still working it out.
-  let { conflict } = memory;
-  if (next.state === "OPEN" && next.mergeable === "CONFLICTING" && !conflict) {
-    emit("merge.conflict", `${next.head}:${next.baseSha}`, { head_sha: next.head, base_sha: next.baseSha }, prLinks);
-    conflict = true;
-  } else if (next.mergeable === "MERGEABLE" && conflict) {
-    emit("merge.clean", `${next.head}:${next.baseSha}`, { head_sha: next.head, base_sha: next.baseSha }, prLinks);
-    conflict = false;
   }
 
   // Last, so an agent reads what happened before being told it's over.
@@ -143,29 +143,11 @@ export function diff(prev: Snapshot, next: Snapshot, memory: Memory): { events: 
     emit("watch.ended", `closed:${next.fetchedAt}`, { reason: "closed" }, prLinks);
   }
 
-  return { events, memory: { rollup, conflict } };
+  return events;
 }
 
 function isFailed(c: Check): boolean {
   return c.done && c.conclusion !== null && FAILED.has(c.conclusion);
-}
-
-// checks.completed's data, or null while any check is still running.
-function rollupOf(s: Snapshot): { result: string; failed: string[]; counts: { [key: string]: number } } | null {
-  if (!s.checks.length || s.checks.some((c) => !c.done)) return null;
-  const counts = { success: 0, failure: 0, cancelled: 0, skipped: 0, neutral: 0 };
-  const failed: string[] = [];
-  for (const c of s.checks) {
-    if (isFailed(c)) {
-      counts.failure++;
-      failed.push(c.name);
-    } else if (c.conclusion === "cancelled") counts.cancelled++;
-    else if (c.conclusion === "skipped" || c.conclusion === "stale") counts.skipped++;
-    else if (c.conclusion === "neutral") counts.neutral++;
-    else counts.success++;
-  }
-  const result = counts.failure ? "failure" : counts.cancelled ? "cancelled" : "success";
-  return { result, failed: failed.slice(0, 20), counts };
 }
 
 function workflowRuns(checks: Check[]): Map<number, { workflow: string | null; done: boolean; conclusion: string }> {

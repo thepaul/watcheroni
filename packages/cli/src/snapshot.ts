@@ -30,10 +30,8 @@ export interface Snapshot {
   url: string;
   state: "OPEN" | "CLOSED" | "MERGED";
   draft: boolean;
-  mergeable: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
   head: string;
   base: string;
-  baseSha: string;
   mergeSha: string | null;
   requested: string[];
   // Pending (unsubmitted) reviews and their comments are left out: only
@@ -65,8 +63,8 @@ query($owner: String!, $name: String!, $number: Int!) {
     databaseId
     nameWithOwner
     pullRequest(number: $number) {
-      number url state isDraft mergeable
-      headRefOid baseRefName baseRefOid
+      number url state isDraft
+      headRefOid baseRefName
       mergeCommit { oid }
       reviewRequests(first: 50) { nodes { requestedReviewer { __typename ... on User { login } ... on Bot { login } ... on Team { slug } } } }
       reviews(last: 100) { nodes { databaseId state body submittedAt url author { ...actor } } }
@@ -105,10 +103,8 @@ interface RawPr {
   url: string;
   state: Snapshot["state"];
   isDraft: boolean;
-  mergeable: Snapshot["mergeable"];
   headRefOid: string;
   baseRefName: string;
-  baseRefOid: string;
   mergeCommit: { oid: string } | null;
   reviewRequests: { nodes: { requestedReviewer: { __typename: string; login?: string; slug?: string } | null }[] };
   reviews: { nodes: { databaseId: number; state: string; body: string; submittedAt: string | null; url: string; author: RawActor | null }[] };
@@ -154,10 +150,8 @@ export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedA
     url: pr.url,
     state: pr.state,
     draft: pr.isDraft,
-    mergeable: pr.mergeable,
     head: pr.headRefOid,
     base: pr.baseRefName,
-    baseSha: pr.baseRefOid,
     mergeSha: pr.mergeCommit?.oid ?? null,
     requested: pr.reviewRequests.nodes.flatMap(({ requestedReviewer: r }) =>
       !r ? [] : r.__typename === "Team" ? [`team:${r.slug}`] : r.login ? [r.login] : []),

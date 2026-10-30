@@ -91,7 +91,8 @@ export async function createSubscription(
     verifiedUntil = Date.now() + PRIVATE_VERIFY_SECONDS * 1000;
   }
 
-  // The PR's current state, as a baseline for derived events.
+  // The PR's current state: it must be open, and its head lets RepoHub
+  // match statuses (which name only a commit) to it from the start.
   let baseline: PrBaseline | undefined;
   if (parsed.pr !== undefined) {
     const prRes = await githubGet(minted.token, `/repos/${repo.full_name}/pulls/${parsed.pr}`);
@@ -117,7 +118,7 @@ export async function createSubscription(
       ttl_seconds: parsed.ttl_seconds,
       verified_until: verifiedUntil,
     },
-    { ...repo, installation_id: found.id },
+    repo,
     baseline,
   );
   if (!result.ok) {
@@ -143,7 +144,7 @@ export async function createSubscription(
   await installation.addRepo(repo.id);
   if (result.needs_open_prs) await rememberOpenPrs(env, installation, found.id, repo.full_name, repo.id);
   if (baseline) {
-    info.baseline = { state: baseline.state, head_sha: baseline.head_sha, mergeable: baseline.mergeable ?? "unknown" };
+    info.baseline = { state: baseline.state, head_sha: baseline.head_sha };
   }
   return json(info, result.created ? 201 : 200);
 }
@@ -321,7 +322,6 @@ interface PullBody {
   merged?: boolean;
   merged_at?: string | null;
   draft?: boolean;
-  mergeable?: boolean | null;
   head?: { sha?: string };
   base?: { ref?: string };
   user?: { login?: string };
@@ -333,6 +333,5 @@ function toBaseline(pr: PullBody): PrBaseline {
     head_sha: pr.head?.sha ?? null,
     base_ref: pr.base?.ref ?? null,
     draft: !!pr.draft,
-    mergeable: pr.mergeable === true ? "mergeable" : pr.mergeable === false ? "conflicting" : "unknown",
   };
 }

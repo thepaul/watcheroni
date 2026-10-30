@@ -11,10 +11,12 @@ the PRs it watches. The command gets:
   in its environment.
 
 With `--batch` it runs once per settled batch instead, with a JSON array
-of events on stdin and their number in `WATCHERONI_COUNT`. `--on` (or
-`--kinds`) picks the kinds, e.g. `--on check.*,review.submitted`;
-`watch.*` kinds, such as `watch.ended` when a PR is merged or closed,
-always come through.
+of events on stdin and their number in `WATCHERONI_COUNT`. A batch is
+everything that arrived within `--settle` (5 s by default) of its first
+event; `--settle 0` turns that off, so a batch is whatever one read of
+the inbox brought. `--on` (or `--kinds`) picks the kinds, e.g.
+`--on check.*,review.submitted`; `watch.*` kinds, such as `watch.ended`
+when a PR is merged or closed, always come through.
 
 **When the command fails.** An event is acknowledged only when the command
 exits 0. Otherwise watcheroni logs
@@ -95,28 +97,24 @@ together with anything that arrived since.
 
 ## Only CI failures
 
-`check.failed` arrives as soon as one check fails; `checks.completed`
-once every check on the head commit has finished, with the overall
-`result` (`success`, `failure` or `cancelled`) and the names of the
-`failed` ones. Save this as `watcheroni-ci-failed` (`chmod +x`; it needs
-`jq`) to hear about a failure straight away and about the run's result
-unless it passed:
+`check.failed` arrives as soon as a check fails (and `check.completed`
+as each check finishes, whatever its result). Save this as
+`watcheroni-ci-failed` (`chmod +x`; it needs `jq`) to hear about each
+failure straight away:
 
 ```sh
 #!/bin/sh
 # A notification for CI failures only.
-msg=$(jq -r 'if .kind == "check.failed" then "\(.data.name) failed"
-  elif .kind == "checks.completed" and .data.result != "success"
-  then "Checks finished: \(.data.result) (\(.data.failed | join(", ")))"
+msg=$(jq -r 'if .kind == "check.failed" then "\(.data.name) failed (\(.data.conclusion))"
   else empty end') || exit 1
-[ -n "$msg" ] || exit 0   # checks passed, or watch.ended: nothing to say
+[ -n "$msg" ] || exit 0   # watch.ended: nothing to say
 osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' \
   "$WATCHERONI_REPO#$WATCHERONI_PR" "$msg"
 # On Linux, instead: notify-send "$WATCHERONI_REPO#$WATCHERONI_PR" "$msg"
 ```
 
 ```
-npx watcheroni exec --on check.failed,checks.completed -- watcheroni-ci-failed
+npx watcheroni exec --on check.failed -- watcheroni-ci-failed
 ```
 
 The `jq` test exits 0 for everything else, so those events are

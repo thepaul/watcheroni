@@ -218,8 +218,8 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
 {
   "repo": "octo/widgets",
   "pr": 123,
-  "kinds": ["pr.*", "review.*", "comment.created", "check.failed",
-            "checks.completed", "merge.*"],
+  "kinds": ["pr.*", "review.*", "comment.created", "check.*",
+            "workflow.completed"],
   "ignore": {"self": true, "bots": false, "actors": ["dependabot[bot]"]},
   "ttl_seconds": 604800
 }
@@ -243,9 +243,6 @@ X-GitHub-Token: ghu_...            (needed for private repositories only)
   set. Unfiltered repository-wide subscribers on that repo see these
   copies too; otherwise only PRs that have their own subscription get
   one, and a status on no watched PR's head arrives once with `pr` `null`.
-- The derived kinds (`checks.completed`, `merge.conflict`, `merge.clean`)
-  are worked out only for PRs that have a PR subscription of their own, so
-  a repository-wide subscription gets them only for those PRs.
 - `kinds`: event kinds or globs (`review.*`). Leaving it out means every
   kind for PR subscriptions.
 - `ignore.self`: drop events caused by the account's own GitHub user.
@@ -266,8 +263,9 @@ The server checks, in order:
    token is used for this check and then forgotten.
 3. Quotas (see "Limits").
 
-A PR subscription also fetches the PR's current state, so the server has a
-baseline for derived events (checks, merge conflicts).
+A PR subscription also fetches the PR's current state: it must be open,
+and its head commit lets checks and statuses on that commit match the PR
+from the start.
 
 Creating is idempotent: the same inbox, repo, PR and filter (`kinds`,
 `ignore`, `base`, `author`) returns the existing subscription with `200`
@@ -280,14 +278,14 @@ given (`author` lowercased).
   "inbox": "cc-5f2e9a",
   "repo": {"id": 1296269, "full_name": "octo/widgets", "private": true},
   "pr": 123,
-  "kinds": ["pr.*", "review.*", "comment.created", "check.failed",
-            "checks.completed", "merge.*"],
+  "kinds": ["pr.*", "review.*", "comment.created", "check.*",
+            "workflow.completed"],
   "ignore": {"self": true, "bots": false, "actors": ["dependabot[bot]"]},
   "created_at": "2026-10-26T17:41:00Z",
   "expires_at": "2026-11-02T17:41:00Z",
   "verified_until": "2026-11-02T17:41:00Z",
   "state": "active",
-  "baseline": {"state": "open", "head_sha": "4f2e1a9...", "mergeable": "mergeable"}
+  "baseline": {"state": "open", "head_sha": "4f2e1a9..."}
 }
 ```
 
@@ -323,8 +321,7 @@ A subscription ends, after delivering a final event, when:
 | The PR is closed | `pr.closed`, then `watch.ended` |
 | Nobody read the inbox for `ttl_seconds` | `watch.expired` |
 | Private access not re-verified | `watch.unverified` |
-| The App was uninstalled, or the repo removed from it | `watch.revoked` |
-| The repository was deleted or transferred away | `watch.revoked` |
+| The App was uninstalled or suspended, or the repo removed from it | `watch.revoked` |
 
 `watch.ended` tells an agent it can stop waiting. A client that wants to
 keep watching a reopened PR subscribes again.
@@ -439,7 +436,8 @@ event it gets is:
 ```
 
 The client should re-read the state of what it watches from GitHub
-directly.
+directly. (The watcheroni server doesn't send `inbox.gap` yet; it drops
+an inbox's oldest events without one.)
 
 ## Events
 
@@ -467,13 +465,15 @@ directly.
 
 - `v`: envelope version, always `1` in this protocol version.
 - `id`: stable across retries and redeliveries. For events from a webhook
-  it's the GitHub delivery ID plus an index; for derived events it's
-  derived from what was detected. Use it to drop duplicates.
+  it's the GitHub delivery ID plus an index; for events about the watch
+  or the repo (`watch.*`, `repo.*`) it's made from what happened. Use it
+  to drop duplicates.
 - `sub`: which subscription matched. If two subscriptions in one inbox
   match the same event, it's delivered once, naming the first.
 - `at`: when it happened on GitHub, if GitHub says; else `received_at`.
 - `pr`: the PR number, or `null` for events not about a PR.
-- `actor`: who caused it, or `null` for derived events.
+- `actor`: who caused it, or `null` when that isn't known (as for
+  `watch.*` and `repo.*`).
 - `data`: depends on `kind` (below). Fields are metadata only.
 - `links.api`: the GitHub REST URL to fetch the content, where there is
   one.
@@ -484,12 +484,16 @@ changing the protocol version.
 
 ### Kinds
 
+[docs/events.md](docs/events.md) says, for every kind, what it means,
+which GitHub webhook produces it, what change produces it in a client
+that polls GitHub itself, and what isn't tracked at all.
+
 **Pull requests** (from `pull_request`):
 
 | Kind | `data` |
 |---|---|
 | `pr.opened` | `head_sha`, `base`, `draft` |
-| `pr.pushed` | `before`, `after` (head SHAs), `forced` |
+| `pr.pushed` | `before`, `after` (head SHAs) |
 | `pr.ready_for_review` | |
 | `pr.converted_to_draft` | |
 | `pr.review_requested` | `reviewer` (login or `team:slug`) |
@@ -509,48 +513,40 @@ changing the protocol version.
 | `review_comment.created` | `comment_id`, `review_id`, `path`, `line`, `in_reply_to` |
 | `thread.resolved` | `thread_node_id`, `path`, `line`, `comment_id` (the thread's first comment) |
 | `thread.unresolved` | `thread_node_id`, `path`, `line`, `comment_id` |
-| `comment.created` | `comment_id` |
+| `comment.created` | `comment_id`; on an issue, also `issue` (number) |
 
 A review with several comments produces one `review.submitted` and one
-`review_comment.created` per comment. Clients that wake an agent SHOULD
-debounce, since these arrive together.
+`review_comment.created` per comment. Since these arrive together,
+clients that wake an agent MAY wait a moment for the rest before waking
+it (the CLI's `--settle`).
 
 GitHub makes every reply in a review thread a `commented` review with
 no text (`has_body: false`) holding the reply, so a reply arrives as a
 `review.submitted` and a `review_comment.created`. Both are sent, so a
-`review.*` filter still sees every review; clients that show events to
-people or agents MAY show only the replies when both are at hand.
+`review.*` filter still sees every review.
 
 A review comment's or thread's `line` is its original line once the code
 under it has changed (`null` for a comment on the whole file). Fetch a
 thread's first comment to see what the thread is about.
 
-**Checks** (from `check_run`, `check_suite`, `status`, `workflow_run`):
+**Checks** (from `check_run`, `status`, `workflow_run`):
 
 | Kind | `data` |
 |---|---|
-| `check.failed` | `head_sha`, `name`, `check_run_id` or `status_context`, `conclusion` (`failure`, `timed_out`, `action_required`, `startup_failure`) |
-| `checks.completed` | `head_sha`, `result` (`success`, `failure`, `cancelled`), `failed` (names, at most 20), `counts` (`{success, failure, cancelled, skipped, neutral}`) |
+| `check.completed` | `head_sha`, `name`, `check_run_id` or `status_context`, `workflow_run_id` (when known), `conclusion` (`success`, `failure`, `cancelled`, `skipped`, `neutral`, `timed_out`, ...) |
+| `check.failed` | the same as `check.completed`, with `conclusion` one of `failure`, `timed_out`, `action_required`, `startup_failure` |
 | `workflow.completed` | `head_sha`, `run_id`, `workflow`, `conclusion` |
 
-`check.failed` arrives as soon as one check fails. `checks.completed` is
-**derived**: it's sent when every check on the PR's current head has
-finished, and again whenever that changes: a re-run changes the result,
-or checks that started late finish (each `checks.completed` covers every
-check seen on the head so far, so the later one supersedes the earlier).
-The server and the CLI's local mode follow the same rule; the server
-also waits until the checks have stayed finished, unchanged, for about
-20 seconds. It is best-effort, because GitHub has no event meaning "all
-checks are done".
-
-**Mergeability** (derived; no GitHub webhook exists for this):
-
-| Kind | `data` |
-|---|---|
-| `merge.conflict` | `head_sha`, `base_sha` |
-| `merge.clean` | `head_sha`, `base_sha` (sent only after a conflict) |
-
-Usually within a minute of the change, at most about 15 minutes.
+A `check.completed` is sent for each check run or commit status as it
+finishes, and a failing one is followed by a `check.failed` with the same
+`data`. A re-run is a new check run, so it is sent again when it
+finishes, as is a run its App completes again with another conclusion.
+Nothing says that all of a commit's checks are done (GitHub has no such
+event), and nothing reports whether the PR can be merged: ask GitHub
+(`gh pr checks`, `gh pr view --json mergeable`) when an event makes it
+worth knowing. `workflow_run_id` is known only to clients that poll
+GitHub themselves (see "Clients without the server"); webhooks don't
+carry it.
 
 **Issues** (repository-wide subscriptions, and comments on issues):
 
@@ -634,7 +630,11 @@ both cases.
 - Within v1, the server may add endpoints, optional request fields,
   response fields, event kinds, `data` fields, error codes and features.
 - Clients check `/v1/meta` `features` before using optional parts.
-- Machine-readable definitions live in `packages/protocol/schema/`
-  (JSON Schema for every request, response, message and event kind), with
-  example payloads in `packages/protocol/fixtures/` that both the server
-  and the CLI test against.
+- Kinds have also been removed: `checks.completed` (all of a commit's
+  checks finished), `merge.conflict` and `merge.clean` were derived by the
+  server, by heuristics, and are no longer sent, by the server or the
+  CLI's local mode. A subscription that names them (or `merge.*`) is still
+  accepted and simply never gets them. Use `check.completed` and
+  `check.failed`, and ask GitHub about the rest.
+- TypeScript types for the requests, responses, messages and events
+  live in `packages/protocol` (published as `@watcheroni/protocol`).
