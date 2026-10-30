@@ -90,6 +90,8 @@ export class FakeServer {
   refuseSockets = false;
   // Repos the App is installed on, and whether each is private.
   readonly repos = new Map<string, { private: boolean }>();
+  // Where an app_not_installed answer says to install it.
+  installUrl: unknown = "https://github.com/apps/watcheroni/installations/new";
   // GitHub tokens accepted for private repos.
   readonly githubTokens = new Set<string>();
   // Subscriptions made, with the X-GitHub-Token each request carried.
@@ -103,7 +105,9 @@ export class FakeServer {
   readonly verifiedUntil = new Map<string, string>();
   readonly verified: { id: string; githubToken: string | null }[] = [];
   // What POST /v1/github/refresh answers, and the refresh tokens it saw.
+  // With refreshLimited, it's the server's own 429 instead.
   refreshAnswer: Record<string, unknown> = { error: "bad_refresh_token" };
+  refreshLimited = false;
   readonly refreshed: string[] = [];
   private http: Server | null = null;
   private waiting = new Set<() => void>();
@@ -216,7 +220,8 @@ export class FakeServer {
     };
     if (req.method === "POST" && url.pathname === "/v1/github/refresh") {
       this.refreshed.push((await readBody<{ refresh_token: string }>()).refresh_token);
-      return json(200, this.refreshAnswer);
+      if (this.refreshLimited) res.setHeader("Retry-After", "60");
+      return this.refreshLimited ? json(429, { status: 429, code: "rate_limited" }) : json(200, this.refreshAnswer);
     }
     if (!this.authorized(req)) return json(401, { status: 401, code: "unauthorized" });
     const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?(?:\/([^/]+)(\/[a-z]+)?)?$/);
@@ -229,7 +234,7 @@ export class FakeServer {
       const body = await readBody<{ repo: string; pr?: number; kinds?: string[]; base?: string; author?: string }>();
       const repo = this.repos.get(body.repo);
       if (!repo) {
-        return json(409, { status: 409, code: "app_not_installed", install_url: "https://github.com/apps/watcheroni/installations/new" });
+        return json(409, { status: 409, code: "app_not_installed", install_url: this.installUrl });
       }
       const githubToken = (req.headers["x-github-token"] as string | undefined) ?? null;
       if (repo.private && !githubToken) return json(401, { status: 401, code: "github_token_required" });

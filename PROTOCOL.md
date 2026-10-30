@@ -72,6 +72,11 @@ with no GitHub App configured leaves out `github` and doesn't offer
 sign-in. `github.app_slug` and `github.install_url` are present only when
 the server knows its App's slug (each copy of the server, self-hosted
 ones included, has its own App); clients MUST cope without them.
+Clients SHOULD NOT open a URL, or offer it as a place to sign in or
+install the App, unless it's an `https://github.com/` page. The
+watcheroni CLI runs the device flow on github.com whatever `web_url`
+says, refuses a `verification_uri` anywhere else, and leaves out any
+other `install_url`.
 
 ## Authentication
 
@@ -110,7 +115,10 @@ user is, once, and exchanges that for an API key.
 
    The key is shown only once. `label` is optional (at most 100
    characters are kept). A failure to reach GitHub is `503 unavailable`
-   with `Retry-After`.
+   with `Retry-After`. Too many logins from one IPv4 address or IPv6 /64
+   are `429 rate_limited` with `Retry-After`, and no `RateLimit-*`
+   headers (they describe an account's budget); the GitHub token is
+   still good, so the client can wait and send it again.
 
 3. The client keeps the GitHub token and refresh token **locally**. It
    needs them again only to subscribe to private repositories (see
@@ -142,6 +150,10 @@ The response is GitHub's own status and body (`access_token`,
 `refresh_token`, `expires_in`, ...), passed through unchanged; note that
 GitHub reports a bad or expired refresh token as `200` with an `error`
 field. No API key is needed, since the refresh token is the credential.
+Too many refreshes from one IPv4 address or IPv6 /64 are the server's
+own `429 rate_limited` with `Retry-After` (and no `RateLimit-*`
+headers), not GitHub's answer; the refresh token hasn't been used, so it
+can be sent again later.
 
 ### Keys
 

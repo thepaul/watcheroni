@@ -1,7 +1,8 @@
 import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
-import type { ServerConfig } from "./config.ts";
+import { type ServerConfig, checkServerUrl } from "./config.ts";
 import { LoginNeeded } from "./github.ts";
+import { githubUrl } from "./login.ts";
 import { anyKey, isPr, type RepoTarget, type Target } from "./targets.ts";
 
 // Server mode: reading an inbox on a watcheroni server (PROTOCOL.md,
@@ -36,7 +37,7 @@ export class ServerClient {
   private readonly apiKey: string;
 
   constructor(config: ServerConfig) {
-    this.url = config.url;
+    this.url = checkServerUrl(config.url);
     this.apiKey = config.apiKey;
   }
 
@@ -96,6 +97,7 @@ export class ServerClient {
   // connect to the URL it returns instead.
   async socket(name: string): Promise<{ url: string; headers: Record<string, string> }> {
     const url = new URL(`${this.url}/v1/inboxes/${name}/ws`);
+    // checkServerUrl has made sure plain http only goes to this machine.
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     return { url: url.href, headers: { Authorization: `Bearer ${this.apiKey}` } };
   }
@@ -135,7 +137,9 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
   } catch (e) {
     if (e instanceof ServerError) {
       if (e.code === "app_not_installed") {
-        const url = typeof e.problem.install_url === "string" ? `; it can be installed from ${e.problem.install_url}` : "";
+        // Shown only if it's a github.com page, like the sign-in page.
+        const install = githubUrl(e.problem.install_url);
+        const url = install ? `; it can be installed from ${install}` : "";
         o.log(`the watcheroni App isn't installed on ${repo}${url}`);
       } else if (e.code === "github_token_invalid") {
         o.log(`${client.url} didn't accept this machine's GitHub token for ${repo}; run \`watcheroni login\` again`);
@@ -171,7 +175,14 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
   }
   const due = subs.filter((s) => s.repo.private && s.verified_until && Date.parse(s.verified_until) - now < RENEW_BEFORE_MS);
   if (!due.length) return;
-  const token = await o.githubToken?.();
+  let token: string | null | undefined;
+  try {
+    token = await o.githubToken?.();
+  } catch (e) {
+    if (!(e instanceof Unreachable)) throw e;
+    o.log(`couldn't renew the server's watch on ${due.map((s) => s.repo.full_name).join(", ")}: ${e.message}`);
+    return;
+  }
   if (!token) {
     o.log(`the server needs a fresh GitHub token to keep watching ${due.map((s) => s.repo.full_name).join(", ")}; run \`watcheroni login\``);
     return;

@@ -6,7 +6,7 @@ import { Feed } from "../src/feed.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
-import { ServerClient, ServerReader, renewSubscriptions, subscribe } from "../src/server.ts";
+import { ServerClient, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -254,6 +254,44 @@ describe("subscribing on the server", () => {
     expect(fake.subscriptions).toEqual([]);
   });
 
+  it("says the server is limiting refreshes, not to sign in again, on a 429", async () => {
+    fake.repos.set("octo/secret", { private: true });
+    fake.refreshLimited = true;
+    const path = signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    expect(await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) })).toBeNull();
+    expect(messages.at(-1)).toBe(
+      `couldn't subscribe to octo/secret#3 (${fake.url} is limiting GitHub token refreshes from this address; try again in 60 seconds)`,
+    );
+    expect(messages.join("\n")).not.toMatch(/watcheroni login/);
+    // The refresh token wasn't used up, so it's kept for next time.
+    expect((JSON.parse(readFileSync(path, "utf8")) as Credentials).servers[fake.url].github.refresh_token).toBe("ghr_old");
+
+    // Renewing logs the same, and leaves the subscription for next time.
+    fake.refreshLimited = false;
+    fake.githubTokens.add("ghu_old");
+    signIn({ expires_at: new Date(Date.now() + 3600_000).toISOString() });
+    const sub = await subscribe(client(), "box", priv, { log, githubToken: () => githubTokenFor(fake.url) });
+    fake.verifiedUntil.set(sub!, new Date(Date.now() + 3600_000).toISOString());
+    fake.refreshLimited = true;
+    signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    messages.length = 0;
+    await renewSubscriptions(client(), "box", { log, githubToken: () => githubTokenFor(fake.url) });
+    expect(messages).toEqual([
+      `couldn't renew the server's watch on octo/secret: ${fake.url} is limiting GitHub token refreshes from this address; try again in 60 seconds`,
+    ]);
+    expect(fake.verified).toEqual([]);
+  });
+
+  it("says the server can't be reached, not to sign in again, when a refresh gets no answer", async () => {
+    signIn({ expires_at: new Date(Date.now() - 1000).toISOString() });
+    const down = async () => {
+      throw new TypeError("fetch failed", { cause: new Error("connect ECONNREFUSED") });
+    };
+    const refreshing = githubTokenFor(fake.url, { fetch: down, now: Date.now });
+    await expect(refreshing).rejects.toThrow(Unreachable);
+    await expect(refreshing).rejects.toThrow(`can't reach ${fake.url} to refresh the GitHub token: connect ECONNREFUSED`);
+  });
+
   it("renews private subscriptions due within two days, and only those", async () => {
     fake.repos.set("octo/secret", { private: true });
     fake.repos.set("octo/widgets", { private: false });
@@ -278,6 +316,12 @@ describe("subscribing on the server", () => {
   it("falls back to polling when the App isn't installed, saying where to install it", async () => {
     expect(await subscribe(client(), "box", pub, { log })).toBeNull();
     expect(messages).toEqual(["the watcheroni App isn't installed on octo/widgets; it can be installed from https://github.com/apps/watcheroni/installations/new"]);
+  });
+
+  it("leaves out an install address that isn't a github.com page", async () => {
+    fake.installUrl = "https://github.com.evil.com/apps/watcheroni\n\x1b[2Jrun this";
+    expect(await subscribe(client(), "box", pub, { log })).toBeNull();
+    expect(messages).toEqual(["the watcheroni App isn't installed on octo/widgets"]);
   });
 
   it("falls back to polling when the server is down", async () => {

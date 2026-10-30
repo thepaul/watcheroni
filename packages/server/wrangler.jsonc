@@ -20,6 +20,14 @@
       { "name": "CONTROL", "class_name": "Control" }
     ]
   },
+  // Per-IP limits on the sign-in endpoints, which need no API key and each
+  // cost a GitHub call made with the App's client secret ("Per IP address"
+  // in DESIGN.md). Namespace IDs are per Cloudflare account, so the test
+  // server and production use different ones.
+  "ratelimits": [
+    { "name": "LOGIN_RATE_LIMIT", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
+    { "name": "REFRESH_RATE_LIMIT", "namespace_id": "1002", "simple": { "limit": 10, "period": 60 } }
+  ],
   // The redelivery cron runs on production only: both Workers use the same
   // GitHub App, whose webhooks go to production, so a second cron on the
   // test server would only redeliver the same failures twice. On the test
@@ -66,6 +74,10 @@
           { "name": "CONTROL", "class_name": "Control" }
         ]
       },
+      "ratelimits": [
+        { "name": "LOGIN_RATE_LIMIT", "namespace_id": "2001", "simple": { "limit": 10, "period": 60 } },
+        { "name": "REFRESH_RATE_LIMIT", "namespace_id": "2002", "simple": { "limit": 10, "period": 60 } }
+      ],
       // Every 10 minutes: Control redelivers webhooks that failed.
       "triggers": { "crons": ["*/10 * * * *"] },
       "vars": {
