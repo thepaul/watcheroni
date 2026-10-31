@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UnsequencedEvent, WatchEvent } from "@watcheroni/protocol";
@@ -72,6 +72,38 @@ describe("inbox", () => {
     // A lock left by a process that has gone.
     writeFileSync(join(process.env.WATCHERONI_STATE_DIR!, "inboxes", `${name}.lock`), "999999");
     Inbox.open(name).close();
+  });
+
+  it("deletes inboxes nobody has opened for a week, unless in use", () => {
+    const dir = join(process.env.WATCHERONI_STATE_DIR!, "inboxes");
+    const age = (file: string, days: number) => {
+      const t = new Date(Date.now() - days * 24 * 3600 * 1000);
+      utimesSync(join(dir, file), t, t);
+    };
+    const [old, recent, busy, current] = [`t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`];
+    for (const name of [old, recent, current]) {
+      const i = Inbox.open(name);
+      i.save();
+      i.close();
+    }
+    const held = Inbox.open(busy);
+    held.save();
+    // Opened, then left by a process that has gone, never saved.
+    writeFileSync(join(dir, "orphan.lock"), "999999");
+    writeFileSync(join(dir, `${old}.json.999999.tmp`), "{");
+    for (const f of [`${old}.json`, `${busy}.json`, `${current}.json`, "orphan.lock", `${old}.json.999999.tmp`]) age(f, 8);
+    age(`${recent}.json`, 6);
+
+    const inbox = Inbox.open(current);
+    expect(Inbox.names()).toEqual([busy, current, recent].sort());
+    expect(existsSync(join(dir, "orphan.lock"))).toBe(false);
+    expect(existsSync(join(dir, `${old}.json.999999.tmp`))).toBe(false);
+    // Opening one counts as looking at it, whether or not it's saved.
+    inbox.close();
+    held.close();
+    age(`${busy}.json`, 8);
+    Inbox.open(recent).close();
+    expect(Inbox.names()).toEqual([current, recent].sort());
   });
 });
 

@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { INBOX_NAME, type UnsequencedEvent, type WatchEvent } from "@watcheroni/protocol";
@@ -42,6 +42,9 @@ interface State {
 }
 
 const SEEN_KEPT = 2000;
+// An inbox nobody has opened for this long is deleted. A server stops
+// feeding one after a week unread, too.
+const STALE_MS = 7 * 24 * 3600 * 1000;
 
 export class InboxBusy extends Error {}
 
@@ -71,6 +74,14 @@ export class Inbox {
     lock(join(dir, `${name}.lock`), name);
     const inbox = new Inbox(name, dir);
     process.once("exit", () => inbox.close());
+    // Its file's time is when it was last opened, which sweep() goes by.
+    const now = new Date();
+    try {
+      utimesSync(inbox.file, now, now);
+    } catch {
+      // Not saved yet.
+    }
+    sweep(dir, name);
     return inbox;
   }
 
@@ -224,6 +235,53 @@ export class Inbox {
     } catch {
       return { version: 1, seq: 0, acked: 0, events: [], seen: [], watched: {} };
     }
+  }
+}
+
+// Deletes the inboxes nobody has opened for STALE_MS, except `keep` and
+// any in use, with what they watched and any events never acknowledged.
+// One that's wanted again starts out empty.
+function sweep(dir: string, keep: string): void {
+  let files: string[];
+  try {
+    files = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const stale = (file: string) => {
+    try {
+      return Date.now() - statSync(join(dir, file)).mtimeMs > STALE_MS;
+    } catch {
+      return false;
+    }
+  };
+  const names = new Set<string>();
+  for (const file of files) {
+    // Left by a save that was killed.
+    if (file.endsWith(".tmp") && stale(file)) tryUnlink(join(dir, file));
+    const m = /^(.*)\.(json|lock)$/.exec(file);
+    if (m && INBOX_NAME.test(m[1]!) && m[1] !== keep) names.add(m[1]!);
+  }
+  for (const name of names) {
+    // A lock with no inbox file is one opened but never saved.
+    if (!(files.includes(`${name}.json`) ? stale(`${name}.json`) : stale(`${name}.lock`))) continue;
+    const lockFile = join(dir, `${name}.lock`);
+    try {
+      lock(lockFile, name);
+    } catch {
+      continue; // In use.
+    }
+    // Opened and closed again while we were deciding?
+    if (stale(`${name}.json`)) tryUnlink(join(dir, `${name}.json`));
+    tryUnlink(lockFile);
+  }
+}
+
+function tryUnlink(file: string): void {
+  try {
+    unlinkSync(file);
+  } catch {
+    // Already gone.
   }
 }
 
