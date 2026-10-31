@@ -87,6 +87,32 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(2);
   });
 
+  it("with --json, prints each event as a JSON line, then how it ended", async () => {
+    fake.inject("box", "review.submitted", { review_id: 5, state: "approved" });
+    fake.inject("box", "comment.created", { comment_id: 9 });
+    const run = cli(["wait", "--settle", "0", "--json"]);
+    expect(await run.code).toBe(0);
+    const lines = run.stdout().trimEnd().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.map((l) => l.kind ?? l.result)).toEqual(["review.submitted", "comment.created", "events"]);
+    expect(lines[2]).toEqual({ result: "events", watching: [] });
+    expect(fake.inbox("box").acked).toBe(2);
+  });
+
+  it("with --json, says so on a line of its own when it times out", async () => {
+    const run = cli(["wait", "--timeout", "1s", "--json"]);
+    expect(await run.code).toBe(2);
+    expect(run.stdout()).toBe(`${JSON.stringify({ result: "timeout", watching: [] })}\n`);
+  });
+
+  it("won't take --json and --format together, or --json where it means nothing", async () => {
+    const both = cli(["wait", "--json", "--format", "json"]);
+    expect(await both.code).toBe(1);
+    expect(both.stderr()).toBe("watcheroni: --json replaces --format; use one or the other\n");
+    const exec = cli(["exec", "--json", "--", "true"]);
+    expect(await exec.code).toBe(1);
+    expect(exec.stderr()).toBe("watcheroni: exec has no --json; wait, stream and ls do\n");
+  });
+
   it("filters kinds, acknowledging the ones skipped", async () => {
     fake.inject("box", "comment.created");
     fake.inject("box", "check.failed");
@@ -134,14 +160,14 @@ describe("wait against a server", () => {
     // The server's first subscription will be sub_1.
     fake.inject("box", "pr.merged", {}, "e1", "sub_1");
     fake.inject("box", "watch.ended", { reason: "merged" }, "e2", "sub_1");
-    const run = cli(["wait", "octo/widgets#7", "--settle", "0", "--format", "json"]);
+    const run = cli(["wait", "octo/widgets#7", "--settle", "0", "--json"]);
     // 3: everything watched has ended.
     expect(await run.code, run.stderr()).toBe(3);
     expect(fake.subscriptions).toEqual([{ id: "sub_1", inbox: "box", repo: "octo/widgets", pr: 7, githubToken: null }]);
     expect(run.stderr()).toBe("watcheroni: watching octo/widgets#7 in inbox box\n");
-    const out = JSON.parse(run.stdout()) as { events: { kind: string }[]; watching: string[] };
-    expect(out.events.map((e) => e.kind)).toEqual(["pr.merged", "watch.ended"]);
-    expect(out.watching).toEqual([]);
+    const lines = run.stdout().trimEnd().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.map((l) => l.kind ?? l.result)).toEqual(["pr.merged", "watch.ended", "ended"]);
+    expect(lines[2]).toEqual({ result: "ended", watching: [] });
   });
 
   it("polls a target from this machine when the App isn't installed on its repo", async () => {
@@ -309,6 +335,15 @@ describe("stream against a server", () => {
     await run.code;
     expect(run.stdout().trim().split("\n").map((l) => (JSON.parse(l) as { kind: string }).kind)).toEqual(["comment.created", "review.submitted"]);
   });
+
+  it("takes --json, which is what it prints anyway", async () => {
+    fake.inject("box", "comment.created");
+    const run = cli(["stream", "--json"]);
+    await until(() => fake.inbox("box").acked === 1);
+    run.kill();
+    await run.code;
+    expect((JSON.parse(run.stdout()) as { kind: string }).kind).toBe("comment.created");
+  });
 });
 
 describe("exec against a server", () => {
@@ -434,5 +469,40 @@ describe("ls --all", () => {
     const run = cli(["ls", "--all"], { WATCHERONI_SERVER: "" });
     expect(await run.code).toBe(0);
     expect(run.stdout()).toBe("No inboxes on this machine.\n");
+  });
+
+  it("with --json, prints an array of inboxes, with an error for one it can't read", async () => {
+    const dir = join(env.WATCHERONI_STATE_DIR, "inboxes");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "a-bad.json"), "null");
+    writeFileSync(join(dir, "b-good.json"), JSON.stringify({
+      version: 1, seq: 0, acked: 0, events: [], seen: [],
+      watched: { "octo/widgets#7": { target: { owner: "octo", name: "widgets", number: 7 }, addedAt: "t", snapshot: null } },
+      repos: { "octo/widgets (pr.opened; base main)": { target: { owner: "octo", name: "widgets", kinds: ["pr.opened"], base: "main" }, addedAt: "u", sub: "sub_1" } },
+    }));
+    const run = cli(["ls", "--all", "--json"], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(1);
+    const out = JSON.parse(run.stdout()) as Record<string, unknown>[];
+    expect(out[0]).toMatchObject({ inbox: "a-bad", error: expect.any(String) });
+    expect(out[1]).toEqual({
+      inbox: "b-good",
+      prs: [{ pr: "octo/widgets#7", since: "t" }],
+      repos: [{ repo: "octo/widgets", kinds: ["pr.opened"], base: "main", since: "u" }],
+      pending: 0,
+    });
+  });
+
+  it("with --json and no inboxes, prints an empty array", async () => {
+    const run = cli(["ls", "--all", "--json"], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(0);
+    expect(run.stdout()).toBe("[]\n");
+  });
+});
+
+describe("ls --json", () => {
+  it("prints the inbox as one JSON object", async () => {
+    const run = cli(["ls", "--json"], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(0);
+    expect(JSON.parse(run.stdout())).toEqual({ inbox: "box", prs: [], repos: [], pending: 0 });
   });
 });

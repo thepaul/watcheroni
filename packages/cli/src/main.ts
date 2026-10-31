@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { WatchEvent } from "@watcheroni/protocol";
 import { parseArgs } from "node:util";
 import pkg from "../package.json" with { type: "json" };
 import { loadServer } from "./config.ts";
@@ -18,7 +19,7 @@ const EXIT = { events: 0, error: 1, timeout: 2, ended: 3, login: 4 } as const;
 const HELP = `watcheroni ${pkg.version}: wait for, stream, or act on what happens to GitHub pull requests
 
 Usage:
-  watcheroni wait   [target...] [--timeout 1h] [--settle 5s] [--format text|json]
+  watcheroni wait   [target...] [--timeout 1h] [--settle 5s] [--json]
   watcheroni stream [target...]
   watcheroni exec   [target...] [--on kinds] [--batch] [--settle 5s] -- command [args...]
   watcheroni watch  [target...]
@@ -41,6 +42,9 @@ Options:
   --settle TIME     wait and exec --batch: after the first event, wait this
                     long for more before printing or running the command
                     (default 5s; 0 goes with what the first read brought)
+  --json            wait: each event as a JSON line, then a line saying how
+                    it ended, {"result":"events|timeout|ended","watching":[...]};
+                    stream: JSON lines, as without it; ls: one JSON value
 
 wait exits 0 after printing events, 2 on timeout, 3 when every watched PR
 has ended (never while a whole repository is watched), 4 when GitHub
@@ -73,6 +77,23 @@ function describeInbox(name: string, nothing: string): string[] {
   ];
 }
 
+// The same, for `ls --json`.
+function inboxJson(name: string): object {
+  const { watched, repos, pending } = Inbox.peek(name);
+  return {
+    inbox: name,
+    prs: watched.map((w) => ({ pr: targetKey(w.target), since: w.addedAt })),
+    repos: repos.map(({ target: t, addedAt }) => ({
+      repo: `${t.owner}/${t.name}`,
+      kinds: t.kinds,
+      ...(t.base ? { base: t.base } : {}),
+      ...(t.author ? { author: t.author } : {}),
+      since: addedAt,
+    })),
+    pending,
+  };
+}
+
 async function main(argv: string[]): Promise<number> {
   // Its options are the server script's own.
   if (argv[0] === "selfhost") return selfhost(argv.slice(1));
@@ -90,7 +111,9 @@ async function main(argv: string[]): Promise<number> {
       interval: { type: "string", default: "2m" },
       timeout: { type: "string", default: "1h" },
       settle: { type: "string", default: "5s" },
-      format: { type: "string", default: "text" },
+      // Before --json: wait's events as one JSON object. Kept for scripts.
+      format: { type: "string" },
+      json: { type: "boolean", default: false },
       batch: { type: "boolean", default: false },
       all: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -115,6 +138,23 @@ async function main(argv: string[]): Promise<number> {
   if (verb === "logout") return (await logout(), 0);
 
   if (verb === "ls") {
+    if (opts.json) {
+      if (!opts.all) {
+        process.stdout.write(`${JSON.stringify(inboxJson(inboxName))}\n`);
+        return 0;
+      }
+      let unreadable = 0;
+      const all = Inbox.names().map((name) => {
+        try {
+          return inboxJson(name);
+        } catch (e) {
+          unreadable++;
+          return { inbox: name, error: e instanceof Error ? e.message : String(e) };
+        }
+      });
+      process.stdout.write(`${JSON.stringify(all)}\n`);
+      return unreadable ? EXIT.error : 0;
+    }
     if (!opts.all) {
       process.stdout.write(describeInbox(inboxName, `Inbox ${inboxName} is watching nothing.`).map((l) => `${l}\n`).join(""));
       return 0;
@@ -139,10 +179,12 @@ async function main(argv: string[]): Promise<number> {
     throw new UsageError(`unknown command ${verb}; see watcheroni --help`);
   }
 
+  if (opts.json && verb !== "wait" && verb !== "stream") throw new UsageError(`${verb} has no --json; wait, stream and ls do`);
   const kinds = (opts.on ?? opts.kinds)?.split(",").map((k) => k.trim()).filter(Boolean) ?? [];
   const interval = Math.max(parseDuration(opts.interval), 10_000);
   if (verb === "exec" && !command.length) throw new UsageError("exec needs a command after --");
-  if (opts.format !== "text" && opts.format !== "json") throw new UsageError("--format is text or json");
+  if (opts.format !== undefined && opts.format !== "text" && opts.format !== "json") throw new UsageError("--format is text or json");
+  if (opts.json && opts.format !== undefined) throw new UsageError("--json replaces --format; use one or the other");
 
   const config = loadServer();
   const parsed = args.map(parseTarget);
@@ -277,7 +319,7 @@ async function main(argv: string[]): Promise<number> {
   try {
     switch (verb) {
       case "wait":
-        return await waitCommand(feed, { kinds, interval, timeout: parseDuration(opts.timeout), settle: parseDuration(opts.settle), json: opts.format === "json", inbox: inboxName });
+        return await waitCommand(feed, { kinds, interval, timeout: parseDuration(opts.timeout), settle: parseDuration(opts.settle), output: opts.json ? "lines" : opts.format === "json" ? "object" : "text", inbox: inboxName });
       case "stream":
         return await streamCommand(feed, { kinds, interval });
       case "exec":
@@ -294,9 +336,12 @@ const RESUBSCRIBE_MS = 60 * 60_000;
 
 async function waitCommand(
   feed: Feed,
-  o: { kinds: string[]; interval: number; timeout: number; settle: number; json: boolean; inbox: string },
+  o: { kinds: string[]; interval: number; timeout: number; settle: number; output: "text" | "lines" | "object"; inbox: string },
 ): Promise<number> {
   const deadline = Date.now() + o.timeout;
+  // --json: a line per event, then one saying how the wait ended.
+  const lines = (events: WatchEvent[], result: "events" | "timeout" | "ended", watching: string[]) =>
+    [...events, { result, watching }].map((v) => `${JSON.stringify(v)}\n`).join("");
   // A server inbox still being read with no PR known to be watched.
   const reading = () => (feed.ended() ? undefined : o.inbox);
   // Events left from before (a killed wait, say) come out first.
@@ -312,19 +357,24 @@ async function waitCommand(
       }
       const events = items.map((i) => i.event);
       const still = feed.watching();
-      process.stdout.write(o.json ? `${JSON.stringify({ events, watching: still })}\n` : `${formatText(events, still, reading(), feed.repoEnded)}\n`);
+      const ended = feed.ended();
+      process.stdout.write(o.output === "lines" ? lines(events, ended ? "ended" : "events", still)
+        : o.output === "object" ? `${JSON.stringify({ events, watching: still })}\n`
+        : `${formatText(events, still, reading(), feed.repoEnded)}\n`);
       feed.ack(items);
-      return feed.ended() ? EXIT.ended : EXIT.events;
+      return ended ? EXIT.ended : EXIT.events;
     }
     if (feed.ended()) {
-      process.stdout.write(o.json ? `${JSON.stringify({ events: [], watching: [] })}\n` : `${footer([], undefined, feed.repoEnded)}\n`);
+      process.stdout.write(o.output === "lines" ? lines([], "ended", [])
+        : o.output === "object" ? `${JSON.stringify({ events: [], watching: [] })}\n`
+        : `${footer([], undefined, feed.repoEnded)}\n`);
       return EXIT.ended;
     }
     const left = deadline - Date.now();
     if (left <= 0) {
       const still = feed.watching();
-      process.stdout.write(o.json
-        ? `${JSON.stringify({ events: [], watching: still, timeout: true })}\n`
+      process.stdout.write(o.output === "lines" ? lines([], "timeout", still)
+        : o.output === "object" ? `${JSON.stringify({ events: [], watching: still, timeout: true })}\n`
         : `No new events. ${footer(still, reading())}\n`);
       return EXIT.timeout;
     }

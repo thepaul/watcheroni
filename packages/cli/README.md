@@ -66,12 +66,12 @@ teaches a session the commands and puts the CLI on its PATH.
 ## Commands
 
 ```
-watcheroni wait   [target...] [--timeout 1h] [--settle 5s] [--format text|json]
+watcheroni wait   [target...] [--timeout 1h] [--settle 5s] [--json]
 watcheroni stream [target...]
 watcheroni exec   [target...] [--on kinds] [--batch] -- command [args...]
 watcheroni watch  [target...]
 watcheroni unwatch <target...>
-watcheroni ls
+watcheroni ls [--all] [--json]
 ```
 
 Targets are `owner/repo#123` or PR URLs. With none, it's the open PR for
@@ -83,12 +83,22 @@ below).
   happens, waits `--settle` (5 s; `0` for none) for related events, prints them with the
   command that fetches each one's content, and exits. Exit codes: `0`
   events, `2` timeout, `3` every watched PR has ended, `4` no GitHub
-  credentials, `1` other errors.
-- **`stream`** prints each event as a JSON line until killed.
+  credentials, `1` other errors. With `--json` it prints each event as a
+  JSON line instead, then a last line saying how it ended:
+  `{"result":"events","watching":["octo/widgets#7"]}`, with `"timeout"` or
+  `"ended"` in place of `"events"` for exit codes 2 and 3. (`--format json`,
+  from before `--json`, still prints one object holding all the events.)
+- **`stream`** prints each event as a JSON line until killed (`--json` is
+  accepted, and changes nothing).
 - **`exec`** runs a command per event, with the event as JSON on stdin and
   `WATCHERONI_KIND`, `_REPO`, `_PR`, `_URL` and `_EVENT_ID` in its
   environment. An event is acknowledged only when the command exits 0.
   `--batch` runs it once per settled batch, with a JSON array on stdin.
+- **`ls`** says what the inbox watches and how many events wait in it;
+  `--all` lists every inbox on this machine. `--json` prints the inbox as
+  `{"inbox","prs":[{"pr","since"}],"repos":[{"repo","kinds","base","author","since"}],"pending"}`
+  (`base` and `author` only when set), or with `--all` an array of them,
+  where an inbox that can't be read is `{"inbox","error"}`.
 
 ## Recipes
 

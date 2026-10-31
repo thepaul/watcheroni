@@ -996,10 +996,10 @@ watcheroni install [owner/repo]      # opens the App's install page
 watcheroni doctor                    # checks login, server, App install, fallback
 
 watcheroni watch [target...] [--kinds ...] [--ttl 7d]
-watcheroni ls
+watcheroni ls [--all] [--json]
 watcheroni unwatch <target | sub-id>
 
-watcheroni wait   [target...] [--timeout 1h] [--format text|json]
+watcheroni wait   [target...] [--timeout 1h] [--json]
 watcheroni stream [target...]        # JSON lines until killed
 watcheroni exec   [target...] --on 'check.failed' -- ./fix.sh
 
@@ -1038,7 +1038,9 @@ watcheroni config [get | set] <key> [value]
 
 ### Output for agents
 
-`wait` prints text by default (`--format json` for scripts), written so an
+`wait` prints text by default (`--json` for scripts and agents that parse
+it: a JSON line per event, then `{"result": "events" | "timeout" | "ended",
+"watching": [...]}`; the older `--format json` prints one object), written so an
 agent can act on it without reading docs:
 
 ```
