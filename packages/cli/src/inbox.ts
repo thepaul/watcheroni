@@ -48,6 +48,11 @@ const STALE_MS = 7 * 24 * 3600 * 1000;
 
 export class InboxBusy extends Error {}
 
+// Inboxes this process has open, closed on exit by one listener however
+// many there are.
+const opened = new Set<Inbox>();
+let closingOnExit = false;
+
 export function stateDir(): string {
   if (process.env.WATCHERONI_STATE_DIR) return process.env.WATCHERONI_STATE_DIR;
   return join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "watcheroni");
@@ -74,7 +79,13 @@ export class Inbox {
     mkdirSync(dir, { recursive: true });
     lock(join(dir, `${name}.lock`), name);
     const inbox = new Inbox(name, dir);
-    process.once("exit", () => inbox.close());
+    opened.add(inbox);
+    if (!closingOnExit) {
+      closingOnExit = true;
+      process.once("exit", () => {
+        for (const i of opened) i.close();
+      });
+    }
     inbox.touch();
     sweep(dir, name);
     return inbox;
@@ -104,6 +115,7 @@ export class Inbox {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    opened.delete(this);
     // So an inbox used for longer than a week isn't swept as soon as it's let go.
     this.touch();
     release(this.lockFile);

@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -192,8 +192,11 @@ describe("wait against a server", () => {
   it("polls a target from this machine when the App isn't installed on its repo", async () => {
     const run = cli(["wait", "octo/widgets#7"], { GH_TOKEN: "x" });
     await until(() => run.stderr().includes("polling GitHub"));
+    expect(existsSync(join(env.WATCHERONI_STATE_DIR, "inboxes", "box.lock"))).toBe(true);
     run.kill();
     await run.code;
+    // Let go when killed.
+    expect(existsSync(join(env.WATCHERONI_STATE_DIR, "inboxes", "box.lock"))).toBe(false);
     expect(run.stderr()).toMatch(/the watcheroni App isn't installed on octo\/widgets; it can be installed from https:\/\/github.com\/apps\/watcheroni\/installations\/new\nwatcheroni: watching octo\/widgets#7 in inbox box, polling GitHub from this machine/);
   });
 
