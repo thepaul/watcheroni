@@ -222,7 +222,7 @@ uses an inbox. The inbox is `--inbox`, or `$WATCHERONI_INBOX`, or
 `cc-$CLAUDE_CODE_SESSION_ID` inside Claude Code, or `default`.
 `watcheroni ls --all` lists every inbox on this machine, Claude Code
 sessions' included, with what each watches and how many events wait in it.
-An inbox nobody has opened for a week is deleted the next time any inbox
+An inbox nobody has opened or closed for a week is deleted the next time any inbox
 is opened, with what it watched and any events left in it, unless a
 process is using it; `default` and the rest start out empty if used again.
 (A server stops feeding an inbox after a week unread, too.)

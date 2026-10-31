@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { INBOX_NAME, type UnsequencedEvent, type WatchEvent } from "@watcheroni/protocol";
@@ -58,6 +58,7 @@ export class Inbox {
   private readonly file: string;
   private readonly lockFile: string;
   private state: State;
+  private closed = false;
 
   private constructor(name: string, dir: string) {
     this.name = name;
@@ -74,13 +75,7 @@ export class Inbox {
     lock(join(dir, `${name}.lock`), name);
     const inbox = new Inbox(name, dir);
     process.once("exit", () => inbox.close());
-    // Its file's time is when it was last opened, which sweep() goes by.
-    const now = new Date();
-    try {
-      utimesSync(inbox.file, now, now);
-    } catch {
-      // Not saved yet.
-    }
+    inbox.touch();
     sweep(dir, name);
     return inbox;
   }
@@ -107,10 +102,20 @@ export class Inbox {
   }
 
   close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    // So an inbox used for longer than a week isn't swept as soon as it's let go.
+    this.touch();
+    release(this.lockFile);
+  }
+
+  // Its file's time is when it was last opened or closed, which sweep() goes by.
+  private touch(): void {
+    const now = new Date();
     try {
-      unlinkSync(this.lockFile);
+      utimesSync(this.file, now, now);
     } catch {
-      // Already gone.
+      // Not saved yet.
     }
   }
 
@@ -267,13 +272,13 @@ function sweep(dir: string, keep: string): void {
     if (!(files.includes(`${name}.json`) ? stale(`${name}.json`) : stale(`${name}.lock`))) continue;
     const lockFile = join(dir, `${name}.lock`);
     try {
-      lock(lockFile, name);
+      lock(lockFile, name, false);
     } catch {
       continue; // In use.
     }
     // Opened and closed again while we were deciding?
     if (stale(`${name}.json`)) tryUnlink(join(dir, `${name}.json`));
-    tryUnlink(lockFile);
+    release(lockFile);
   }
 }
 
@@ -285,23 +290,84 @@ function tryUnlink(file: string): void {
   }
 }
 
-function lock(file: string, name: string): void {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const fd = openSync(file, "wx");
-      writeFileSync(fd, String(process.pid));
-      closeSync(fd);
-      return;
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+// Takes the lock file, or throws InboxBusy. The file appears with the PID
+// already in it, by linking a file written beforehand, so nobody reads it
+// empty. Unless `wait` is false, a lock held by a live process is tried
+// again for a moment, as another process's sweep() holds it only briefly.
+function lock(file: string, name: string, wait = true): void {
+  const tmp = `${file}.${process.pid}.tmp`;
+  writeFileSync(tmp, String(process.pid));
+  try {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        linkSync(tmp, file);
+        return;
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      }
+      const pid = holder(file);
+      if (pid === null) continue; // Let go meanwhile.
+      if (pid === "busy" || (pid && alive(pid))) {
+        if (wait && attempt < 5) {
+          pause(20);
+          continue;
+        }
+        throw new InboxBusy(`Inbox ${name} is in use${pid === "busy" ? "" : ` by process ${pid}`}, another wait, stream or exec; stop it, or use another inbox with --inbox`);
+      }
+      steal(file);
     }
-    const pid = Number(readFileSync(file, "utf8"));
-    if (pid && alive(pid)) {
-      throw new InboxBusy(`Inbox ${name} is in use by process ${pid}, another wait, stream or exec; stop it, or use another inbox with --inbox`);
-    }
-    unlinkSync(file);
+  } finally {
+    tryUnlink(tmp);
   }
   throw new InboxBusy(`Couldn't lock inbox ${name}`);
+}
+
+// The PID in a lock file, null if it's gone, or "busy" if it's empty and
+// new: an older version of this CLI writes the PID after making the file.
+function holder(file: string): number | "busy" | null {
+  try {
+    const pid = Number(readFileSync(file, "utf8"));
+    if (pid) return pid;
+    return Date.now() - statSync(file).mtimeMs < 10_000 ? "busy" : 0;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw e;
+  }
+}
+
+// Removes a lock left by a process that has gone. It's moved aside first
+// and checked again, so if another process replaced it meanwhile, theirs
+// is put back rather than deleted.
+function steal(file: string): void {
+  const aside = `${file}.${process.pid}.stale.tmp`;
+  try {
+    renameSync(file, aside);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw e;
+  }
+  const pid = holder(aside);
+  if (pid === "busy" || (pid && alive(pid))) {
+    try {
+      linkSync(aside, file);
+    } catch {
+      // Taken again already.
+    }
+  }
+  tryUnlink(aside);
+}
+
+// Lets go of a lock, if it's still this process's.
+function release(file: string): void {
+  try {
+    if (Number(readFileSync(file, "utf8")) === process.pid) unlinkSync(file);
+  } catch {
+    // Already gone.
+  }
+}
+
+function pause(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
 function alive(pid: number): boolean {
