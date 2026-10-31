@@ -13,6 +13,7 @@ watches, prints what happened, and exits. To keep watching, run it again.
 ```
 watcheroni wait                       # the open PR for the current branch
 watcheroni wait octo/widgets#123      # or name PRs, as owner/repo#N or URLs
+watcheroni wait octo/widgets#123 octo/gadgets#45   # several at once
 ```
 
 In Claude Code, run it with the Bash tool and `run_in_background: true`:
@@ -41,7 +42,7 @@ Other commands:
 
 | Exit | Meaning |
 |---|---|
-| 0 | Events were printed |
+| 0 | Events were printed. A PR that ended while others are still watched exits 0 too: its `pr.merged` or `pr.closed` and `watch.ended` are among the events |
 | 2 | Timed out with nothing to report |
 | 3 | Every watched PR has been merged or closed (any final events are printed first) |
 | 4 | No GitHub login: `gh auth login` (interactive), or `GH_TOKEN` / `GITHUB_TOKEN` |
