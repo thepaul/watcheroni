@@ -28,6 +28,12 @@ until a `wait` prints them, so nothing is lost between runs.
 Only one `wait` can read an inbox at a time. To add a PR while one is
 running, stop it and start `watcheroni wait owner/repo#456`.
 
+Stop only this session's own `wait`: with the background task's ID
+(TaskStop in Claude Code), or `kill` the process ID that the "in use by
+process" error names. Never `pkill` or `killall` it by name: other
+sessions on this machine run `watcheroni wait` too, and a pattern like
+`pkill -f "watcheroni.*wait"` kills theirs as well.
+
 Other commands:
 
 - `watcheroni ls`: what this session's inbox watches.
