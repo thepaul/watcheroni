@@ -1039,8 +1039,8 @@ watcheroni config [get | set] <key> [value]
 ### Output for agents
 
 `wait` prints text by default (`--json` for scripts and agents that parse
-it: a JSON line per event, then `{"result": "events" | "timeout" | "ended",
-"watching": [...]}`; the older `--format json` prints one object), written so an
+it: a JSON line per event, then, on exit 0, 2 or 3, `{"result": "events" |
+"timeout" | "ended", "watching": [...]}`; the older `--format json` prints one object), written so an
 agent can act on it without reading docs:
 
 ```

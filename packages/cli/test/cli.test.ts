@@ -111,6 +111,9 @@ describe("wait against a server", () => {
     const exec = cli(["exec", "--json", "--", "true"]);
     expect(await exec.code).toBe(1);
     expect(exec.stderr()).toBe("watcheroni: exec has no --json; wait, stream and ls do\n");
+    const logout = cli(["logout", "--json"]);
+    expect(await logout.code).toBe(1);
+    expect(logout.stderr()).toBe("watcheroni: logout has no --json; wait, stream and ls do\n");
   });
 
   it("filters kinds, acknowledging the ones skipped", async () => {

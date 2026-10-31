@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import type { WatchEvent } from "@watcheroni/protocol";
 import { parseArgs } from "node:util";
+import type { WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { loadServer } from "./config.ts";
 import { Feed } from "./feed.ts";
@@ -42,8 +42,8 @@ Options:
   --settle TIME     wait and exec --batch: after the first event, wait this
                     long for more before printing or running the command
                     (default 5s; 0 goes with what the first read brought)
-  --json            wait: each event as a JSON line, then a line saying how
-                    it ended, {"result":"events|timeout|ended","watching":[...]};
+  --json            wait: each event as a JSON line, then, on exit 0, 2 or
+                    3, {"result":"events|timeout|ended","watching":[...]};
                     stream: JSON lines, as without it; ls: one JSON value
 
 wait exits 0 after printing events, 2 on timeout, 3 when every watched PR
@@ -134,6 +134,8 @@ async function main(argv: string[]): Promise<number> {
     ?? process.env.WATCHERONI_INBOX
     ?? (process.env.CLAUDE_CODE_SESSION_ID ? `cc-${process.env.CLAUDE_CODE_SESSION_ID}` : "default");
 
+  if (opts.json && !["wait", "stream", "ls"].includes(verb)) throw new UsageError(`${verb} has no --json; wait, stream and ls do`);
+
   if (verb === "login") return (await login(), 0);
   if (verb === "logout") return (await logout(), 0);
 
@@ -179,7 +181,6 @@ async function main(argv: string[]): Promise<number> {
     throw new UsageError(`unknown command ${verb}; see watcheroni --help`);
   }
 
-  if (opts.json && verb !== "wait" && verb !== "stream") throw new UsageError(`${verb} has no --json; wait, stream and ls do`);
   const kinds = (opts.on ?? opts.kinds)?.split(",").map((k) => k.trim()).filter(Boolean) ?? [];
   const interval = Math.max(parseDuration(opts.interval), 10_000);
   if (verb === "exec" && !command.length) throw new UsageError("exec needs a command after --");
