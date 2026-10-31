@@ -85,7 +85,8 @@ below).
   events, `2` timeout, `3` every watched PR has ended, `4` no GitHub
   credentials, `1` other errors. With `--json` it prints each event as a
   JSON line instead, with `"command"` added: the same `gh` command the text
-  shows for it, or `null`. A last line says how it ended:
+  shows for it, or `null` (a review's comments each get their own, where
+  the text has one for them all). A last line says how it ended:
   `{"result":"events","watching":["octo/widgets#7"]}`, with `"timeout"` or
   `"ended"` in place of `"events"` for exit codes 2 and 3. (`--format json`,
   from before `--json`, still prints one object holding all the events.)

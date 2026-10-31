@@ -1041,7 +1041,7 @@ watcheroni config [get | set] <key> [value]
 `wait` prints text by default, written so an agent can act on it without
 reading docs. (`--json` is for scripts and agents that parse it: a JSON
 line per event, with `"command"`, the `gh` command shown below or null,
-then, on exit 0, 2 or 3, `{"result": "events" | "timeout" | "ended",
+though a review's comments each get their own, then, on exit 0, 2 or 3, `{"result": "events" | "timeout" | "ended",
 "watching": [...]}`. The older `--format json` prints one object.) The text:
 
 ```

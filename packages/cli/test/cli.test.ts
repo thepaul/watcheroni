@@ -103,6 +103,17 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(2);
   });
 
+  it("with --json, gives each of a review's comments its own command", async () => {
+    fake.inject("box", "review_comment.created", { comment_id: 6, review_id: 5, path: "a.ts", line: 3 });
+    fake.inject("box", "review_comment.created", { comment_id: 8, review_id: 5, path: "b.ts" });
+    const run = cli(["wait", "--settle", "0", "--json"]);
+    expect(await run.code).toBe(0);
+    expect(run.stdout().trimEnd().split("\n").slice(0, 2).map((l) => (JSON.parse(l) as { command: string }).command)).toEqual([
+      "gh api repos/octo/widgets/pulls/comments/6 --jq .body",
+      "gh api repos/octo/widgets/pulls/comments/8 --jq .body",
+    ]);
+  });
+
   it("with --json, says so on a line of its own when it times out", async () => {
     const run = cli(["wait", "--timeout", "1s", "--json"]);
     expect(await run.code).toBe(2);
@@ -341,7 +352,10 @@ describe("stream against a server", () => {
     await until(() => fake.inbox("box").acked === 2);
     run.kill();
     await run.code;
-    expect(run.stdout().trim().split("\n").map((l) => (JSON.parse(l) as { kind: string }).kind)).toEqual(["comment.created", "review.submitted"]);
+    const events = run.stdout().trim().split("\n").map((l) => JSON.parse(l) as { kind: string });
+    expect(events.map((e) => e.kind)).toEqual(["comment.created", "review.submitted"]);
+    // Only --json adds the command.
+    expect(events[0]).not.toHaveProperty("command");
   });
 
   it("with --json, adds the command that fetches each event's content", async () => {
