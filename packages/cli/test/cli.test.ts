@@ -396,3 +396,30 @@ describe("reading with no server", () => {
     expect(Inbox.peek("box").pending).toBe(1);
   });
 });
+
+describe("ls --all", () => {
+  it("lists every inbox here, with what it watches and the events waiting", async () => {
+    process.env.WATCHERONI_STATE_DIR = env.WATCHERONI_STATE_DIR;
+    const box = Inbox.open("box");
+    box.watch("octo/widgets#7", { owner: "octo", name: "widgets", number: 7 });
+    box.append([{
+      v: 1, id: "e1", sub: null, kind: "pr.opened", at: "t", received_at: "t",
+      repo: { id: 1, full_name: "octo/widgets" }, pr: 7, actor: null, data: {}, links: {},
+    }]);
+    box.close();
+    // A file is written once something changes: here, a watch since ended.
+    const empty = Inbox.open("cc-abc");
+    empty.watch("octo/widgets#8", { owner: "octo", name: "widgets", number: 8 });
+    empty.unwatch("octo/widgets#8");
+    empty.close();
+    const run = cli(["ls", "--all"], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(0);
+    expect(run.stdout()).toMatch(/^box:\n  octo\/widgets#7  since \S+\n  1 event\(s\) not yet read\.\ncc-abc:\n  watching nothing\.\n$/);
+  });
+
+  it("says so when there are none", async () => {
+    const run = cli(["ls", "--all"], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(0);
+    expect(run.stdout()).toBe("No inboxes on this machine.\n");
+  });
+});

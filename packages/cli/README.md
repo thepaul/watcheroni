@@ -208,6 +208,8 @@ printed and removed only once acknowledged, so a `wait` that gets killed
 loses nothing: the next one prints the same events. One process at a time
 uses an inbox. The inbox is `--inbox`, or `$WATCHERONI_INBOX`, or
 `cc-$CLAUDE_CODE_SESSION_ID` inside Claude Code, or `default`.
+`watcheroni ls --all` lists every inbox on this machine, Claude Code
+sessions' included, with what each watches and how many events wait in it.
 
 What local mode can't see that the server will: events between polls
 that undo each other (a thread resolved and then unresolved within one

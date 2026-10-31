@@ -1,4 +1,4 @@
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { INBOX_NAME, type UnsequencedEvent, type WatchEvent } from "@watcheroni/protocol";
@@ -72,6 +72,21 @@ export class Inbox {
     const inbox = new Inbox(name, dir);
     process.once("exit", () => inbox.close());
     return inbox;
+  }
+
+  // Every inbox on this machine, by name, for `ls --all`.
+  static names(): string[] {
+    let files: string[];
+    try {
+      files = readdirSync(join(stateDir(), "inboxes"));
+    } catch {
+      return [];
+    }
+    return files
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => f.slice(0, -".json".length))
+      .filter((n) => INBOX_NAME.test(n))
+      .sort();
   }
 
   // Reads an inbox without locking it, for `ls`.

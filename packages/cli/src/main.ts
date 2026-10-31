@@ -23,7 +23,7 @@ Usage:
   watcheroni exec   [target...] [--on kinds] [--batch] [--settle 5s] -- command [args...]
   watcheroni watch  [target...]
   watcheroni unwatch <target...>
-  watcheroni ls
+  watcheroni ls [--all]       what the inbox watches; --all: every inbox here
   watcheroni login | logout   sign in to the server ($WATCHERONI_SERVER)
   watcheroni selfhost [--help] run your own server (from a watcheroni clone)
 
@@ -62,6 +62,17 @@ export function parseDuration(s: string): number {
   return Number(m[1]) * unit;
 }
 
+// What an inbox watches and how many events wait in it, a line each.
+function describeInbox(name: string, nothing: string): string[] {
+  const { watched, repos, pending } = Inbox.peek(name);
+  return [
+    ...(!watched.length && !repos.length ? [nothing] : []),
+    ...watched.map((w) => `${targetKey(w.target)}  since ${w.addedAt}`),
+    ...repos.map((r) => `${repoKey(r.target)}  since ${r.addedAt}`),
+    ...(pending ? [`${pending} event(s) not yet read.`] : []),
+  ];
+}
+
 async function main(argv: string[]): Promise<number> {
   // Its options are the server script's own.
   if (argv[0] === "selfhost") return selfhost(argv.slice(1));
@@ -81,6 +92,7 @@ async function main(argv: string[]): Promise<number> {
       settle: { type: "string", default: "5s" },
       format: { type: "string", default: "text" },
       batch: { type: "boolean", default: false },
+      all: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
       version: { type: "boolean", short: "v", default: false },
     },
@@ -103,11 +115,15 @@ async function main(argv: string[]): Promise<number> {
   if (verb === "logout") return (await logout(), 0);
 
   if (verb === "ls") {
-    const { watched, repos, pending } = Inbox.peek(inboxName);
-    if (!watched.length && !repos.length) process.stdout.write(`Inbox ${inboxName} is watching nothing.\n`);
-    for (const w of watched) process.stdout.write(`${targetKey(w.target)}  since ${w.addedAt}\n`);
-    for (const r of repos) process.stdout.write(`${repoKey(r.target)}  since ${r.addedAt}\n`);
-    if (pending) process.stdout.write(`${pending} event(s) not yet read.\n`);
+    if (!opts.all) {
+      process.stdout.write(describeInbox(inboxName, `Inbox ${inboxName} is watching nothing.`).map((l) => `${l}\n`).join(""));
+      return 0;
+    }
+    const names = Inbox.names();
+    if (!names.length) process.stdout.write("No inboxes on this machine.\n");
+    for (const name of names) {
+      process.stdout.write(`${name}:\n${describeInbox(name, "watching nothing.").map((l) => `  ${l}\n`).join("")}`);
+    }
     return 0;
   }
   if (!["wait", "stream", "exec", "watch", "unwatch"].includes(verb)) {
