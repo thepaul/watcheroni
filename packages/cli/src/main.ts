@@ -4,7 +4,7 @@ import type { WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { loadServer } from "./config.ts";
 import { Feed } from "./feed.ts";
-import { formatText, footer } from "./format.ts";
+import { command, formatText, footer } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
@@ -42,9 +42,11 @@ Options:
   --settle TIME     wait and exec --batch: after the first event, wait this
                     long for more before printing or running the command
                     (default 5s; 0 goes with what the first read brought)
-  --json            wait: each event as a JSON line, then, on exit 0, 2 or
-                    3, {"result":"events|timeout|ended","watching":[...]};
-                    stream: JSON lines, as without it; ls: one JSON value
+  --json            wait and stream: each event as a JSON line, with
+                    "command", the one that fetches its content (or null);
+                    wait then ends, on exit 0, 2 or 3, with a line
+                    {"result":"events|timeout|ended","watching":[...]};
+                    ls: one JSON value
 
 wait exits 0 after printing events, 2 on timeout, 3 when every watched PR
 has ended (never while a whole repository is watched), 4 when GitHub
@@ -322,7 +324,7 @@ async function main(argv: string[]): Promise<number> {
       case "wait":
         return await waitCommand(feed, { kinds, interval, timeout: parseDuration(opts.timeout), settle: parseDuration(opts.settle), output: opts.json ? "lines" : opts.format === "json" ? "object" : "text", inbox: inboxName });
       case "stream":
-        return await streamCommand(feed, { kinds, interval });
+        return await streamCommand(feed, { kinds, interval, json: opts.json });
       case "exec":
         return await execCommand(feed, { kinds, interval, batch: opts.batch, settle: parseDuration(opts.settle), command });
     }
@@ -342,7 +344,7 @@ async function waitCommand(
   const deadline = Date.now() + o.timeout;
   // --json: a line per event, then one saying how the wait ended.
   const lines = (events: WatchEvent[], result: "events" | "timeout" | "ended", watching: string[]) =>
-    [...events, { result, watching }].map((v) => `${JSON.stringify(v)}\n`).join("");
+    [...events.map(withCommand), { result, watching }].map((v) => `${JSON.stringify(v)}\n`).join("");
   // A server inbox still being read with no PR known to be watched.
   const reading = () => (feed.ended() ? undefined : o.inbox);
   // Events left from before (a killed wait, say) come out first.
@@ -383,10 +385,14 @@ async function waitCommand(
   }
 }
 
-async function streamCommand(feed: Feed, o: { kinds: string[]; interval: number }): Promise<number> {
+// An event as `--json` prints it: with the command that fetches its
+// content, or null.
+const withCommand = (e: WatchEvent) => ({ ...e, command: command(e) });
+
+async function streamCommand(feed: Feed, o: { kinds: string[]; interval: number; json: boolean }): Promise<number> {
   for (;;) {
     for (const item of feed.wanted(o.kinds)) {
-      process.stdout.write(`${JSON.stringify(item.event)}\n`);
+      process.stdout.write(`${JSON.stringify(o.json ? withCommand(item.event) : item.event)}\n`);
       feed.ack([item]);
     }
     if (feed.ended()) return EXIT.ended;

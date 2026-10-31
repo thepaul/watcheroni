@@ -40,7 +40,8 @@ Other commands:
 - `watcheroni unwatch owner/repo#123`: stop watching a PR.
 - `watcheroni stream`: print each event as a JSON line until killed.
 - `watcheroni exec -- command`: run a command for each event.
-- `watcheroni wait --json`: each event as a JSON line, then (on exit 0,
+- `watcheroni wait --json`: each event as a JSON line, with `command`,
+  the `gh` command that fetches its content (or null), then (on exit 0,
   2 or 3) a line `{"result":"events|timeout|ended","watching":[...]}`.
 - `watcheroni ls --json`: what the inbox watches, as JSON.
 - `watcheroni --help`: the rest, including whole-repository watches

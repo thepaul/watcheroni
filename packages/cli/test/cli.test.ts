@@ -94,6 +94,11 @@ describe("wait against a server", () => {
     expect(await run.code).toBe(0);
     const lines = run.stdout().trimEnd().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
     expect(lines.map((l) => l.kind ?? l.result)).toEqual(["review.submitted", "comment.created", "events"]);
+    expect(lines.map((l) => l.command)).toEqual([
+      "gh api repos/octo/widgets/pulls/7/reviews/5 --jq '.state, .body'",
+      "gh api repos/octo/widgets/issues/comments/9 --jq .body",
+      undefined,
+    ]);
     expect(lines[2]).toEqual({ result: "events", watching: [] });
     expect(fake.inbox("box").acked).toBe(2);
   });
@@ -339,13 +344,17 @@ describe("stream against a server", () => {
     expect(run.stdout().trim().split("\n").map((l) => (JSON.parse(l) as { kind: string }).kind)).toEqual(["comment.created", "review.submitted"]);
   });
 
-  it("takes --json, which is what it prints anyway", async () => {
-    fake.inject("box", "comment.created");
+  it("with --json, adds the command that fetches each event's content", async () => {
+    fake.inject("box", "comment.created", { comment_id: 9 });
+    fake.inject("box", "pr.pushed");
     const run = cli(["stream", "--json"]);
-    await until(() => fake.inbox("box").acked === 1);
+    await until(() => fake.inbox("box").acked === 2);
     run.kill();
     await run.code;
-    expect((JSON.parse(run.stdout()) as { kind: string }).kind).toBe("comment.created");
+    expect(run.stdout().trim().split("\n").map((l) => JSON.parse(l) as { kind: string; command: string | null }).map((e) => [e.kind, e.command])).toEqual([
+      ["comment.created", "gh api repos/octo/widgets/issues/comments/9 --jq .body"],
+      ["pr.pushed", null],
+    ]);
   });
 });
 

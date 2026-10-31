@@ -84,12 +84,13 @@ below).
   command that fetches each one's content, and exits. Exit codes: `0`
   events, `2` timeout, `3` every watched PR has ended, `4` no GitHub
   credentials, `1` other errors. With `--json` it prints each event as a
-  JSON line instead, then a last line saying how it ended:
+  JSON line instead, with `"command"` added: the same `gh` command the text
+  shows for it, or `null`. A last line says how it ended:
   `{"result":"events","watching":["octo/widgets#7"]}`, with `"timeout"` or
   `"ended"` in place of `"events"` for exit codes 2 and 3. (`--format json`,
   from before `--json`, still prints one object holding all the events.)
-- **`stream`** prints each event as a JSON line until killed (`--json` is
-  accepted, and changes nothing).
+- **`stream`** prints each event as a JSON line until killed; `--json`
+  adds `"command"` to each, as for `wait`.
 - **`exec`** runs a command per event, with the event as JSON on stdin and
   `WATCHERONI_KIND`, `_REPO`, `_PR`, `_URL` and `_EVENT_ID` in its
   environment. An event is acknowledged only when the command exits 0.

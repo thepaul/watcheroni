@@ -75,6 +75,12 @@ function describeAll(events: WatchEvent[]): string[] {
   return lines;
 }
 
+// The command that fetches one event's content, for `--json`. A review's
+// comments each get their own, where the text lists them together.
+export function command(e: WatchEvent): string | null {
+  return describe(e)[1];
+}
+
 function describe(e: WatchEvent): [string, string | null] {
   const d = e.data;
   const repo = repoPath(e);

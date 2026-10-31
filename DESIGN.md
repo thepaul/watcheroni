@@ -1038,10 +1038,11 @@ watcheroni config [get | set] <key> [value]
 
 ### Output for agents
 
-`wait` prints text by default (`--json` for scripts and agents that parse
-it: a JSON line per event, then, on exit 0, 2 or 3, `{"result": "events" |
-"timeout" | "ended", "watching": [...]}`; the older `--format json` prints one object), written so an
-agent can act on it without reading docs:
+`wait` prints text by default, written so an agent can act on it without
+reading docs. (`--json` is for scripts and agents that parse it: a JSON
+line per event, with `"command"`, the `gh` command shown below or null,
+then, on exit 0, 2 or 3, `{"result": "events" | "timeout" | "ended",
+"watching": [...]}`. The older `--format json` prints one object.) The text:
 
 ```
 octo/widgets#123: 3 new events
