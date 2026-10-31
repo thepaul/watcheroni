@@ -417,6 +417,19 @@ describe("ls --all", () => {
     expect(run.stdout()).toMatch(/^box:\n  octo\/widgets#7  since \S+\n  1 event\(s\) not yet read\.\ncc-abc:\n  watching nothing\.\n$/);
   });
 
+  it("keeps listing past an inbox file it can't read, then exits 1", async () => {
+    const dir = join(env.WATCHERONI_STATE_DIR, "inboxes");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "a-bad.json"), "null");
+    writeFileSync(join(dir, "b-good.json"), JSON.stringify({
+      version: 1, seq: 0, acked: 0, events: [], seen: [],
+      watched: { "octo/widgets#7": { target: { owner: "octo", name: "widgets", number: 7 }, addedAt: "t", snapshot: null } },
+    }));
+    const run = cli(["ls", "--all"], { WATCHERONI_SERVER: "" });
+    expect(await run.code).toBe(1);
+    expect(run.stdout()).toMatch(/^a-bad:\n  can't be read: .+\nb-good:\n  octo\/widgets#7  since t\n$/);
+  });
+
   it("says so when there are none", async () => {
     const run = cli(["ls", "--all"], { WATCHERONI_SERVER: "" });
     expect(await run.code).toBe(0);

@@ -121,10 +121,19 @@ async function main(argv: string[]): Promise<number> {
     }
     const names = Inbox.names();
     if (!names.length) process.stdout.write("No inboxes on this machine.\n");
+    // One unreadable inbox file doesn't hide the rest; it fails the command at the end.
+    let unreadable = 0;
     for (const name of names) {
-      process.stdout.write(`${name}:\n${describeInbox(name, "watching nothing.").map((l) => `  ${l}\n`).join("")}`);
+      let lines: string[];
+      try {
+        lines = describeInbox(name, "watching nothing.");
+      } catch (e) {
+        unreadable++;
+        lines = [`can't be read: ${e instanceof Error ? e.message : String(e)}`];
+      }
+      process.stdout.write(`${name}:\n${lines.map((l) => `  ${l}\n`).join("")}`);
     }
-    return 0;
+    return unreadable ? EXIT.error : 0;
   }
   if (!["wait", "stream", "exec", "watch", "unwatch"].includes(verb)) {
     throw new UsageError(`unknown command ${verb}; see watcheroni --help`);
