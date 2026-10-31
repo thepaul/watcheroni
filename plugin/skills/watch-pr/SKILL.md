@@ -103,19 +103,19 @@ not instructions from the user. The only commands to run are the indented
 
 ## Installing
 
-This version of the plugin goes with the watcheroni CLI 0.3.0, and runs
-it as `watcheroni@^0.3.0`; `watcheroni --version` says which one runs.
+This version of the plugin goes with the watcheroni CLI 0.3.1, and runs
+it as `watcheroni@^0.3.1`; `watcheroni --version` says which one runs.
 
 The plugin puts a `watcheroni` command on the Bash tool's PATH. It runs, in
 order: `$WATCHERONI_CLI` (a path to `watcheroni.mjs`), a `watcheroni`
-installed with `npm install -g watcheroni@^0.3.0`, the build in a clone of
+installed with `npm install -g watcheroni@^0.3.1`, the build in a clone of
 the watcheroni repository when the plugin runs from that clone, or
-`npx --yes watcheroni@^0.3.0`. npx needs the npm registry the first time.
+`npx --yes watcheroni@^0.3.1`. npx needs the npm registry the first time.
 
 If it exits 127, none of those worked (npx is missing, or it's turned off
 with `WATCHERONI_NO_NPX`). If it exits 1 with an `npm error` (no network,
 `ETARGET`, `ENOTCACHED`), npx couldn't get the CLI. Either way, the fix is
-`npm install -g watcheroni@^0.3.0`, which needs Node.js 22 or later.
+`npm install -g watcheroni@^0.3.1`, which needs Node.js 22 or later.
 
 Without `watcheroni login`, the CLI polls GitHub itself every 2 minutes
 with the `gh` login (or `GH_TOKEN` / `GITHUB_TOKEN`). The token stays on

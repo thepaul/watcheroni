@@ -1,6 +1,6 @@
 {
   "name": "watcheroni",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "The watcheroni CLI for Claude Code: wait in the background for CI checks, reviews, comments, pushes and merges on GitHub pull requests",
   "author": {
     "name": "Paul Cannon"
