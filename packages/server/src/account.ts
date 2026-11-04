@@ -193,6 +193,9 @@ export class Account extends DurableObject<Env> {
       -- Where each inbox deleted for being idle had got to, so one made
       -- again under its name carries on from there.
       CREATE TABLE IF NOT EXISTS deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER NOT NULL, acked INTEGER NOT NULL);
+      -- When a subscription to each inbox was last asked for, so it isn't
+      -- taken for idle while the Worker makes one (checkSubscription).
+      CREATE TABLE IF NOT EXISTS subscribing (inbox TEXT PRIMARY KEY, at INTEGER NOT NULL);
     `);
   }
 
@@ -321,16 +324,18 @@ export class Account extends DurableObject<Env> {
   }
 
   // Is there room for the inbox, if it's new? At the cap, deletes the
-  // inboxes nobody has read for INBOX_IDLE_DAYS, if nothing is subscribed
-  // or connected to them, to make some.
+  // inboxes nobody has read (or asked to subscribe to) for
+  // INBOX_IDLE_DAYS, if nothing is subscribed or connected to them, to
+  // make some.
   private roomForInbox(name: string): { ok: true } | Refusal {
     if (this.inbox(name)) return { ok: true };
     const count = () => this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM inboxes").one().n;
     if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
     const idle = this.sql
       .exec<{ name: string }>(
-        `SELECT name FROM inboxes WHERE MAX(created_at, COALESCE(last_read_at, 0)) < ?
-         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.inbox = inboxes.name)`,
+        `SELECT name FROM inboxes WHERE MAX(created_at, COALESCE(last_read_at, 0)) < ?1
+         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.inbox = inboxes.name)
+         AND NOT EXISTS (SELECT 1 FROM subscribing WHERE subscribing.inbox = inboxes.name AND subscribing.at >= ?1)`,
         Date.now() - INBOX_IDLE_DAYS * 24 * 3600 * 1000,
       )
       .toArray();
@@ -339,6 +344,7 @@ export class Account extends DurableObject<Env> {
       this.sql.exec("DELETE FROM events WHERE inbox = ?", old);
       this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ?", old);
       this.sql.exec("DELETE FROM inboxes WHERE name = ?", old);
+      this.sql.exec("DELETE FROM subscribing WHERE inbox = ?", old);
     }
     if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
     return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many inboxes on this account (at most ${ACCOUNT_MAX_INBOXES})` };
@@ -370,19 +376,33 @@ export class Account extends DurableObject<Env> {
   }
 
   // RPC, before subscribing: does the inbox exist, and is there room for
-  // another subscription?
+  // another subscription? The Worker calls RepoHub before saveSubscription,
+  // and other requests run here meanwhile, so this notes the inbox in
+  // `subscribing`: roomForInbox, making room for another inbox, then won't
+  // take it for idle for INBOX_IDLE_DAYS. (Not by setting `last_read_at`,
+  // which would also keep the inbox's subscriptions from expiring.)
   checkSubscription(inbox: string): SubscriptionCheck {
     if (!this.inbox(inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
     const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions").one().n;
     if (n >= ACCOUNT_MAX_SUBSCRIPTIONS) {
       return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many subscriptions on this account (at most ${ACCOUNT_MAX_SUBSCRIPTIONS})` };
     }
+    this.open();
+    this.sql.exec(
+      "INSERT INTO subscribing (inbox, at) VALUES (?, ?) ON CONFLICT (inbox) DO UPDATE SET at = excluded.at",
+      inbox, Date.now(),
+    );
     return { ok: true };
   }
 
-  // RPC, once RepoHub has the subscription.
-  saveSubscription(sub: SubscriptionInfo): void {
+  // RPC, once RepoHub has the subscription. Refuses if the inbox is gone
+  // after all, so no subscription is ever kept for a missing inbox (which
+  // deliveries would make again, past the cap); the Worker then takes it
+  // back from RepoHub. This runs without an await, so nothing can delete
+  // the inbox between the check and the insert.
+  saveSubscription(sub: SubscriptionInfo): SubscriptionCheck {
     const { baseline: _, ...rest } = sub;
+    if (!this.inbox(rest.inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
     this.open();
     this.sql.exec(
       `INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at, verified_until)
@@ -393,6 +413,7 @@ export class Account extends DurableObject<Env> {
       Date.parse(rest.created_at), Date.parse(rest.expires_at),
       rest.verified_until === null ? null : Date.parse(rest.verified_until),
     );
+    return { ok: true };
   }
 
   // RPC: an inbox's subscriptions, oldest first, or null if there's no

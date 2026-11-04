@@ -140,7 +140,13 @@ export async function createSubscription(
     verified_until: sub.verified_until === null ? null : new Date(sub.verified_until).toISOString(),
     state: "active",
   };
-  await account.saveSubscription(info);
+  const saved = await account.saveSubscription(info);
+  if (!saved.ok) {
+    // The inbox went meanwhile. checkSubscription makes that all but
+    // impossible; if it happens anyway, take back what RepoHub just made.
+    if (result.created) await repoHubStub(env, repo.id).unsubscribe(sub.id);
+    return problem(saved.status, saved.code, saved.detail);
+  }
   await installation.addRepo(repo.id);
   if (result.needs_open_prs) await rememberOpenPrs(env, installation, found.id, repo.full_name, repo.id);
   if (baseline) {

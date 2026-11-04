@@ -12,6 +12,7 @@ import {
   type EventsPage,
   type LoginResponse,
   type ServerMessage,
+  type SubscriptionInfo,
 } from "../src/protocol";
 
 const BASE = "https://watcheroni.test";
@@ -518,6 +519,37 @@ describe("per-account caps", () => {
     expect(got[0]).toMatchObject({ type: "ready", head: 6, acked: 3 });
     expect(eventsOf(got).map((e) => [e.seq, e.kind])).toEqual([[5, "inbox.gap"], [6, "debug.ping"]]);
     ws.close();
+  });
+
+  it("keeps an inbox a subscription is being made for, even at the cap", async () => {
+    const { call, stub } = await account();
+    expect((await call("/v1/inboxes/target", { method: "PUT" })).status).toBe(200);
+    const old = Date.now() - (INBOX_IDLE_DAYS + 1) * 24 * 3600 * 1000;
+    await runInDurableObject(stub, (_, state) => {
+      for (let i = 1; i < ACCOUNT_MAX_INBOXES; i++) {
+        state.storage.sql.exec("INSERT INTO inboxes (name, created_at) VALUES (?, ?)", `fake${i}`, Date.now());
+      }
+      state.storage.sql.exec("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'target'", old, old);
+    });
+    const now = new Date().toISOString();
+    const sub: SubscriptionInfo = {
+      id: "sub_race", inbox: "target", repo: { id: 1, full_name: "o/r", private: false }, pr: 1, kinds: [],
+      ignore: { self: false, bots: false, actors: [] }, created_at: now, expires_at: now, verified_until: null, state: "active",
+    };
+    // The Worker checks, then calls RepoHub, then saves. A PUT in between
+    // finds a subscription being made to the inbox, so not idle: no room.
+    expect(await stub.checkSubscription("target")).toEqual({ ok: true });
+    expect((await call("/v1/inboxes/newcomer", { method: "PUT" })).status).toBe(422);
+    expect(await stub.saveSubscription(sub)).toEqual({ ok: true });
+    expect((await stub.listSubscriptions("target"))?.map((s) => s.id)).toEqual(["sub_race"]);
+
+    // Had it gone anyway, the save is refused rather than kept for no inbox.
+    expect(await stub.checkSubscription("fake1")).toEqual({ ok: true });
+    await runInDurableObject(stub, (_, state) => {
+      state.storage.sql.exec("DELETE FROM inboxes WHERE name = 'fake1'");
+    });
+    expect(await stub.saveSubscription({ ...sub, id: "sub_lost", inbox: "fake1" })).toMatchObject({ ok: false, status: 404, code: "not_found" });
+    expect(await stub.getSubscription("fake1", "sub_lost")).toBeNull();
   });
 
   it(`allows ${ACCOUNT_MAX_SOCKETS} WebSockets, closes more with 4029, and counts across hibernation`, async () => {

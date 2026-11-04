@@ -2,11 +2,12 @@ import examples from "@octokit/webhooks-examples/api.github.com/index.json";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { Account } from "../src/account";
 import { appJwt } from "../src/app";
 import { Installation } from "../src/installation";
 import { installUrl } from "../src/subscriptions";
-import type { LoginResponse, Meta, SubscriptionInfo, SubscriptionsResponse, WatchEvent } from "../src/protocol";
-import type { RepoHubStats } from "../src/repo-hub";
+import { ACCOUNT_MAX_INBOXES, INBOX_IDLE_DAYS, type LoginResponse, type Meta, type SubscriptionInfo, type SubscriptionsResponse, type WatchEvent } from "../src/protocol";
+import { RepoHub, type RepoHubStats } from "../src/repo-hub";
 import { sign } from "../src/webhook/signature";
 
 const BASE = "https://watcheroni.test";
@@ -353,6 +354,54 @@ describe("subscribing to a public repo", () => {
     expect(res.status).toBe(404);
     expect((await call("/v1/inboxes/nope/subscriptions", { headers: user.auth })).status).toBe(404);
     expect((await hubStats(repo.id)).subscriptions).toEqual([]);
+  });
+
+  // A subscription to `box`, the account's only idle inbox, at the inbox
+  // cap, with a PUT of another inbox in the window between the Worker's
+  // checkSubscription and saveSubscription (while RepoHub subscribes).
+  async function subscribeDuringPut() {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${user.id}`));
+    const old = Date.now() - (INBOX_IDLE_DAYS + 1) * 24 * 3600 * 1000;
+    await runInDurableObject(account, (_, state) => {
+      for (let i = 1; i < ACCOUNT_MAX_INBOXES; i++) {
+        state.storage.sql.exec("INSERT INTO inboxes (name, created_at) VALUES (?, ?)", `fake${i}`, Date.now());
+      }
+      state.storage.sql.exec("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'box'", old, old);
+    });
+    const real = RepoHub.prototype.subscribe;
+    let put = 0;
+    // Async, which RPC callers await all the same.
+    const late = async function (this: RepoHub, ...args: Parameters<RepoHub["subscribe"]>) {
+      put = (await call("/v1/inboxes/newcomer", { method: "PUT", headers: user.auth })).status;
+      return real.apply(this, args);
+    };
+    vi.spyOn(RepoHub.prototype, "subscribe").mockImplementation(late as unknown as RepoHub["subscribe"]);
+    const res = await subscribe(user.auth, { repo: fullName(repo), pr: 7 });
+    return { user, repo, account, res, put };
+  }
+
+  it("keeps its idle inbox from a PUT at the inbox cap while RepoHub subscribes", async () => {
+    // checkSubscription noted `box` as being subscribed to, so the PUT finds no room.
+    const { user, res, put } = await subscribeDuringPut();
+    expect(put).toBe(422);
+    expect(res.status).toBe(201);
+    const sub = await res.json<SubscriptionInfo>();
+    expect((await list(user.auth)).map((s) => s.id)).toEqual([sub.id]);
+  });
+
+  it("takes the subscription back from RepoHub if its inbox goes meanwhile", async () => {
+    // As it would if checkSubscription didn't note the inbox: the
+    // PUT deletes `box` to make room.
+    vi.spyOn(Account.prototype, "checkSubscription").mockReturnValue({ ok: true });
+    const { repo, account, res, put } = await subscribeDuringPut();
+    expect(put).toBe(200);
+    expect(res.status).toBe(404);
+    expect(await res.json()).toMatchObject({ code: "not_found", title: "No such inbox" });
+    expect((await hubStats(repo.id)).subscriptions).toEqual([]);
+    expect(await runInDurableObject(account, (_, state) => state.storage.sql.exec("SELECT id FROM subscriptions").toArray())).toEqual([]);
   });
 
   it("rejects malformed requests without asking GitHub", async () => {

@@ -497,9 +497,14 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   installation token as the baseline (404 is `not_found`); the account's
   quota (`Account.checkSubscription`: the inbox must exist, at most 200
   subscriptions); `RepoHub.subscribe`; then `Account.saveSubscription`
-  and `Installation.addRepo`. Account keeps the index that `GET` and
-  `DELETE` read, and drops a row when a `watch.*` event for it is
-  delivered, so it follows RepoHub ending watches.
+  and `Installation.addRepo`. Other requests reach Account between its
+  two calls, so `checkSubscription` notes the inbox in `subscribing`,
+  which keeps it from being deleted as idle for 30 days, and
+  `saveSubscription` checks again that it exists (refusing, and the
+  Worker taking the subscription back from RepoHub, if not). Account
+  keeps the index that `GET` and `DELETE` read, and drops a row when a
+  `watch.*` event for it is delivered, so it follows RepoHub ending
+  watches.
 - The install URL (in `/v1/meta`, `app_not_installed` and the landing
   page) comes from the `GITHUB_APP_SLUG` var, through `installUrl(env)`
   in `src/subscriptions.ts`; a self-hosted copy has its own App.
