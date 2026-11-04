@@ -497,7 +497,11 @@ export class ServerReader {
   private add(events: WatchEvent[]): void {
     let added = false;
     for (const e of events) {
-      if (this.pos !== null && e.seq <= this.pos) continue;
+      // An `inbox.gap` for a position ahead of the inbox's `head` takes it
+      // back (PROTOCOL.md, "Gaps"); what's queued past it is from before.
+      const back = e.kind === "inbox.gap" && this.pos !== null && e.seq < this.pos && e.data.missed_after === this.pos;
+      if (back) this.queue = this.queue.filter((q) => q.seq < e.seq);
+      else if (this.pos !== null && e.seq <= this.pos) continue;
       this.pos = e.seq;
       if (this.seen.has(e.id)) continue;
       this.seen.add(e.id);

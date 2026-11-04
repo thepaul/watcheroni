@@ -12,6 +12,7 @@ import {
   type EventsPage,
   type LoginResponse,
   type ServerMessage,
+  type SubscriptionInfo,
 } from "../src/protocol";
 
 const BASE = "https://watcheroni.test";
@@ -114,6 +115,15 @@ describe("long-polling", () => {
 
   it("404s for an unknown inbox", async () => {
     expect((await call("/v1/inboxes/nope-never-made/events")).status).toBe(404);
+  });
+
+  it("refuses an after that isn't a non-negative integer, as hello does", async () => {
+    const inbox = await newInbox();
+    for (const after of ["-1", "1.5", "x", "", "99999999999999999999"]) {
+      const res = await call(`/v1/inboxes/${inbox}/events?after=${after}`);
+      expect(res.status, after).toBe(400);
+      expect(await res.json()).toMatchObject({ code: "invalid_request" });
+    }
   });
 });
 
@@ -321,6 +331,36 @@ describe("gaps", () => {
     expect(await alarmAt(account)).toBeNull();
   });
 
+  it("brings a position ahead of head back with inbox.gap, then everything kept", async () => {
+    const inbox = await newInbox();
+    await inject(inbox, { count: 3 });
+    await age(inbox, 1);
+    const page = await read(inbox, "?after=9&wait=30");
+    expect(page.events.map((e) => [e.seq, e.kind])).toEqual([[1, "inbox.gap"], [2, "debug.ping"], [3, "debug.ping"]]);
+    expect(page.events[0].data).toEqual({ missed_after: 9, resumed_at: 2 });
+    expect(page).toMatchObject({ next: 3, head: 3 });
+    // From where that leaves it, it's an ordinary reader.
+    expect((await read(inbox, "?after=3")).events).toEqual([]);
+
+    // Over the WebSocket too; new events follow without another gap.
+    const c = await connect(inbox);
+    c.ws.send(JSON.stringify({ type: "hello", after: Number.MAX_SAFE_INTEGER }));
+    await c.waitFor((m) => eventsOf(m).length === 3);
+    expect(eventsOf(c.messages).map((e) => [e.seq, e.kind])).toEqual([[1, "inbox.gap"], [2, "debug.ping"], [3, "debug.ping"]]);
+    expect(eventsOf(c.messages)[0].data).toEqual({ missed_after: Number.MAX_SAFE_INTEGER, resumed_at: 2 });
+    await inject(inbox);
+    await c.waitFor((m) => eventsOf(m).length === 4);
+    expect(eventsOf(c.messages)[3]).toMatchObject({ seq: 4, kind: "debug.ping" });
+    c.ws.close();
+
+    // With nothing kept, the gap takes `head`.
+    await age(inbox, 4);
+    const empty = await read(inbox, "?after=9");
+    expect(empty.events.map((e) => [e.seq, e.kind])).toEqual([[4, "inbox.gap"]]);
+    expect(empty.events[0].data).toEqual({ missed_after: 9, resumed_at: 5 });
+    expect(empty.next).toBe(4);
+  });
+
   it("sends none to a reader that missed nothing", async () => {
     const inbox = await newInbox();
     expect((await read(inbox)).events).toEqual([]);
@@ -328,8 +368,6 @@ describe("gaps", () => {
     await inject(inbox, { count: 2 });
     expect((await read(inbox, "?after=0")).events.map((e) => e.kind)).toEqual(["debug.ping", "debug.ping"]);
     expect((await read(inbox, "?after=2")).events).toEqual([]);
-    // A position ahead of `head` (say, from an inbox since deleted and made again).
-    expect((await read(inbox, "?after=9")).events).toEqual([]);
     const c = await connect(inbox);
     c.ws.send(JSON.stringify({ type: "hello" }));
     await c.waitFor((m) => eventsOf(m).length === 2);
@@ -432,6 +470,86 @@ describe("per-account caps", () => {
     }));
     expect(left).toEqual({ inboxes: ["fake1"], events: 0 });
     expect((await call("/v1/inboxes/and-another", { method: "PUT" })).status).toBe(422);
+  });
+
+  it("makes a deleted inbox again where it left off, so old positions are behind, never ahead", async () => {
+    const { call, stub, inject } = await account();
+    const read = async (query: string) => (await call(`/v1/inboxes/gone/events${query}`)).json<EventsPage>();
+    expect((await call("/v1/inboxes/gone", { method: "PUT" })).status).toBe(200);
+    for (let i = 0; i < 5; i++) await inject("gone");
+    await call("/v1/inboxes/gone/ack", { method: "POST", body: JSON.stringify({ seq: 3 }) });
+    const old = Date.now() - (INBOX_IDLE_DAYS + 1) * 24 * 3600 * 1000;
+    await runInDurableObject(stub, (_, state) => {
+      for (let i = 1; i < ACCOUNT_MAX_INBOXES; i++) {
+        state.storage.sql.exec("INSERT INTO inboxes (name, created_at) VALUES (?, ?)", `fake${i}`, Date.now());
+      }
+      state.storage.sql.exec("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'gone'", old, old);
+    });
+    expect((await call("/v1/inboxes/newcomer", { method: "PUT" })).status).toBe(200);
+    expect((await call("/v1/inboxes/gone/events")).status).toBe(404);
+
+    // Made again (with room for it), it carries on from head 5 and acked 3.
+    await runInDurableObject(stub, (_, state) => {
+      state.storage.sql.exec("DELETE FROM inboxes WHERE name = 'fake1'");
+    });
+    const made = await (await call("/v1/inboxes/gone", { method: "PUT" })).json<{ head: number; acked: number }>();
+    expect(made).toMatchObject({ head: 5, acked: 3 });
+    expect(await runInDurableObject(stub, (_, state) => state.storage.sql.exec("SELECT * FROM deleted_inboxes").toArray())).toEqual([]);
+
+    // A reader caught up when it went gets the new events, from seq 6; one
+    // behind, or one starting from acked, hears it missed some.
+    const poll = call("/v1/inboxes/gone/events?after=5&wait=30");
+    await sleep(200);
+    await inject("gone");
+    expect((await (await poll).json<EventsPage>()).events.map((e) => e.seq)).toEqual([6]);
+    for (const page of [await read("?after=3"), await read("")]) {
+      expect(page.events.map((e) => [e.seq, e.kind])).toEqual([[5, "inbox.gap"], [6, "debug.ping"]]);
+      expect(page.events[0].data).toEqual({ missed_after: 3, resumed_at: 6 });
+    }
+    // Over the WebSocket too.
+    const res = await call("/v1/inboxes/gone/ws", { headers: { Upgrade: "websocket" } });
+    const ws = res.webSocket!;
+    const got: ServerMessage[] = [];
+    ws.addEventListener("message", (ev) => {
+      got.push(JSON.parse(String(ev.data)));
+    });
+    ws.accept();
+    ws.send(JSON.stringify({ type: "hello", after: 4 }));
+    for (let i = 0; i < 200 && eventsOf(got).length < 2; i++) await sleep(10);
+    expect(got[0]).toMatchObject({ type: "ready", head: 6, acked: 3 });
+    expect(eventsOf(got).map((e) => [e.seq, e.kind])).toEqual([[5, "inbox.gap"], [6, "debug.ping"]]);
+    ws.close();
+  });
+
+  it("keeps an inbox a subscription is being made for, even at the cap", async () => {
+    const { call, stub } = await account();
+    expect((await call("/v1/inboxes/target", { method: "PUT" })).status).toBe(200);
+    const old = Date.now() - (INBOX_IDLE_DAYS + 1) * 24 * 3600 * 1000;
+    await runInDurableObject(stub, (_, state) => {
+      for (let i = 1; i < ACCOUNT_MAX_INBOXES; i++) {
+        state.storage.sql.exec("INSERT INTO inboxes (name, created_at) VALUES (?, ?)", `fake${i}`, Date.now());
+      }
+      state.storage.sql.exec("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'target'", old, old);
+    });
+    const now = new Date().toISOString();
+    const sub: SubscriptionInfo = {
+      id: "sub_race", inbox: "target", repo: { id: 1, full_name: "o/r", private: false }, pr: 1, kinds: [],
+      ignore: { self: false, bots: false, actors: [] }, created_at: now, expires_at: now, verified_until: null, state: "active",
+    };
+    // The Worker checks, then calls RepoHub, then saves. A PUT in between
+    // finds a subscription being made to the inbox, so not idle: no room.
+    expect(await stub.checkSubscription("target")).toEqual({ ok: true });
+    expect((await call("/v1/inboxes/newcomer", { method: "PUT" })).status).toBe(422);
+    expect(await stub.saveSubscription(sub)).toEqual({ ok: true });
+    expect((await stub.listSubscriptions("target"))?.map((s) => s.id)).toEqual(["sub_race"]);
+
+    // Had it gone anyway, the save is refused rather than kept for no inbox.
+    expect(await stub.checkSubscription("fake1")).toEqual({ ok: true });
+    await runInDurableObject(stub, (_, state) => {
+      state.storage.sql.exec("DELETE FROM inboxes WHERE name = 'fake1'");
+    });
+    expect(await stub.saveSubscription({ ...sub, id: "sub_lost", inbox: "fake1" })).toMatchObject({ ok: false, status: 404, code: "not_found" });
+    expect(await stub.getSubscription("fake1", "sub_lost")).toBeNull();
   });
 
   it(`allows ${ACCOUNT_MAX_SOCKETS} WebSockets, closes more with 4029, and counts across hibernation`, async () => {

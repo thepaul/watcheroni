@@ -28,7 +28,9 @@ The words MUST, SHOULD and MAY are used as in RFC 2119.
   own credentials.
 - **Sequence number (`seq`).** Each inbox numbers its events 1, 2, 3, ...
   with no reuse. A client's position in an inbox is the last `seq` it
-  has handled.
+  has handled. It normally only moves forward, but a position the
+  server never gave out is answered with an `inbox.gap` that moves the
+  client back (see "Gaps").
 - **Acknowledged position (`acked`).** The server stores one position per
   inbox, moved forward only by the client. A client with no local state
   (a new process, another machine) starts reading from there.
@@ -192,7 +194,11 @@ subscriptions are deleted after 30 days in which nothing read it.
 An account has at most `limits.inboxes_per_account` inboxes. Creating
 another, with `PUT` or by connecting a WebSocket to a new name, answers
 `422 quota_exceeded`, unless the server can first delete an inbox nobody
-has read for 30 days that has no subscriptions or connections left.
+has read for 30 days that has no subscriptions or connections left. An
+inbox deleted this way keeps its numbering: if its name is used again,
+`head` and `acked` carry on from where they were, as if all its events
+had expired, so a client still holding a position from before is told
+what it missed (see "Gaps").
 
 ```json
 {
@@ -341,7 +347,8 @@ GET /v1/inboxes/{name}/events?after=40&wait=300&limit=100
 ```
 
 - `after`: return events with `seq` greater than this. Leave it out to
-  start from `acked`.
+  start from `acked`. Anything but a non-negative integer is `400
+  invalid_request`.
 - `wait`: seconds to wait if nothing is there yet, up to
   `limits.max_wait_seconds`. `0` (the default) returns at once.
 - `limit`: at most this many events, up to 500.
@@ -448,6 +455,20 @@ gets one.
 
 The client should re-read the state of what it watches from GitHub
 directly.
+
+A position ahead of `head` is one the inbox never gave out: `seq`s are
+never reused, even by an inbox deleted and made again, and `ack` stops at
+`head`. The server can't say what such a client missed, so it answers
+with a gap too, followed by every event it keeps:
+
+```json
+{"seq": 0, "kind": "inbox.gap", "data": {"missed_after": 900, "resumed_at": 1}, ...}
+```
+
+Here `missed_after` is greater than the gap's `seq`: the client should
+move its position *back* to the gap's `seq` (not ignore it as an event
+it has already seen), and carry on from there. A gap's `seq` can be `0`,
+when `resumed_at` is `1`.
 
 ## Events
 

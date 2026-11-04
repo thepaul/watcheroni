@@ -423,7 +423,8 @@ and get through the CLI's own `--kinds` filter too.
 ### `inbox.gap`
 
 The reader's position is older than the oldest event the inbox still
-keeps, so it missed some. Re-read what it watches from GitHub.
+keeps, so it missed some; or it's ahead of the inbox's `head`, so the
+server can't say what it missed. Re-read what it watches from GitHub.
 
 `data`: `missed_after` (the reader's position), `resumed_at` (the `seq`
 of the first event kept after the gap).
@@ -431,8 +432,10 @@ of the first event kept after the gap).
 **Server:** at the start of a read (a long poll, or a WebSocket's
 `hello`) from a position before what the inbox keeps: its last 1,000
 events, none older than 7 days. It isn't stored; its `seq` is
-`resumed_at - 1`, so a reader that handles it is past the gap. The CLI
-always lets it through `--kinds`.
+`resumed_at - 1`, so a reader that handles it is past the gap. For a
+position ahead of `head`, `missed_after` is above that `seq`, which the
+reader moves back to, and every event kept follows. The CLI always lets
+it through `--kinds`.
 
 **Local mode:** Not sent.
 
