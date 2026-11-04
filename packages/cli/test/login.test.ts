@@ -298,6 +298,7 @@ describe("logging in again", () => {
   it("keeps the new key and only warns when the revoke fails", async () => {
     for (const fail of [
       async () => Response.json({}, { status: 500 }),
+      async () => Response.json({}, { status: 429 }),
       async () => {
         throw new Error("connection reset");
       },
@@ -307,7 +308,7 @@ describe("logging in again", () => {
       revokeWith(deps, calls, fail);
       await expect(login(SERVER, deps)).resolves.toMatchObject({ api_key: "wk2_7_secret2_tag" });
       expect(readCredentials().servers[SERVER]?.api_key).toBe("wk2_7_secret2_tag");
-      expect(printed.at(-1)).toMatch(/^(The server didn't revoke the previous key \(500\)|Couldn't reach .* to revoke the previous key \(connection reset\)); it stays live\.$/);
+      expect(printed.at(-1)).toMatch(/^(The server didn't revoke the previous key \((500|429)\)|Couldn't reach .* to revoke the previous key \(connection reset\)); it stays live\.$/);
     }
   });
 
@@ -317,9 +318,10 @@ describe("logging in again", () => {
       { api_key: "wk2_7_old_tag", account: { id: 7, login: "octocat" } },
     ]) {
       writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { [SERVER]: { ...old, github: {} } } }));
-      const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
+      const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }]);
       await login(SERVER, deps);
       expect(deletes(calls)).toEqual([[`${SERVER}/v1/keys/current`, `Bearer ${old.api_key}`]]);
+      expect(printed.at(-1)).toBe("Revoked the previous key.");
     }
   });
 
@@ -352,6 +354,16 @@ describe("logout", () => {
     expect(calls.at(-1)).toMatchObject({ url: `${SERVER}/v1/keys/current`, auth: "Bearer wk2_7_secret_tag" });
     expect(JSON.parse(readFileSync(process.env.WATCHERONI_CREDENTIALS!, "utf8")).servers).toEqual({});
     expect(await logout(SERVER, deps)).toBe(false);
+  });
+
+  it("forgets the credentials even when the revoke fails, saying so", async () => {
+    const { deps, printed } = fake([{ access_token: "ghu_tok" }]);
+    await login(SERVER, deps);
+    const fetch = deps.fetch;
+    deps.fetch = async (input, init) => (init?.method === "DELETE" ? Response.json({}, { status: 500 }) : fetch(input, init));
+    expect(await logout(SERVER, deps)).toBe(true);
+    expect(printed.at(-2)).toBe("The server didn't revoke the key (500); forgetting it anyway.");
+    expect(readCredentials().servers).toEqual({});
   });
 });
 

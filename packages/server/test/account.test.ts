@@ -159,10 +159,11 @@ describe("WebSocket", () => {
     for (const after of [-1, 1.5, "1"]) c.ws.send(JSON.stringify({ type: "hello", after }));
     await c.waitFor((m) => m.length === 3);
     expect(c.messages.map((m) => m.type === "error" && m.code)).toEqual(["invalid_request", "invalid_request", "invalid_request"]);
-    // Nothing was sent from those, and a good hello still works.
-    c.ws.send(JSON.stringify({ type: "hello", after: 1 }));
-    await c.waitFor((m) => eventsOf(m).length === 1);
-    expect(eventsOf(c.messages).map((e) => [e.seq, e.kind])).toEqual([[2, "debug.ping"]]);
+    // Nothing was sent from those, and a good hello still works: a null
+    // after, like none, starts from what's acked.
+    c.ws.send(JSON.stringify({ type: "hello", after: null }));
+    await c.waitFor((m) => eventsOf(m).length === 2);
+    expect(eventsOf(c.messages).map((e) => e.seq)).toEqual([1, 2]);
     c.ws.close();
   });
 

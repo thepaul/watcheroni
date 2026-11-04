@@ -131,8 +131,9 @@ the credentials file. The environment wins, and `WATCHERONI_SERVER=`
 `WATCHERONI_CREDENTIALS` moves just the credentials. Signing in again
 revokes the key it replaces, so a key you copied elsewhere (say, into
 CI's `WATCHERONI_API_KEY`) stops working when you sign in again on the
-machine it came from; to sign in for CI, give it its own credentials file
-with `WATCHERONI_CREDENTIALS`. `watcheroni logout` revokes the key and
+machine it came from. To get CI a key of its own, sign in to a separate
+file (`WATCHERONI_CREDENTIALS=ci-credentials.json watcheroni login`) and
+give CI that file's key. `watcheroni logout` revokes the key and
 forgets it.
 
 The server URL must be `https://`: the API key goes with every request,

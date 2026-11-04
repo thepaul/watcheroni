@@ -476,14 +476,15 @@ directly.
 - `v`: envelope version, always `1` in this protocol version.
 - `id`: stable across retries and redeliveries. For events from a webhook
   it's the GitHub delivery ID plus an index; for events about the watch
-  or the repo (`watch.*`, `repo.*`) it's made from what happened. Use it
-  to drop duplicates.
-- `sub`: which subscription matched. If two subscriptions in one inbox
-  match the same event, it's delivered once, naming the first.
+  or the repo (`watch.*`, `repo.*`), and for `inbox.gap`, it's made from
+  what happened. Use it to drop duplicates.
+- `sub`: which subscription matched, or `null` for `inbox.gap`. If two
+  subscriptions in one inbox match the same event, it's delivered once,
+  naming the first.
 - `at`: when it happened on GitHub, if GitHub says; else `received_at`.
 - `pr`: the PR number, or `null` for events not about a PR.
 - `actor`: who caused it, or `null` when that isn't known (as for
-  `watch.*` and `repo.*`).
+  `watch.*`, `repo.*` and `inbox.gap`).
 - `data`: depends on `kind` (below). Fields are metadata only.
 - `links.api`: the GitHub REST URL to fetch the content, where there is
   one.

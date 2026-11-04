@@ -606,7 +606,10 @@ export class Account extends DurableObject<Env> {
       const last = events[events.length - 1].seq;
       // Every page should move the position on; if one doesn't, stop
       // rather than send it forever.
-      if (last <= attachment.pos) return;
+      if (last <= attachment.pos) {
+        console.error(`inbox ${attachment.inbox}: a page from ${attachment.pos} ended at ${last}`);
+        return;
+      }
       attachment.pos = last;
       ws.serializeAttachment(attachment);
     }
