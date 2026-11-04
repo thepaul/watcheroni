@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { diff } from "../src/diff.ts";
+import { diff, unknownRuns } from "../src/diff.ts";
+import type { Snapshot } from "../src/snapshot.ts";
 import { HEAD1, HEAD2, alice, check, run, snap } from "./fixtures.ts";
 
 const kinds = (events: { kind: string }[]) => events.map((e) => e.kind);
@@ -172,12 +173,37 @@ describe("diff", () => {
       expect(kinds(diff(snap({ workflowRuns }), snap({ head: HEAD2, workflowRuns: [run()] })))).toEqual(["pr.pushed", "workflow.completed"]);
     }
 
-    // Without both polls' runs (a token that can't read Actions, or a
-    // snapshot saved before runs were read) there is nothing to compare.
+    // Without the last poll's runs (a token that couldn't read Actions,
+    // or a snapshot saved before runs were read), a finished run can't be
+    // told to have finished since, unless one of the last poll's checks
+    // shows it was still running then.
     expect(diff(snap({ workflowRuns: null }), snap({ workflowRuns: [run()] }))).toEqual([]);
+    expect(unknownRuns(snap({ workflowRuns: null }), snap({ workflowRuns: [run()] })).map((r) => r.id)).toEqual([500]);
     const { workflowRuns: _, ...old } = snap();
     expect(diff(old as never, snap({ workflowRuns: [run()] }))).toEqual([]);
     expect(diff(snap({ workflowRuns: [run({ done: false })] }), snap({ workflowRuns: null }))).toEqual([]);
+    expect(unknownRuns(snap({ workflowRuns: [run({ done: false })] }), snap({ workflowRuns: null }))).toEqual([]);
+  });
+
+  it("workflow runs: a run whose check was still running at the last poll, its runs unread", () => {
+    // Saved by a version that didn't read runs: run 500's lint job was
+    // running, run 600's had finished.
+    const { workflowRuns: _, ...old } = snap({
+      checks: [check("lint", { done: false, conclusion: null }), check("docs", { workflowRunId: 600 })],
+    });
+    const next = snap({
+      checks: [check("lint"), check("docs", { workflowRunId: 600 })],
+      workflowRuns: [run(), run({ id: 600, name: "Docs" }), run({ id: 700, done: false, conclusion: null })],
+    });
+    const events = diff(old as never, next).filter((e) => e.kind === "workflow.completed");
+    expect(events.map((e) => [e.data.run_id, e.data.conclusion])).toEqual([[500, "success"]]);
+    // Whether 600 finished since can't be known; 700 hasn't finished.
+    expect(unknownRuns(old as never, next).map((r) => r.id)).toEqual([600]);
+    // The same while runs couldn't be read.
+    expect(diff({ ...(old as Snapshot), workflowRuns: null }, next).filter((e) => e.kind === "workflow.completed")).toHaveLength(1);
+    // With the last poll's runs, or after a push, there's nothing unknown.
+    expect(unknownRuns(snap(), next)).toEqual([]);
+    expect(unknownRuns(old as never, { ...next, head: HEAD2 })).toEqual([]);
   });
 
   it("commit statuses", () => {

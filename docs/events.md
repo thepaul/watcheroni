@@ -44,9 +44,11 @@ miss:
   and beyond the 1,000 workflow runs GitHub lists for one commit;
 - checks and workflow runs on a commit that is no longer the head by the
   next poll (the server reports workflow runs finishing there);
-- workflow runs finishing before their head's runs have been read once:
-  on the head a watch starts on, while the runs can't be read
-  (`workflow.completed`, below).
+- workflow runs finishing before their head's runs have been read once
+  after the first poll: on the head a watch starts on, while the runs
+  can't be read, or with an inbox from watcheroni 0.3.2 or earlier, a
+  run whose checks had all finished by the last poll
+  (`workflow.completed`, below; the CLI names them on stderr).
 
 Its events' `at` is the time GitHub gives for reviews, comments and
 checks, and the time of the poll for everything else. Their `id`s start
@@ -349,13 +351,19 @@ and is completed with its real conclusion. While the runs can't be read
 (the GitHub login can't read the repo's Actions, or the request fails)
 nothing is sent; once they can again, runs that finished meanwhile are,
 compared with the head's runs as last read, or, after a push, as runs
-on a new head. Only on the head a watch starts on, before the runs have
-been read once, is there nothing to compare them with. The CLI says so on
-stderr, with GitHub's reason, once per run of the CLI while the runs
-can't be read, and once when they can again. A 403 is usually GitHub
-refusing the GitHub login access to them (a fine-grained token, for one,
-needs read access to the repo's Actions), unless GitHub's reason says
-it's a rate limit.
+on a new head. When a head's runs are read for the first time after the
+first poll (they couldn't be read until now, or the inbox was saved by
+watcheroni 0.3.2 or earlier, which didn't read them), a run that one of
+the last poll's checks showed still running is sent once it has
+finished; any other run already finished then can't be told to have
+finished since, so it isn't sent, and the CLI names those runs on
+stderr. The CLI says on stderr, with GitHub's reason, once per run of
+the CLI while the runs can't be read, and once when they can again. A
+403 there is GitHub refusing the GitHub login access to them (a
+fine-grained token, for one, needs read access to the repo's Actions).
+A 403 or 429 with `x-ratelimit-remaining: 0` or a `retry-after` header
+is a rate limit instead: the whole poll of that PR is tried again next
+time.
 
 ## The watch itself
 

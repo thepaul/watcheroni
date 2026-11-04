@@ -1,5 +1,5 @@
 import type { DataValue, UnsequencedEvent } from "@watcheroni/protocol";
-import type { Actor, Check, Snapshot } from "./snapshot.ts";
+import type { Actor, Check, Snapshot, WorkflowRun } from "./snapshot.ts";
 
 // Turns the change between two snapshots of a PR into the same event kinds
 // the server sends (PROTOCOL.md, "Kinds"), with IDs prefixed `local:`. The
@@ -131,13 +131,14 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
   // re-run is a new attempt of the same run, so its finishing counts too,
   // as does a run completed again with another conclusion (a fork's run
   // is completed as `action_required` until a maintainer approves it).
-  // Without both polls' runs there is nothing to compare.
-  const prevRuns = next.head === prev.head ? prev.workflowRuns ?? null : [];
-  if (prevRuns && next.workflowRuns) {
-    const before = new Map(prevRuns.map((r) => [r.id, r]));
+  // Without the last poll's runs, only those its checks show were still
+  // running can be told to have finished since (see runsBefore()).
+  const before = runsBefore(prev, next);
+  if (before && next.workflowRuns) {
     for (const r of next.workflowRuns) {
-      const b = before.get(r.id);
-      if (!r.done || (b?.done && b.attempt === r.attempt && b.conclusion === r.conclusion)) continue;
+      if (!r.done) continue;
+      const b = before.runs.get(r.id);
+      if (b ? b.done && b.attempt === r.attempt && b.conclusion === r.conclusion : !before.all) continue;
       emit("workflow.completed", `${r.id}:${r.attempt}:${r.conclusion}`, {
         head_sha: next.head, run_id: r.id, workflow: r.name, conclusion: r.conclusion,
       }, { at: r.at, html: r.url, api: r.api });
@@ -154,6 +155,32 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
   }
 
   return events;
+}
+
+// What's known of the workflow runs at the last poll, to compare `next`'s
+// with: `all` of them, by ID (none after a push, as every run on a new
+// head is new), or, when they weren't read (a snapshot saved before runs
+// were, or while they couldn't be), only the runs one of the last poll's
+// checks shows was still running then, as not done. Null when `next`'s
+// runs weren't read either.
+export function runsBefore(prev: Snapshot, next: Snapshot): { all: boolean; runs: Map<number, Pick<WorkflowRun, "done" | "attempt" | "conclusion">> } | null {
+  if (!next.workflowRuns) return null;
+  if (next.head !== prev.head) return { all: true, runs: new Map() };
+  if (prev.workflowRuns) return { all: true, runs: new Map(prev.workflowRuns.map((r) => [r.id, r])) };
+  const running = new Map<number, Pick<WorkflowRun, "done" | "attempt" | "conclusion">>();
+  for (const c of prev.checks) {
+    if (!c.done && c.workflowRunId !== null) running.set(c.workflowRunId, { done: false, attempt: 0, conclusion: null });
+  }
+  return { all: false, runs: running };
+}
+
+// Runs in `next` that had finished by a poll that couldn't compare them
+// with the last one's (see runsBefore()): whether they finished since the
+// last poll can't be known, so they aren't reported.
+export function unknownRuns(prev: Snapshot, next: Snapshot): WorkflowRun[] {
+  const before = runsBefore(prev, next);
+  if (!before || before.all) return [];
+  return next.workflowRuns!.filter((r) => r.done && !before.runs.has(r.id));
 }
 
 function isFailed(c: Check): boolean {

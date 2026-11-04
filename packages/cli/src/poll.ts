@@ -1,5 +1,5 @@
 import type { WatchEvent } from "@watcheroni/protocol";
-import { diff, type LocalKind } from "./diff.ts";
+import { diff, type LocalKind, unknownRuns } from "./diff.ts";
 import { GitHubError, LoginNeeded } from "./github.ts";
 import type { Inbox } from "./inbox.ts";
 import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
@@ -57,7 +57,6 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       }
     } else {
       unreadableRuns.delete(key);
-      if (w.snapshot?.workflowRunsError) log(`${key}: its workflow runs can be read again`);
     }
     if (!w.snapshot) {
       if (next.state !== "OPEN") {
@@ -88,6 +87,19 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
     if (next.workflowRuns === null) {
       next = { ...next, workflowRuns: next.head === w.snapshot.head ? w.snapshot.workflowRuns ?? null : [] };
     }
+    // Runs read for the first time on a head after the first poll (a
+    // snapshot saved before runs were read, or runs that couldn't be read
+    // until now) can't all be compared with the last poll's: said once.
+    const unknown = unknownRuns(w.snapshot, next);
+    let missed = "";
+    if (unknown.length) {
+      const ids = unknown.slice(0, 10).map((r) => r.id).join(", ") + (unknown.length > 10 ? `, and ${unknown.length - 10} more` : "");
+      missed = unknown.length === 1
+        ? `; workflow run ${ids} had already finished, so if it finished since the last poll, no workflow.completed is sent for it`
+        : `; workflow runs ${ids} had already finished, so any of them that finished since the last poll gets no workflow.completed`;
+    }
+    if (w.snapshot.workflowRunsError && !next.workflowRunsError) log(`${key}: its workflow runs can be read again${missed}`);
+    else if (missed) log(`${key}: read its workflow runs on this head for the first time${missed}`);
     const events = diff(w.snapshot, next);
     added.push(...inbox.record(key, next, events));
     if (events.some((e) => e.kind === "watch.ended")) {

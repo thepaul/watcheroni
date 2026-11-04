@@ -5,7 +5,7 @@ import type { UnsequencedEvent, WatchEvent } from "@watcheroni/protocol";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
 import { clean, formatText, toJson } from "../src/format.ts";
-import { GitHubError, graphql } from "../src/github.ts";
+import { GitHubError, graphql, restList } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { forgetWarnings, pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
@@ -220,6 +220,37 @@ describe("polling", () => {
       "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
     ]);
     inbox.close();
+  });
+
+  it("says which runs it can't report when it first reads them after the first poll", async () => {
+    // Saved by a version that didn't read runs, with run 500's job running.
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const { workflowRuns: _, ...saved } = snap({ checks: [check("lint", { done: false, conclusion: null })] });
+    inbox.record(targetKey(target), saved as Snapshot, []);
+    const logged: string[] = [];
+    const runs = [run(), run({ id: 600, name: "Docs" })];
+    const events = await pollOnce(inbox, (m) => logged.push(m), async () => snap({ checks: [check("lint")], workflowRuns: runs }));
+    expect(events.filter((e) => e.kind === "workflow.completed").map((e) => e.data.run_id)).toEqual([500]);
+    expect(logged).toEqual([
+      "octo/widgets#7: read its workflow runs on this head for the first time; workflow run 600 had already finished, so if it finished since the last poll, no workflow.completed is sent for it",
+    ]);
+    // Read since: nothing more to say.
+    logged.length = 0;
+    await pollOnce(inbox, (m) => logged.push(m), async () => snap({ checks: [check("lint")], workflowRuns: runs }));
+    expect(logged).toEqual([]);
+
+    // Runs that couldn't be read from the first poll, read at last.
+    const other = open();
+    other.watch(targetKey(target), target);
+    const unreadable = { ...snap({ workflowRuns: null }), workflowRunsError: "fetch failed" };
+    await pollOnce(other, () => {}, async () => unreadable);
+    await pollOnce(other, (m) => logged.push(m), async () => snap({ workflowRuns: runs }));
+    expect(logged.at(-1)).toBe(
+      "octo/widgets#7: its workflow runs can be read again; workflow runs 500, 600 had already finished, so any of them that finished since the last poll gets no workflow.completed",
+    );
+    inbox.close();
+    other.close();
   });
 
   it("forgets it said so once the PR is unwatched or ends, so watching it again says so again", async () => {
@@ -597,7 +628,13 @@ describe("GitHub's errors", () => {
       const missing = (await graphql("{}", {}).catch((e: Error) => e)) as GitHubError;
       expect(missing.status).toBe(404);
       expect(missing.message).toMatch(/^\[31mred .* end; \[31mred .* end$/);
-      for (const m of [down.message, missing.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+      // And from a REST list, as JSON or not.
+      fetches.mockResolvedValueOnce(Response.json({ message: NASTY }, { status: 403 }));
+      const denied = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(denied.message).toMatch(/^GitHub \/repos\/octo\/widgets\/actions\/runs: 403 \[31mred .* end$/);
+      fetches.mockResolvedValueOnce(new Response(NASTY, { status: 500 }));
+      const failed = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      for (const m of [down.message, missing.message, denied.message, failed.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     } finally {
       fetches.mockRestore();
       vi.unstubAllEnvs();
