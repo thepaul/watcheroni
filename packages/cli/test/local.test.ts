@@ -169,7 +169,7 @@ describe("polling", () => {
     const inbox = open();
     inbox.watch(targetKey(target), target);
     const snapshots: Snapshot[] = [
-      snap({ workflowRuns: [run({ done: false, conclusion: null })] }),
+      // Run 500 had finished when watching started: never reported.
       snap({ workflowRuns: [run()] }),
       // Pushed; the new head's runs can't be read yet, and then are.
       snap({ head: HEAD2, workflowRuns: null }),
@@ -181,11 +181,31 @@ describe("polling", () => {
     const fetch = async () => snapshots.shift()!;
     const polled = async () => (await pollOnce(inbox, () => {}, fetch)).map((e) => [e.kind, e.data.run_id ?? null]);
     expect(await polled()).toEqual([]);
-    expect(await polled()).toEqual([["workflow.completed", 500]]);
     expect(await polled()).toEqual([["pr.pushed", null]]);
     expect(await polled()).toEqual([]);
     expect(await polled()).toEqual([["pr.pushed", null]]);
     expect(await polled()).toEqual([["workflow.completed", 800]]);
+    inbox.close();
+  });
+
+  it("says once that workflow runs can't be read, and once that they can again", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const unreadable = (why: string) => ({ ...snap({ workflowRuns: null }), workflowRunsError: why });
+    const snapshots: Snapshot[] = [
+      unreadable("GitHub /repos/octo/widgets/actions/runs: 403 Resource not accessible by personal access token"),
+      unreadable("GitHub /repos/octo/widgets/actions/runs: 502 Server Error"),
+      snap(),
+      snap(),
+      unreadable("fetch failed"),
+    ];
+    const logged: string[] = [];
+    for (let i = 0; i < 5; i++) await pollOnce(inbox, (m) => logged.push(m), async () => snapshots.shift()!);
+    expect(logged).toEqual([
+      "octo/widgets#7: can't read its workflow runs (GitHub /repos/octo/widgets/actions/runs: 403 Resource not accessible by personal access token); no workflow.completed until they can be read",
+      "octo/widgets#7: its workflow runs can be read again",
+      "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
+    ]);
     inbox.close();
   });
 

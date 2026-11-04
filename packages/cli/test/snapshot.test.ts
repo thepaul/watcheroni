@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { REST_CACHE_SIZE, clearRestCache, restList } from "../src/github.ts";
+import { LoginNeeded, REST_CACHE_SIZE, clearRestCache, restList } from "../src/github.ts";
 import { fetchSnapshot } from "../src/snapshot.ts";
 import { HEAD1 } from "./fixtures.ts";
 
@@ -106,25 +106,54 @@ describe("fetchSnapshot", () => {
       () => { throw new TypeError("fetch failed"); },
       () => Response.json({ workflow_runs: [{ ...runsBody.workflow_runs[0], run_attempt: undefined }] }),
     ];
+    const why: (string | undefined)[] = [];
     for (const r of unreadable) {
       runs = r;
-      expect((await fetchSnapshot(target)).workflowRuns).toBeNull();
+      const s = await fetchSnapshot(target);
+      expect(s.workflowRuns).toBeNull();
+      why.push(s.workflowRunsError);
     }
-    for (const headers of [{ "x-ratelimit-remaining": "0" }, { "retry-after": "60" }]) {
-      runs = () => new Response("API rate limit exceeded", { status: 403, headers });
+    const path = "GitHub /repos/octo/widgets/actions/runs";
+    expect(why).toEqual([
+      `${path}: 403 Resource not accessible by personal access token`,
+      `${path}: 404 Not Found`,
+      `${path}: 502 Server Error`,
+      "fetch failed",
+      "workflow run 500 has no run_attempt",
+    ]);
+    // GitHub's JSON error body is reduced to its message.
+    runs = () => Response.json({ message: "Must have admin rights", documentation_url: "https://docs.github.com/x" }, { status: 403 });
+    expect((await fetchSnapshot(target)).workflowRunsError).toBe(`${path}: 403 Must have admin rights`);
+    // Readable runs have no error.
+    runs = () => Response.json(runsBody);
+    expect((await fetchSnapshot(target)).workflowRunsError).toBeUndefined();
+
+    const limited: (() => Response)[] = [
+      () => new Response("API rate limit exceeded", { status: 403, headers: { "x-ratelimit-remaining": "0" } }),
+      () => new Response("You have exceeded a secondary rate limit", { status: 403, headers: { "retry-after": "60" } }),
+      () => new Response("Too Many Requests", { status: 429 }),
+    ];
+    for (const r of limited) {
+      runs = r;
       await expect(fetchSnapshot(target)).rejects.toMatchObject({ status: 429 });
     }
+    // A token GitHub rejects stops the poll too.
+    runs = () => new Response("Bad credentials", { status: 401 });
+    await expect(fetchSnapshot(target)).rejects.toBeInstanceOf(LoginNeeded);
   });
 
   it("keeps the most recently used pages", async () => {
-    runs = (_h, url) => Response.json({ items: [url] }, { headers: { etag: `"${url}"` } });
+    runs = (h, url) => h.get("if-none-match") === `"${url}"`
+      ? new Response(null, { status: 304 })
+      : Response.json({ items: [url] }, { headers: { etag: `"${url}"` } });
     const pick = (body: unknown) => (body as { items: string[] }).items;
     for (let i = 0; i <= REST_CACHE_SIZE; i++) await restList(`/list/${i}`, pick);
     // /list/0 was used least recently, and has gone; /list/1 hasn't.
-    await restList("/list/1", pick);
+    expect(await restList("/list/1", pick)).toEqual(["https://api.github.com/list/1"]);
     await restList("/list/0", pick);
     expect(asked.slice(-2).map((a) => a.headers.get("if-none-match"))).toEqual(['"https://api.github.com/list/1"', null]);
-    // Asking for /list/1 made it recent: /list/2 went when /list/0 came back.
+    // Asking for /list/1, answered 304, made it recent: /list/2 went when
+    // /list/0 came back.
     await restList("/list/2", pick);
     await restList("/list/1", pick);
     expect(asked.slice(-2).map((a) => a.headers.get("if-none-match"))).toEqual([null, '"https://api.github.com/list/1"']);

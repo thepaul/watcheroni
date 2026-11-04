@@ -73,6 +73,8 @@ export interface Snapshot {
   // Workflow runs on the head commit; null when the token can't read them
   // (or in a snapshot saved before they were read).
   workflowRuns: WorkflowRun[] | null;
+  // Why they couldn't be read, when they couldn't.
+  workflowRunsError?: string;
 }
 
 const QUERY = `
@@ -169,6 +171,7 @@ export async function fetchSnapshot(target: Target): Promise<Snapshot> {
   const repo = data.repository;
   if (!repo?.pullRequest) throw new Error(`${target.owner}/${target.name}#${target.number}: no such pull request`);
   let runs: WorkflowRun[] | null;
+  let why: string | undefined;
   try {
     const sha = encodeURIComponent(repo.pullRequest.headRefOid);
     runs = await restList(
@@ -196,8 +199,10 @@ export async function fetchSnapshot(target: Target): Promise<Snapshot> {
     // read). Out of requests, or logged out, stops the poll to try later.
     if (e instanceof LoginNeeded || (e instanceof GitHubError && e.status === 429)) throw e;
     runs = null;
+    why = String((e as Error)?.message || e || "unknown error").replace(/\s+/g, " ").slice(0, 200);
   }
-  return toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString(), runs);
+  const snapshot = toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString(), runs);
+  return why ? { ...snapshot, workflowRunsError: why } : snapshot;
 }
 
 export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string, runs: WorkflowRun[] | null = null): Snapshot {

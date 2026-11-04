@@ -33,6 +33,13 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       log(`${key}: ${(e as Error).message}; trying again next time`);
       continue;
     }
+    // Said when workflow runs stop being readable, and when they're back,
+    // rather than at every poll.
+    if (next.workflowRunsError && !w.snapshot?.workflowRunsError) {
+      log(`${key}: can't read its workflow runs (${next.workflowRunsError}); no workflow.completed until they can be read`);
+    } else if (!next.workflowRunsError && w.snapshot?.workflowRunsError) {
+      log(`${key}: its workflow runs can be read again`);
+    }
     if (!w.snapshot) {
       if (next.state !== "OPEN") {
         const reason = next.state === "MERGED" ? "merged" : "closed";

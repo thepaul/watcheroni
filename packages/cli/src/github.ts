@@ -72,11 +72,12 @@ const MAX_PAGES = 20;
 export async function restList<T>(path: string, pick: (body: unknown) => T[]): Promise<T[]> {
   const out: T[] = [];
   const seen = new Set<string>();
+  const where = path.replace(/\?.*/, "");
   for (let url: string | null = `${API}${path.replace(/^\//, "")}`; url;) {
     // The token goes to GitHub's API only, and each page once.
-    if (!url.startsWith(API)) throw new GitHubError(`GitHub ${path}: next page outside ${API}: ${url}`, 502);
-    if (seen.has(url)) throw new GitHubError(`GitHub ${path}: next page already read: ${url}`, 502);
-    if (seen.size === MAX_PAGES) throw new GitHubError(`GitHub ${path}: more than ${MAX_PAGES} pages`, 502);
+    if (!url.startsWith(API)) throw new GitHubError(`GitHub ${where}: next page outside ${API}: ${url}`, 502);
+    if (seen.has(url)) throw new GitHubError(`GitHub ${where}: next page already read: ${url}`, 502);
+    if (seen.size === MAX_PAGES) throw new GitHubError(`GitHub ${where}: more than ${MAX_PAGES} pages`, 502);
     seen.add(url);
     const cached = etags.get(url);
     if (cached) {
@@ -99,9 +100,17 @@ export async function restList<T>(path: string, pick: (body: unknown) => T[]): P
     }
     if (res.status === 401) throw new LoginNeeded("GitHub rejected the token: run `gh auth login`, or check GH_TOKEN.");
     if (!res.ok) {
-      // Out of requests is worth trying again, unlike a 403 for no access.
-      const limited = res.status === 429 || res.headers.get("x-ratelimit-remaining") === "0" || res.headers.has("retry-after");
-      throw new GitHubError(`GitHub ${path}: ${res.status} ${await res.text()}`, limited ? 429 : res.status);
+      // Out of requests is worth trying again, unlike a 403 for no access:
+      // a 403 that says so is reported as a 429, as GitHub also sends.
+      const limited = res.headers.get("x-ratelimit-remaining") === "0" || res.headers.has("retry-after");
+      const text = await res.text();
+      let message = text;
+      try {
+        message = (JSON.parse(text) as { message?: string }).message ?? text;
+      } catch {
+        // Not JSON: the text as it is.
+      }
+      throw new GitHubError(`GitHub ${where}: ${res.status} ${message}`, limited ? 429 : res.status);
     }
     const items = pick(await res.json());
     const next = res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
