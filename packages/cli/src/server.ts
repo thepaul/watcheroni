@@ -1,6 +1,7 @@
 import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { type ServerConfig, checkServerUrl } from "./config.ts";
+import { clean, PROSE_LENGTH } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { githubUrl } from "./login.ts";
 import { anyKey, isPr, type RepoTarget, type Target } from "./targets.ts";
@@ -39,8 +40,26 @@ export class ServerError extends Error {
   }
 }
 
+// Why the server refused, from its problem document, made fit to print.
+export function refusal(problem: { detail?: unknown; title?: unknown }, code: string): string {
+  return clean(problem.detail ?? problem.title ?? code, PROSE_LENGTH);
+}
+
 // 401s that are about the GitHub token sent with a request, not the API key.
 const GITHUB_TOKEN_CODES = new Set(["github_token_required", "github_token_invalid"]);
+
+// Redirects are never followed, for the server or GitHub: fetch would
+// send the body again wherever one points, even to plain http, and
+// bodies carry GitHub tokens. Every fetch passes this, and answers a
+// redirect with an error saying so (see redirect()).
+export const NO_REDIRECTS = { redirect: "manual" } as const;
+
+// What to say about an answer that is a redirect, or null if it isn't.
+export function redirect(res: Response): string | null {
+  if (res.type !== "opaqueredirect" && (res.status < 300 || res.status > 399)) return null;
+  const to = res.headers.get("Location");
+  return `answered ${res.status} redirecting${to ? ` to ${JSON.stringify(clean(to, 200))}` : ""}, which watcheroni doesn't follow`;
+}
 
 const SUBPROTOCOL = "watcheroni.v1";
 const WAIT_SECONDS = 300;
@@ -72,27 +91,36 @@ export class ServerClient {
         },
         body: o.body === undefined ? undefined : JSON.stringify(o.body),
         signal: o.signal ? AbortSignal.any([o.signal, timeout]) : timeout,
+        ...NO_REDIRECTS,
       });
     } catch (e) {
       if (o.signal?.aborted) throw e;
       const cause = (e as Error & { cause?: Error }).cause;
       throw new Unreachable(`can't reach ${this.url}: ${cause?.message ?? (e as Error).message}`);
     }
+    // Not worth retrying: the server URL, or the server, needs fixing.
+    const moved = redirect(res);
+    if (moved) {
+      const detail = `${moved}; check the server URL`;
+      throw new ServerError(`${this.url}: ${method} ${path}: ${detail}`, res.status, "redirect", { detail });
+    }
     if (res.status === 204) return undefined as T;
     if (res.ok) return (await res.json()) as T;
     const problem = (await res.json().catch(() => ({}))) as { code?: string; title?: string; detail?: string };
     const code = problem.code ?? String(res.status);
+    // The problem's fields are the server's to choose, so they are cleaned
+    // before they get near a terminal.
     if (res.status === 401 && !GITHUB_TOKEN_CODES.has(code)) {
-      throw new LoginNeeded(`${this.url} rejected the API key (${code}); check WATCHERONI_API_KEY`);
+      throw new LoginNeeded(`${this.url} rejected the API key (${clean(code)}); check WATCHERONI_API_KEY`);
     }
     if (res.status >= 500 || res.status === 429) {
       const retryAfter = Number(res.headers.get("Retry-After"));
-      throw new Unreachable(`${this.url} answered ${res.status} (${code}${problem.title ? `: ${problem.title}` : ""})`, {
+      throw new Unreachable(`${this.url} answered ${res.status} (${clean(code)}${problem.title ? `: ${clean(problem.title, PROSE_LENGTH)}` : ""})`, {
         code,
         retryAfter: retryAfter > 0 ? retryAfter : null,
       });
     }
-    throw new ServerError(`${this.url}: ${method} ${path}: ${res.status} ${problem.detail ?? problem.title ?? code}`, res.status, code, problem);
+    throw new ServerError(`${this.url}: ${method} ${clean(path, PROSE_LENGTH)}: ${res.status} ${refusal(problem, code)}`, res.status, code, problem);
   }
 
   ensureInbox(name: string): Promise<{ head: number; acked: number }> {
@@ -163,7 +191,7 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
       } else if (e.code === "github_token_invalid") {
         o.log(`${client.url} didn't accept this machine's GitHub token for ${repo}; run \`watcheroni login\` again`);
       } else {
-        o.log(`${client.url} won't watch ${anyKey(target)}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
+        o.log(`${client.url} won't watch ${anyKey(target)}: ${refusal(e.problem, e.code)}`);
       }
       return null;
     }
@@ -194,26 +222,28 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
   }
   const due = subs.filter((s) => s.repo.private && s.verified_until && Date.parse(s.verified_until) - now < RENEW_BEFORE_MS);
   if (!due.length) return;
+  // The repos' names are as the server gave them.
+  const name = (s: SubscriptionInfo) => clean(s.repo.full_name);
   let token: string | null | undefined;
   try {
     token = await o.githubToken?.();
   } catch (e) {
     if (!(e instanceof Unreachable)) throw e;
-    o.log(`couldn't renew the server's watch on ${due.map((s) => s.repo.full_name).join(", ")}: ${e.message}`);
+    o.log(`couldn't renew the server's watch on ${due.map(name).join(", ")}: ${e.message}`);
     return;
   }
   if (!token) {
-    o.log(`the server needs a fresh GitHub token to keep watching ${due.map((s) => s.repo.full_name).join(", ")}; run \`watcheroni login\``);
+    o.log(`the server needs a fresh GitHub token to keep watching ${due.map(name).join(", ")}; run \`watcheroni login\``);
     return;
   }
   for (const s of due) {
     try {
-      await client.request("POST", `/v1/inboxes/${inbox}/subscriptions/${s.id}/verify`, { headers: { "X-GitHub-Token": token } });
+      await client.request("POST", `/v1/inboxes/${inbox}/subscriptions/${encodeURIComponent(s.id)}/verify`, { headers: { "X-GitHub-Token": token } });
     } catch (e) {
       if (e instanceof ServerError) {
         o.log(e.code === "repo_access_denied"
-          ? `you can no longer read ${s.repo.full_name}, so the server has stopped watching it`
-          : `couldn't renew the server's watch on ${s.repo.full_name}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
+          ? `you can no longer read ${name(s)}, so the server has stopped watching it`
+          : `couldn't renew the server's watch on ${name(s)}: ${refusal(e.problem, e.code)}`);
         continue;
       }
       if (e instanceof Unreachable || e instanceof LoginNeeded) return;
@@ -469,7 +499,8 @@ export class ServerReader {
         } else if (msg.type === "events") {
           this.add(msg.events);
         } else if (msg.type === "error") {
-          this.o.log(`${this.client.url}: ${msg.code}${msg.detail ? `: ${msg.detail}` : ""}`);
+          // The server's own words, cleaned like the rest.
+          this.o.log(`${this.client.url}: ${clean(msg.code)}${msg.detail ? `: ${clean(msg.detail, PROSE_LENGTH)}` : ""}`);
         }
       });
       const onAbort = () => {
@@ -480,7 +511,8 @@ export class ServerReader {
         clearInterval(pinger);
         this.abort.signal.removeEventListener("abort", onAbort);
         if (this.ws === ws) this.ws = null;
-        resolve({ opened, code, reason });
+        // The reason is the server's to choose, like the text it sends.
+        resolve({ opened, code, reason: clean(reason) });
       };
       ws.addEventListener("close", (ev) => finish(ev.code, ev.reason));
       // An error is followed by close, except on Node 22, whose WebSocket

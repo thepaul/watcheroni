@@ -177,10 +177,20 @@ const MAX_LENGTH = 100;
 // bidirectional formatting characters.
 const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
 
-// A value made printable on one line, and cut to a sane length.
-export function clean(v: unknown): string {
+// A value made printable on one line, and cut to a sane length: `max`,
+// or PROSE_LENGTH for a sentence or two, such as why a server refused.
+export function clean(v: unknown, max = MAX_LENGTH): string {
   const s = String(v ?? "").replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim();
-  return s.length > MAX_LENGTH ? `${s.slice(0, MAX_LENGTH - 1)}…` : s;
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+export const PROSE_LENGTH = 1000;
+
+// Text made safe to print as it is, line breaks and all: the last guard
+// on what the CLI logs, such as a stack trace whose message quotes an
+// answer it couldn't parse.
+export function printable(s: string): string {
+  return s.split("\n").map((line) => line.replace(UNPRINTABLE, " ")).join("\n");
 }
 
 // A value that should be one word (a login, path, branch, state): bare

@@ -114,6 +114,10 @@ export class FakeServer {
   refreshAnswer: Record<string, unknown> = { error: "bad_refresh_token" };
   refreshLimited = false;
   readonly refreshed: string[] = [];
+  // Answer every HTTP request with this problem document (or text) instead,
+  // or with a 307 to this address.
+  problem: { status: number; body: Record<string, unknown> | string } | null = null;
+  redirectTo: string | null = null;
   private http: Server | null = null;
   private waiting = new Set<() => void>();
   private holding = false;
@@ -253,6 +257,15 @@ export class FakeServer {
       for await (const c of req) chunks.push(c as Buffer);
       return JSON.parse(Buffer.concat(chunks).toString()) as T;
     };
+    if (this.redirectTo) {
+      res.writeHead(307, { Location: this.redirectTo }).end();
+      return;
+    }
+    if (typeof this.problem?.body === "string") {
+      res.writeHead(this.problem.status, { "content-type": "application/json" }).end(this.problem.body);
+      return;
+    }
+    if (this.problem) return json(this.problem.status, this.problem.body);
     if (req.method === "POST" && url.pathname === "/v1/github/refresh") {
       this.refreshed.push((await readBody<{ refresh_token: string }>()).refresh_token);
       if (this.refreshLimited) res.setHeader("Retry-After", "60");

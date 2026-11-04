@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
@@ -465,5 +465,91 @@ describe("subscribing on the server", () => {
     feed.wanted([]);
     expect(inbox.watched().map((w) => targetKey(w.target))).toEqual(["octo/secret#3"]);
     inbox.close();
+  });
+});
+
+describe("what the server says", () => {
+  // Colour, an OSC 8 link, a carriage return, a C1 CSI and a NUL.
+  const NASTY = "\x1b[31mred\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\rover\u009b2J\x00end";
+  const CONTROLS = /[\x00-\x1f\x7f-\x9f]/;
+  const client = () => new ServerClient({ url: fake.url, apiKey: fake.token });
+  const log = (m: string) => void messages.push(m);
+
+  it("is cleaned in errors, without cutting a long explanation short", async () => {
+    const detail = `${NASTY} ${"because ".repeat(40)}the end`;
+    fake.problem = { status: 422, body: { status: 422, code: "nope", title: NASTY, detail } };
+    const refused = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(refused).toBeInstanceOf(ServerError);
+    expect(refused.message).not.toMatch(CONTROLS);
+    expect(refused.message).toMatch(/: 422 \[31mred \]8;;https:\/\/evil\.test link \]8;; over 2J end because .* the end$/);
+
+    fake.problem = { status: 503, body: { status: 503, code: NASTY, title: NASTY } };
+    const down = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(down).toBeInstanceOf(Unreachable);
+    expect(down.message).not.toMatch(CONTROLS);
+    expect(down.message).toMatch(/end: \[31mred/);
+
+    fake.problem = { status: 401, body: { status: 401, code: NASTY } };
+    const key = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(key).toBeInstanceOf(LoginNeeded);
+    expect(key.message).not.toMatch(CONTROLS);
+  });
+
+  it("is cleaned when it won't watch a PR, or renew a watch", async () => {
+    fake.problem = { status: 422, body: { status: 422, code: "nope", detail: NASTY } };
+    expect(await subscribe(client(), "box", { owner: "octo", name: "widgets", number: 7 }, { log })).toBeNull();
+    fake.problem = null;
+    fake.repos.set(NASTY, { private: true });
+    fake.subscriptions.push({ id: "sub_1", inbox: "box", repo: NASTY, pr: 7, githubToken: null });
+    fake.verifiedUntil.set("sub_1", new Date(Date.now() + 3600_000).toISOString());
+    await renewSubscriptions(client(), "box", { log });
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatch(/won't watch octo\/widgets#7: \[31mred/);
+    expect(messages[1]).toMatch(/keep watching \[31mred .* end; run/);
+    for (const m of messages) expect(m).not.toMatch(CONTROLS);
+  });
+
+  it("is cleaned when it comes over the WebSocket", async () => {
+    const r = reader();
+    await r.start();
+    for (const s of fake.sockets) s.send({ type: "error", code: NASTY, detail: NASTY });
+    await until(() => messages.length === 1);
+    expect(messages[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+: \[31mred .* end: \[31mred .* end$/);
+    fake.closeSockets(4001, NASTY);
+    expect(await r.changed(1000)).toBe(true);
+    expect(r.failure).toBeInstanceOf(LoginNeeded);
+    expect(r.failure!.message).toMatch(/rejected the API key \(\[31mred/);
+    for (const m of [...messages, r.failure!.message]) expect(m).not.toMatch(CONTROLS);
+  });
+
+  it("can't redirect a request, which fails saying why", async () => {
+    const fetches = vi.spyOn(globalThis, "fetch");
+    try {
+      fake.redirectTo = `http://127.0.0.1:${fake.port}/elsewhere`;
+      const moved = `answered 307 redirecting to "http://127.0.0.1:${fake.port}/elsewhere", which watcheroni doesn't follow; check the server URL`;
+      const err = (await client().ack("box", 1).catch((e: Error) => e)) as Error;
+      expect(fetches.mock.calls[0][1]).toMatchObject({ method: "POST", redirect: "manual" });
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.message).toBe(`${fake.url}: POST /v1/inboxes/box/ack: ${moved}`);
+      expect(fake.requests).toEqual(["POST /v1/inboxes/box/ack"]);
+      expect(await subscribe(client(), "box", { owner: "octo", name: "widgets", number: 7 }, { log })).toBeNull();
+      expect(messages).toEqual([`${fake.url} won't watch octo/widgets#7: ${moved}`]);
+
+      // Nor a refresh, whose body is the refresh token. Where it points
+      // is cleaned too.
+      const path = join(mkdtempSync(join(tmpdir(), "watcheroni-cred-")), "credentials.json");
+      process.env.WATCHERONI_CREDENTIALS = path;
+      const github = { access_token: "ghu_old", refresh_token: "ghr_old", expires_at: new Date(Date.now() - 1000).toISOString(), refresh_token_expires_at: null };
+      writeFileSync(path, JSON.stringify({ servers: { [fake.url]: { api_key: fake.token, key_id: "key_1", account: { id: 7, login: "octocat" }, github } } }));
+      fake.redirectTo = "http://evil.test/\u009b2J";
+      const refresh = (await githubTokenFor(fake.url).catch((e: Error) => e)) as Error;
+      expect(fetches.mock.calls.at(-1)![1]).toMatchObject({ method: "POST", redirect: "manual" });
+      expect(refresh).toBeInstanceOf(Unreachable);
+      expect(refresh.message).toBe(`${fake.url}/v1/github/refresh answered 307 redirecting to "http://evil.test/ 2J", which watcheroni doesn't follow; check the server URL`);
+      expect(fake.refreshed).toEqual([]);
+    } finally {
+      fetches.mockRestore();
+      delete process.env.WATCHERONI_CREDENTIALS;
+    }
   });
 });

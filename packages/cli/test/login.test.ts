@@ -367,6 +367,72 @@ describe("logout", () => {
   });
 });
 
+describe("what the server says", () => {
+  // Colour, an OSC 8 link, a carriage return, a C1 CSI and a NUL.
+  const NASTY = "\x1b[31mred\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\rover\u009b2J\x00end";
+  const CONTROLS = /[\x00-\x1f\x7f-\x9f]/;
+  // Answers `url` with `answer` instead, recording each request's redirect mode.
+  const answering = (deps: LoginDeps, url: string, answer: () => Promise<Response>, modes: (string | undefined)[] = []) => {
+    const fetch = deps.fetch;
+    deps.fetch = async (input, init) => (modes.push(init?.redirect), String(input) === url ? answer() : fetch(input, init));
+    return modes;
+  };
+
+  it("is cleaned when it names the account", async () => {
+    const { deps, printed } = fake([{ access_token: "ghu_tok" }]);
+    answering(deps, `${SERVER}/v1/login`, async () => Response.json({ api_key: "wk2_7_secret_tag", key_id: "key_1", account: { id: 7, login: NASTY } }));
+    await login(SERVER, deps);
+    expect(printed.at(-1)).toBe(`Signed in to ${SERVER} as [31mred ]8;;https://evil.test link ]8;; over 2J end.`);
+  });
+
+  it("is cleaned when it refuses, without cutting the reason short", async () => {
+    const title = `${NASTY} ${"because ".repeat(40)}the end`;
+    const { deps } = fake([{ access_token: "ghu_tok" }], 403, true, DEVICE_PAGE, "ABCD-1234", { title });
+    const err = (await login(SERVER, deps).catch((e: Error) => e)) as Error;
+    expect(err).toBeInstanceOf(LoginFailed);
+    expect(err.message).not.toMatch(CONTROLS);
+    expect(err.message).toMatch(/^the server refused the login \(403: \[31mred .* because the end\)$/);
+  });
+
+  it("is cleaned when a revoke fails", async () => {
+    const { deps, printed } = fake([{ access_token: "ghu_tok" }]);
+    await login(SERVER, deps);
+    answering(deps, `${SERVER}/v1/keys/current`, async () => {
+      throw new Error(NASTY);
+    });
+    await logout(SERVER, deps);
+    expect(printed.at(-2)).toMatch(/^Couldn't reach .* to revoke the key \(\[31mred .* end\); forgetting it anyway\.$/);
+    for (const line of printed) expect(line).not.toMatch(CONTROLS);
+  });
+
+  it("can't redirect a sign-in, which fails saying why, saving nothing", async () => {
+    const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
+    const modes = answering(deps, `${SERVER}/v1/login`, async () => new Response(null, { status: 307, headers: { Location: "http://watcheroni.test/v1/login" } }));
+    await expect(login(SERVER, deps)).rejects.toThrow(
+      `${SERVER}/v1/login answered 307 redirecting to "http://watcheroni.test/v1/login", which watcheroni doesn't follow; check the server URL`,
+    );
+    // Every request refuses redirects, GitHub's too.
+    expect(calls.map((c) => c.url)).toEqual([`${SERVER}/v1/meta`, `${GITHUB}/login/device/code`, `${GITHUB}/login/oauth/access_token`]);
+    expect(modes).toEqual(["manual", "manual", "manual", "manual"]);
+    expect(readCredentials().servers).toEqual({});
+  });
+
+  it("can't redirect the device flow either", async () => {
+    const { deps } = fake([{ access_token: "ghu_tok" }]);
+    answering(deps, `${GITHUB}/login/device/code`, async () => new Response(null, { status: 302, headers: { Location: "https://evil.test/" } }));
+    await expect(login(SERVER, deps)).rejects.toThrow(`${GITHUB}/login/device/code answered 302 redirecting to "https://evil.test/", which watcheroni doesn't follow`);
+  });
+
+  it("says a revoke was redirected, and revokes nothing", async () => {
+    const { deps, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
+    await login(SERVER, deps);
+    const modes = answering(deps, `${SERVER}/v1/keys/current`, async () => new Response(null, { status: 308 }));
+    await login(SERVER, deps);
+    expect(modes.at(-1)).toBe("manual");
+    expect(printed.at(-1)).toBe("The server didn't revoke the previous key: it answered 308 redirecting, which watcheroni doesn't follow; it stays live.");
+  });
+});
+
 describe("choosing the server", () => {
   it("uses the default server once signed in to it, and local mode before", () => {
     const saved = { ...process.env };

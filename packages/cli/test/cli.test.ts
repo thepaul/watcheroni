@@ -641,6 +641,34 @@ describe("ls --all", () => {
   });
 });
 
+describe("what the server says", () => {
+  const NASTY = "\x1b[31mred\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\rover\u009b2J\x00end";
+  // Anything but the line breaks between lines.
+  const CONTROLS = /[\x00-\x09\x0b-\x1f\x7f-\x9f]/;
+
+  it("never reaches the terminal raw", async () => {
+    fake.problem = { status: 422, body: { status: 422, code: "nope", title: NASTY, detail: NASTY } };
+    const refused = cli(["wait", "--settle", "0"]);
+    expect(await refused.code).toBe(1);
+    expect(refused.stderr()).toMatch(/: 422 \[31mred .* end\n$/);
+    expect(refused.stderr()).not.toMatch(CONTROLS);
+
+    // Not even when it's only quoted, by an error the CLI didn't expect.
+    fake.problem = { status: 200, body: `${NASTY}{` };
+    const garbled = cli(["wait", "--settle", "0"]);
+    expect(await garbled.code).toBe(1);
+    expect(garbled.stderr()).toMatch(/JSON/);
+    expect(garbled.stderr()).not.toMatch(CONTROLS);
+  });
+
+  it("can't redirect the CLI elsewhere", async () => {
+    fake.redirectTo = "http://evil.test/";
+    const run = cli(["wait", "--settle", "0"]);
+    expect(await run.code).toBe(1);
+    expect(run.stderr()).toBe(`watcheroni: ${fake.url}: PUT /v1/inboxes/box: answered 307 redirecting to "http://evil.test/", which watcheroni doesn't follow; check the server URL\n`);
+  });
+});
+
 describe("ls --json", () => {
   it("prints the inbox as one JSON object", async () => {
     const run = cli(["ls", "--json"], { WATCHERONI_SERVER: "" });

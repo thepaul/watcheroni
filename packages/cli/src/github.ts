@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { clean, PROSE_LENGTH } from "./format.ts";
 
 // GitHub access for local mode. The token stays on this machine: it is
 // never sent to a watcheroni server.
@@ -40,11 +41,12 @@ export async function graphql<T>(query: string, variables: Record<string, unknow
     signal: AbortSignal.timeout(30_000),
   });
   if (res.status === 401) throw new LoginNeeded("GitHub rejected the token: run `gh auth login`, or check GH_TOKEN.");
-  if (!res.ok) throw new GitHubError(`GitHub GraphQL: ${res.status} ${await res.text()}`, res.status);
+  // GitHub's words are cleaned before they reach a log line.
+  if (!res.ok) throw new GitHubError(`GitHub GraphQL: ${res.status} ${clean(await res.text(), PROSE_LENGTH)}`, res.status);
   const body = (await res.json()) as { data?: T; errors?: { type?: string; message: string }[] };
   if (body.errors?.length) {
     const notFound = body.errors.some((e) => e.type === "NOT_FOUND");
-    throw new GitHubError(body.errors.map((e) => e.message).join("; "), notFound ? 404 : 502);
+    throw new GitHubError(clean(body.errors.map((e) => e.message).join("; "), PROSE_LENGTH), notFound ? 404 : 502);
   }
   return body.data as T;
 }

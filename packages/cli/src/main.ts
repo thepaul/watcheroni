@@ -4,7 +4,7 @@ import type { WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { loadServer } from "./config.ts";
 import { Feed } from "./feed.ts";
-import { command, formatText, footer } from "./format.ts";
+import { clean, command, formatText, footer, PROSE_LENGTH, printable } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
@@ -67,7 +67,9 @@ machine with your gh login (or GH_TOKEN). That token is never sent to the
 server.
 `;
 
-const log = (msg: string) => process.stderr.write(`watcheroni: ${msg}\n`);
+// Text from the server or GitHub is cleaned where a message is made; this
+// catches any that isn't, such as an error quoting an answer.
+const log = (msg: string) => process.stderr.write(`watcheroni: ${printable(msg)}\n`);
 
 const describeKinds = (kinds: string[]) => (kinds.length ? kinds.join(",") : "every kind");
 
@@ -183,7 +185,7 @@ async function main(argv: string[]): Promise<number> {
         lines = describeInbox(name, "watching nothing.");
       } catch (e) {
         unreadable++;
-        lines = [`can't be read: ${e instanceof Error ? e.message : String(e)}`];
+        lines = [`can't be read: ${clean(e instanceof Error ? e.message : String(e), PROSE_LENGTH)}`];
       }
       process.stdout.write(`${name}:\n${lines.map((l) => `  ${l}\n`).join("")}`);
     }
@@ -460,7 +462,7 @@ async function execCommand(
         if (code !== 0) {
           // Stop here so events stay in order; this one is offered again
           // after the next poll.
-          log(`command exited ${code} for ${e.kind} (${e.id}); it will be offered again`);
+          log(`command exited ${code} for ${clean(e.kind)} (${clean(e.id)}); it will be offered again`);
           break;
         }
         feed.ack([item]);
