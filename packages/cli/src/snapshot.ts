@@ -1,3 +1,4 @@
+import { clean } from "./format.ts";
 import { GitHubError, LoginNeeded, graphql, restList } from "./github.ts";
 import type { Target } from "./targets.ts";
 
@@ -199,18 +200,11 @@ export async function fetchSnapshot(target: Target): Promise<Snapshot> {
     // read). Out of requests, or logged out, stops the poll to try later.
     if (e instanceof LoginNeeded || (e instanceof GitHubError && e.status === 429)) throw e;
     runs = null;
-    why = printable(String((e as Error)?.message || e || "unknown error"), 200);
+    // Text from GitHub: made safe to print, and cut to 200 characters.
+    why = clean((e as Error)?.message || e || "unknown error", 200);
   }
   const snapshot = toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString(), runs);
   return why ? { ...snapshot, workflowRunsError: why } : snapshot;
-}
-
-// Text from GitHub, made safe to print to a terminal: control, bidi and
-// zero-width characters become spaces, and it's cut to `max` characters
-// (whole ones, not halves of a surrogate pair).
-const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
-export function printable(text: string, max: number): string {
-  return Array.from(text.replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim()).slice(0, max).join("");
 }
 
 export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string, runs: WorkflowRun[] | null = null): Snapshot {

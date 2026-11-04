@@ -180,14 +180,18 @@ const REPO_NAME = /^[A-Za-z0-9-]{1,39}\/[\w.-]{1,100}$/;
 const PLAIN = /^[\w.\/@+:-]+$/;
 const MAX_LENGTH = 100;
 // C0 and C1 controls, line and paragraph separators, zero-width and
-// bidirectional formatting characters.
-const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
+// bidirectional formatting characters (the Arabic letter mark and the
+// Mongolian vowel separator among them).
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
 
-// A value made printable on one line, and cut to a sane length: `max`,
-// or PROSE_LENGTH for a sentence or two, such as why a server refused.
+// A value made printable on one line, and cut to a sane length: `max`
+// characters, or PROSE_LENGTH for a sentence or two, such as why a
+// server refused. Whole characters, never half a surrogate pair.
 export function clean(v: unknown, max = MAX_LENGTH): string {
   const s = String(v ?? "").replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim();
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  if (s.length <= max) return s;
+  const chars = Array.from(s);
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : s;
 }
 
 export const PROSE_LENGTH = 1000;
@@ -205,7 +209,7 @@ export function printable(s: string): string {
 // \uXXXX. It parses to the same value. They can only be inside strings,
 // where an escape means the same.
 export function toJson(v: unknown): string {
-  return JSON.stringify(v).replace(/[\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return JSON.stringify(v).replace(/[\u007f-\u009f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 // A value that should be one word (a login, path, branch, state): bare

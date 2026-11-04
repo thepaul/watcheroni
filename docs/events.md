@@ -352,9 +352,10 @@ compared with the head's runs as last read, or, after a push, as runs
 on a new head. Only on the head a watch starts on, before the runs have
 been read once, is there nothing to compare them with. The CLI says so on
 stderr, with GitHub's reason, once per run of the CLI while the runs
-can't be read, and once when they can again. A 403 is GitHub refusing
-the GitHub login access to them: a fine-grained token, for one, needs
-read access to the repo's Actions.
+can't be read, and once when they can again. A 403 is usually GitHub
+refusing the GitHub login access to them (a fine-grained token, for one,
+needs read access to the repo's Actions), unless GitHub's reason says
+it's a rate limit.
 
 ## The watch itself
 

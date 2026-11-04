@@ -133,7 +133,8 @@ describe("fetchSnapshot", () => {
     runs = () => new Response("😀".repeat(300), { status: 500 });
     const cut = (await fetchSnapshot(target)).workflowRunsError!;
     expect(Array.from(cut)).toHaveLength(200);
-    expect(cut.endsWith("😀")).toBe(true);
+    expect(cut.endsWith("😀…")).toBe(true);
+    expect(cut).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/);
     // Readable runs have no error.
     runs = () => Response.json(runsBody);
     expect((await fetchSnapshot(target)).workflowRunsError).toBeUndefined();

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { UnsequencedEvent, WatchEvent } from "@watcheroni/protocol";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
-import { formatText, toJson } from "../src/format.ts";
+import { clean, formatText, toJson } from "../src/format.ts";
 import { GitHubError, graphql } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { forgetWarnings, pollOnce } from "../src/poll.ts";
@@ -219,6 +219,30 @@ describe("polling", () => {
     expect(logged).toEqual([
       "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
     ]);
+    inbox.close();
+  });
+
+  it("forgets it said so once the PR is unwatched or ends, so watching it again says so again", async () => {
+    const unreadable = (o: Partial<Snapshot> = {}) => ({ ...snap({ workflowRuns: null, ...o }), workflowRunsError: "fetch failed" });
+    const warning = "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read";
+    const inbox = open();
+    const logged: string[] = [];
+    const poll = (s: Snapshot) => pollOnce(inbox, (m) => logged.push(m), async () => s);
+    // Unwatched, then watched again.
+    inbox.watch(targetKey(target), target);
+    await poll(unreadable());
+    inbox.unwatch(targetKey(target));
+    await poll(unreadable());
+    inbox.watch(targetKey(target), target);
+    await poll(unreadable());
+    expect(logged).toEqual([warning, warning]);
+    // Ended, then watched again.
+    logged.length = 0;
+    await poll(unreadable({ state: "MERGED" }));
+    expect(inbox.watched()).toEqual([]);
+    inbox.watch(targetKey(target), target);
+    await poll(unreadable());
+    expect(logged).toEqual([warning]);
     inbox.close();
   });
 
@@ -537,7 +561,7 @@ describe("text output", () => {
   });
 
   it("carries no control or formatting character from any field", () => {
-    const NASTY = "x\x1b]0;pwned\x07\u202e\u009b2J\u200b\u2028\r\n";
+    const NASTY = "x\x1b]0;pwned\x07\u202e\u009b2J\u200b\u2028\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180e\r\n";
     const kinds = [
       "review.submitted", "review.dismissed", "review_comment.created", "comment.created", "thread.resolved", "check.completed",
       "check.failed", "workflow.completed", "pr.pushed", "pr.base_changed", "pr.review_requested", "pr.merged", "watch.ended",
@@ -556,7 +580,7 @@ describe("text output", () => {
     events.push({ ...events[0], kind: { toString: () => NASTY }, repo: null } as unknown as WatchEvent);
     const text = formatText(events, ["octo/widgets#7"]);
     expect(text).toMatch(/^"x \]0;pwned 2J"#\?: 18 new events/);
-    expect(text.replace(/\n/g, "")).not.toMatch(/[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/);
+    expect(text.replace(/\n/g, "")).not.toMatch(/[\x00-\x1f\x7f-\x9f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/);
   });
 });
 
@@ -583,9 +607,15 @@ describe("GitHub's errors", () => {
 
 describe("JSON output", () => {
   it("escapes what a terminal would act on, and parses to the same value", () => {
-    const value = { s: "a\x1b[31m\x7f\u009b\u200b\u202e\u2028\u2066\ufeffz", n: 1, list: ["é", "日本"] };
+    const value = { s: "a\x1b[31m\x7f\u009b\u200b\u202e\u2028\u2066\ufeff\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180ez", n: 1, list: ["é", "日本"] };
     const json = toJson(value);
-    expect(json).toBe(String.raw`{"s":"a\u001b[31m\u007f\u009b\u200b\u202e\u2028\u2066\ufeffz","n":1,"list":["é","日本"]}`);
+    expect(json).toBe(String.raw`{"s":"a\u001b[31m\u007f\u009b\u200b\u202e\u2028\u2066\ufeff\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180ez","n":1,"list":["é","日本"]}`);
     expect(JSON.parse(json)).toEqual(value);
+  });
+
+  it("and what's printed on one line is cleaned of the same, cut by whole characters", () => {
+    expect(clean("a\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180e\u202e\x1bb")).toBe("a b");
+    const cut = clean("\u{1F600}".repeat(10), 5);
+    expect(Array.from(cut)).toEqual(["\u{1F600}", "\u{1F600}", "\u{1F600}", "\u{1F600}", "\u2026"]);
   });
 });

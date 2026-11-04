@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Inbox } from "../src/inbox.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -665,14 +666,39 @@ describe("what the server says", () => {
     expect(garbled.stderr()).not.toMatch(CONTROLS);
   });
 
+  it("never reaches the terminal raw from GitHub's GraphQL errors, polling from this machine", async () => {
+    // GitHub, answering every request with `body`, in the CLI's process.
+    // The body goes in base64, as the environment can't hold a NUL.
+    const preload = join(cwd, "github.mjs");
+    writeFileSync(preload, [
+      "const real = globalThis.fetch;",
+      "globalThis.fetch = async (input, init) => {",
+      "  const url = String(input instanceof Request ? input.url : input);",
+      "  if (!url.startsWith('https://api.github.com/')) return real(input, init);",
+      "  return new Response(Buffer.from(process.env.FAKE_GITHUB_BODY, 'base64'), { status: Number(process.env.FAKE_GITHUB_STATUS), headers: { 'content-type': 'application/json' } });",
+      "};",
+    ].join("\n"));
+    // Formatting characters too, as in `hostile` (below).
+    const nasty = hostile;
+    for (const [status, body] of [[200, JSON.stringify({ errors: [{ message: nasty }] })], [502, nasty]] as const) {
+      const run = cli(["wait", "octo/widgets#7", "--timeout", "1s"], {
+        WATCHERONI_SERVER: null, WATCHERONI_API_KEY: null, GH_TOKEN: "x",
+        NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`, FAKE_GITHUB_STATUS: String(status), FAKE_GITHUB_BODY: Buffer.from(body).toString("base64"),
+      });
+      expect(await run.code, run.stderr()).toBe(2);
+      expect(run.stderr()).toMatch(/^watcheroni: octo\/widgets#7: .*\[31mred.*end ?; trying again next time$/m);
+      expect(run.stderr()).not.toMatch(RAW);
+    }
+  });
+
   // Anything but line breaks, as CONTROLS, and formatting characters too.
-  const RAW = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
-  const hostile = `${NASTY}\u200b\u2028\u202e\ufeff`;
+  const RAW = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+  const hostile = `${NASTY}\u200b\u2028\u202e\ufeff\u200c\u202a\u2066\u061c\u180e`;
   // JSON output carries `hostile` escaped, not lost.
   const escaped = (out: string) => {
     expect(out).not.toMatch(RAW);
     expect(out).toContain(String.raw`\u001b[31mred`);
-    expect(out).toContain(String.raw`\u009b2J\u0000end\u200b\u2028\u202e\ufeff`);
+    expect(out).toContain(String.raw`\u009b2J\u0000end\u200b\u2028\u202e\ufeff\u200c\u202a\u2066\u061c\u180e`);
   };
   const injectHostile = (id: string, pr = 7) => fake.inject("box", hostile, { state: hostile, path: hostile, name: hostile }, id, null, pr);
 

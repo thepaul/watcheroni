@@ -22,7 +22,12 @@ export function forgetWarnings(): void {
 export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: Fetch = fetchSnapshot, all = true, only?: Set<string>): Promise<WatchEvent[]> {
   const added: WatchEvent[] = [];
   inbox.refresh();
-  for (const w of inbox.watched()) {
+  const watched = inbox.watched();
+  // A PR no longer watched (unwatched or ended, here or by another
+  // process) is forgotten, so watching it again warns again.
+  const keys = new Set(watched.map((w) => `${w.target.owner}/${w.target.name}#${w.target.number}`));
+  for (const key of unreadableRuns) if (!keys.has(key)) unreadableRuns.delete(key);
+  for (const w of watched) {
     if (w.sub && !all) continue;
     const key = `${w.target.owner}/${w.target.name}#${w.target.number}`;
     if (only && !only.has(key)) continue;
@@ -36,6 +41,7 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       if (e instanceof GitHubError && e.status === 404) {
         log(`${key}: no such pull request, or your GitHub login can't see it; no longer watching it`);
         inbox.unwatch(key);
+        unreadableRuns.delete(key);
         continue;
       }
       log(`${key}: ${(e as Error).message}; trying again next time`);
@@ -70,6 +76,7 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
           links: { html: next.url },
         }]));
         inbox.end(key);
+        unreadableRuns.delete(key);
       } else {
         inbox.record(key, next, []);
       }
@@ -83,7 +90,10 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
     }
     const events = diff(w.snapshot, next);
     added.push(...inbox.record(key, next, events));
-    if (events.some((e) => e.kind === "watch.ended")) inbox.end(key);
+    if (events.some((e) => e.kind === "watch.ended")) {
+      inbox.end(key);
+      unreadableRuns.delete(key);
+    }
   }
   return added;
 }
