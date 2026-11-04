@@ -19,7 +19,7 @@ const BODY = "--jq .body";
 export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string, repoEnded = false): string {
   const groups = new Map<string, WatchEvent[]>();
   for (const e of events) {
-    const repo = e.repo ? word(e.repo.full_name) : "other";
+    const repo = e.repo ? word(e.repo.full_name) : e.kind.startsWith("inbox.") ? "inbox" : "other";
     const key = e.repo && e.pr !== null ? `${repo}#${e.pr}` : repo;
     groups.set(key, [...(groups.get(key) ?? []), e]);
   }
@@ -142,8 +142,12 @@ function describe(e: WatchEvent): [string, string | null] {
         : `watch.unverified: the server's access check lapsed; run \`watcheroni login\`, then name the ${e.pr === null ? "repository" : "PR"} again`, null];
     case "watch.revoked":
       return ["watch.revoked: the watcheroni App lost access to this repo", null];
-    case "inbox.gap":
-      return [`inbox.gap: events after ${id(d.missed_after) ?? "?"} were dropped before they were read; check the watched PRs on GitHub`, null];
+    case "inbox.gap": {
+      // The server dropped them for age or number before they were read.
+      const missed = typeof d.missed_after === "number" && typeof d.resumed_at === "number" ? d.resumed_at - d.missed_after - 1 : NaN;
+      const what = missed === 1 ? "1 event was dropped before it was" : `${Number.isSafeInteger(missed) && missed > 0 ? `${missed} ` : ""}events were dropped before they were`;
+      return [`inbox.gap: ${what} read; check the watched PRs on GitHub`, null];
+    }
     default: {
       const path = typeof e.links.api === "string" ? /^https:\/\/api\.github\.com\/([\w.\/-]+)$/.exec(e.links.api)?.[1] : undefined;
       return [`${word(e.kind)}${by(e)}`, path && !path.includes("..") ? `gh api ${path}` : null];

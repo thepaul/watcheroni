@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { HUB_KINDS, WEBHOOK_KINDS } from "../../server/src/kinds.ts";
+import { ACCOUNT_KINDS, HUB_KINDS, WEBHOOK_KINDS } from "../../server/src/kinds.ts";
 import { LOCAL_KINDS } from "../src/diff.ts";
 
 // docs/events.md has a `### \`kind\`` section for every kind the server or
@@ -11,7 +11,7 @@ import { LOCAL_KINDS } from "../src/diff.ts";
 // code is checked against (server/src/kinds.ts, cli/src/diff.ts).
 
 const DOC = readFileSync(join(import.meta.dirname, "..", "..", "..", "docs", "events.md"), "utf8");
-const SERVER = new Set<string>([...WEBHOOK_KINDS, ...HUB_KINDS]);
+const SERVER = new Set<string>([...WEBHOOK_KINDS, ...HUB_KINDS, ...ACCOUNT_KINDS]);
 const LOCAL = new Set<string>(LOCAL_KINDS);
 
 function sections(): Map<string, string> {

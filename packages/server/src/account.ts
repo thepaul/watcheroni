@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import type { AccountKind } from "./kinds";
 import type { ActivityItem } from "./repo-hub";
 import {
   ACCOUNT_MAX_INBOXES,
@@ -8,6 +9,7 @@ import {
   ACCOUNT_MAX_SUBSCRIPTIONS,
   ACCOUNT_REQUESTS_PER_MINUTE,
   INBOX_IDLE_DAYS,
+  INBOX_MAX_AGE_DAYS,
   INBOX_MAX_EVENTS,
   MAX_LIMIT,
   problem,
@@ -101,6 +103,11 @@ const SUBPROTOCOL = "watcheroni.v1";
 // How long a client refused for too many long polls should wait. Most end
 // well within this, when an event comes or their wait runs out.
 const LONG_POLL_RETRY_SECONDS = 30;
+const INBOX_MAX_AGE_MS = INBOX_MAX_AGE_DAYS * 24 * 3600 * 1000;
+// The alarm that deletes events past INBOX_MAX_AGE_MS runs at most this
+// often. Reads leave them out meanwhile, so this only bounds how long they
+// take up storage.
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
 export class Account extends DurableObject<Env> {
   private readonly instance = crypto.randomUUID();
@@ -420,7 +427,7 @@ export class Account extends DurableObject<Env> {
 
   // RPC: append events to inboxes and push them to waiting sockets. In the
   // full design RepoHub calls this; in the prototype /debug does.
-  deliver(items: Delivery[]): { delivered: number; duplicates: number } {
+  async deliver(items: Delivery[]): Promise<{ delivered: number; duplicates: number }> {
     let delivered = 0;
     let duplicates = 0;
     const touched = new Set<string>();
@@ -444,8 +451,30 @@ export class Account extends DurableObject<Env> {
       // A `watch.*` event is the subscription's last.
       if (event.sub && event.kind.startsWith("watch.")) this.sql.exec("DELETE FROM subscriptions WHERE id = ?", event.sub);
     }
+    // Whenever events are stored, an alarm is due to delete them once
+    // they're too old; it sets the next one itself.
+    if (delivered && (await this.ctx.storage.getAlarm()) === null) {
+      await this.ctx.storage.setAlarm(Date.now() + INBOX_MAX_AGE_MS);
+    }
     for (const name of touched) this.push(name);
     return { delivered, duplicates };
+  }
+
+  // Deletes every inbox's events older than INBOX_MAX_AGE_MS, then waits
+  // for the next to get that old (but at least PRUNE_INTERVAL_MS, so a
+  // steady stream of events doesn't wake it each time). Each inbox loses
+  // everything up to its newest such event, so what's kept stays a run of
+  // consecutive seqs, as eventsAfter expects.
+  override async alarm(): Promise<void> {
+    if (!this.created) return;
+    this.open();
+    const now = Date.now();
+    const old = this.sql
+      .exec<{ inbox: string; seq: number }>("SELECT inbox, MAX(seq) AS seq FROM events WHERE at < ? GROUP BY inbox", now - INBOX_MAX_AGE_MS)
+      .toArray();
+    for (const { inbox, seq } of old) this.sql.exec("DELETE FROM events WHERE inbox = ? AND seq <= ?", inbox, seq);
+    const next = this.sql.exec<{ at: number | null }>("SELECT MIN(at) AS at FROM events").one().at;
+    if (next !== null) await this.ctx.storage.setAlarm(Math.max(next + INBOX_MAX_AGE_MS, now + PRUNE_INTERVAL_MS));
   }
 
   // RPC: what the hibernation test looks at.
@@ -578,15 +607,49 @@ export class Account extends DurableObject<Env> {
     return this.sql.exec<InboxRow>("SELECT * FROM inboxes WHERE name = ?", name).toArray()[0] ?? null;
   }
 
+  // Up to `limit` events after `after`, leaving out any older than
+  // INBOX_MAX_AGE_MS that the alarm hasn't deleted yet. The events kept
+  // are consecutive seqs, so a reader is behind them exactly when the
+  // first one isn't `after + 1` (or, with none kept, when `after` is
+  // before `head`). Such a reader first gets an `inbox.gap`, made here,
+  // not stored. It takes the seq just before the first event kept (the
+  // last one dropped), so handling it moves the reader past the gap, and
+  // asking again from there brings no second one.
   private eventsAfter(name: string, after: number, limit: number): WatchEvent[] {
-    return this.sql
+    const now = Date.now();
+    const events = this.sql
       .exec<{ body: string }>(
-        "SELECT body FROM events WHERE inbox = ? AND seq > ? ORDER BY seq LIMIT ?",
-        name, after, limit,
+        "SELECT body FROM events WHERE inbox = ? AND seq > ? AND at >= ? ORDER BY seq LIMIT ?",
+        name, after, now - INBOX_MAX_AGE_MS, limit,
       )
       .toArray()
       .map((row) => JSON.parse(row.body) as WatchEvent);
+    if (events.length && events[0].seq === after + 1) return events;
+    const resumedAt = events.length ? events[0].seq : (this.inbox(name)?.head ?? 0) + 1;
+    if (after + 1 >= resumedAt) return events;
+    return [gapEvent(name, after, resumedAt, now), ...events.slice(0, limit - 1)];
   }
+}
+
+// The `inbox.gap` for a reader at `after` whose next event kept is
+// `resumedAt`. Its ID is the same however often it's made.
+function gapEvent(inbox: string, after: number, resumedAt: number, now: number): WatchEvent {
+  const at = new Date(now).toISOString();
+  const kind: AccountKind = "inbox.gap";
+  return {
+    v: 1,
+    seq: resumedAt - 1,
+    id: `inbox:${inbox}.gap.${after}.${resumedAt}`,
+    sub: null,
+    kind,
+    at,
+    received_at: at,
+    repo: null,
+    pr: null,
+    actor: null,
+    data: { missed_after: after, resumed_at: resumedAt },
+    links: {},
+  };
 }
 
 function subscriptionInfo(row: SubscriptionRow): SubscriptionInfo {

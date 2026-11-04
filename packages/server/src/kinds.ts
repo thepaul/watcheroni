@@ -1,5 +1,5 @@
-// Every kind the server sends, by where it comes from. normalise.ts and
-// repo-hub.ts take their kinds' types from here, so a kind can't be sent
+// Every kind the server sends, by where it comes from. normalise.ts,
+// repo-hub.ts and account.ts take their kinds' types from here, so a kind can't be sent
 // without being listed, and a test checks docs/events.md against these
 // lists (and the CLI's local ones, in packages/cli/src/diff.ts).
 
@@ -39,6 +39,10 @@ export const HUB_KINDS = [
   "repo.unthrottled",
 ] as const;
 
+// Made by Account when a reader's position is older than what its inbox
+// still keeps.
+export const ACCOUNT_KINDS = ["inbox.gap"] as const;
+
 // Produced by the normaliser for RepoHub's own use, never delivered:
 // `pr.seen` carries a PR's head, base, author and state for repo-wide
 // `base` and `author` filters.
@@ -46,4 +50,5 @@ export const INTERNAL_KINDS = ["pr.seen"] as const;
 
 export type WebhookKind = (typeof WEBHOOK_KINDS)[number];
 export type HubKind = (typeof HUB_KINDS)[number];
+export type AccountKind = (typeof ACCOUNT_KINDS)[number];
 export type InternalKind = (typeof INTERNAL_KINDS)[number];

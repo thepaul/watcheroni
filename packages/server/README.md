@@ -37,7 +37,7 @@ What's here, compared with the full design:
 - **Not yet:** Control, re-verifying private
   subscriptions (`/verify`), expiring subscriptions, revoking keys on the
   `github_app_authorization` webhook (`Account.revokeAllKeys` is ready for
-  it), `inbox.gap`. The tests stub GitHub.
+  it). The tests stub GitHub.
 
 ## Develop
 

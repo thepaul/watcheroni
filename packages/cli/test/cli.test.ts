@@ -141,6 +141,22 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(2);
   });
 
+  it("wakes on inbox.gap whatever --kinds says, and says what to do", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    const run = cli(["wait", "octo/widgets#7", "--settle", "0", "--kinds", "check.*"]);
+    await until(() => fake.sockets.size === 1);
+    fake.gap("box", 0, 41);
+    expect(await run.code, run.stderr()).toBe(0);
+    expect(run.stdout()).toBe([
+      "inbox: 1 new event",
+      "- inbox.gap: 40 events were dropped before they were read; check the watched PRs on GitHub",
+      "",
+      "octo/widgets#7 is still open. Run `watcheroni wait` again to keep watching.",
+      "",
+    ].join("\n"));
+    expect(fake.inbox("box").acked).toBe(40);
+  });
+
   it("remembers --kinds given with a PR, until it's changed", async () => {
     fake.repos.set("octo/widgets", { private: false });
     fake.inject("box", "comment.created");

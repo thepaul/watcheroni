@@ -43,12 +43,14 @@ export const INBOX_NAME = /^[A-Za-z0-9._-]{1,64}$/;
 export const MAX_WAIT_SECONDS = 300;
 export const MAX_LIMIT = 500;
 export const INBOX_MAX_EVENTS = 1000;
+export const INBOX_MAX_AGE_DAYS = 7;
 
 // Kind patterns, as in `--kinds check.*,review.submitted`: an exact kind,
 // a prefix ending in `.*`, or `*`. `watch.*` kinds always match, because
-// they say the subscription ended.
+// they say the subscription ended, and so do `inbox.*`, which say events
+// were missed.
 export function matchesKind(patterns: readonly string[], kind: string): boolean {
-  if (!patterns.length || kind.startsWith("watch.")) return true;
+  if (!patterns.length || kind.startsWith("watch.") || kind.startsWith("inbox.")) return true;
   return patterns.some((p) => p === "*" || p === kind || (p.endsWith(".*") && kind.startsWith(p.slice(0, -1))));
 }
 

@@ -1,4 +1,4 @@
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { AccountStats } from "../src/account";
@@ -7,6 +7,8 @@ import {
   ACCOUNT_MAX_LONG_POLLS,
   ACCOUNT_MAX_SOCKETS,
   INBOX_IDLE_DAYS,
+  INBOX_MAX_AGE_DAYS,
+  INBOX_MAX_EVENTS,
   type EventsPage,
   type LoginResponse,
   type ServerMessage,
@@ -156,6 +158,102 @@ describe("WebSocket", () => {
     await inject(inbox);
     await sleep(100);
     expect(c.messages).toEqual([]);
+    c.ws.close();
+  });
+});
+
+describe("gaps", () => {
+  const stub = () => env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${ACCOUNT_ID}`));
+  const read = async (inbox: string, query = "") => (await call(`/v1/inboxes/${inbox}/events${query}`)).json<EventsPage>();
+  const DAY = 24 * 3600 * 1000;
+  // Makes an inbox's events up to `seq` older than an inbox keeps.
+  const age = (inbox: string, seq: number) =>
+    runInDurableObject(stub(), (_, state) => {
+      state.storage.sql.exec("UPDATE events SET at = ? WHERE inbox = ? AND seq <= ?", Date.now() - (INBOX_MAX_AGE_DAYS + 1) * DAY, inbox, seq);
+    });
+
+  it(`starts a read from before the last ${INBOX_MAX_EVENTS} events with inbox.gap`, async () => {
+    const inbox = await newInbox();
+    for (let i = 0; i < 10; i++) await inject(inbox, { count: 100 });
+    await inject(inbox, { count: 5 });
+    // The first event kept, of 1,005.
+    const first = 1005 - INBOX_MAX_EVENTS + 1;
+
+    const page = await read(inbox, "?after=0&limit=3&wait=30");
+    expect(page.events.map((e) => [e.seq, e.kind])).toEqual([[first - 1, "inbox.gap"], [first, "debug.ping"], [first + 1, "debug.ping"]]);
+    expect(page.events[0]).toMatchObject({ v: 1, sub: null, repo: null, pr: null, actor: null, data: { missed_after: 0, resumed_at: first } });
+    expect(page.next).toBe(first + 1);
+    // From acked (0), the same gap, under the same ID.
+    const again = await read(inbox, "?limit=1");
+    expect(again.events).toEqual([{ ...page.events[0], at: again.events[0].at, received_at: again.events[0].received_at }]);
+    expect(again.next).toBe(first - 1);
+    // Past it, or right at the boundary, there's none.
+    expect((await read(inbox, `?after=${first - 1}&limit=1`)).events.map((e) => e.seq)).toEqual([first]);
+    // A position inside what was dropped gets its own.
+    expect((await read(inbox, "?after=3&limit=1")).events[0]).toMatchObject({ seq: first - 1, data: { missed_after: 3, resumed_at: first } });
+  });
+
+  it("sends inbox.gap over the WebSocket too", async () => {
+    const inbox = await newInbox();
+    await inject(inbox, { count: 4 });
+    await age(inbox, 2);
+    const c = await connect(inbox);
+    c.ws.send(JSON.stringify({ type: "hello", after: 1 }));
+    await c.waitFor((m) => eventsOf(m).length === 3);
+    expect(eventsOf(c.messages).map((e) => [e.seq, e.kind])).toEqual([[2, "inbox.gap"], [3, "debug.ping"], [4, "debug.ping"]]);
+    expect(eventsOf(c.messages)[0].data).toEqual({ missed_after: 1, resumed_at: 3 });
+    // New events follow without another.
+    await inject(inbox);
+    await c.waitFor((m) => eventsOf(m).length === 4);
+    expect(eventsOf(c.messages)[3]).toMatchObject({ seq: 5, kind: "debug.ping" });
+    c.ws.close();
+  });
+
+  it("drops events older than the inbox keeps, from reads at once and from storage at the alarm", async () => {
+    const inbox = await newInbox();
+    await inject(inbox, { count: 3 });
+    expect(await runInDurableObject(stub(), (_, state) => state.storage.getAlarm())).not.toBeNull();
+    await age(inbox, 2);
+    expect((await read(inbox, "?after=0")).events.map((e) => [e.seq, e.kind])).toEqual([[2, "inbox.gap"], [3, "debug.ping"]]);
+
+    expect(await runDurableObjectAlarm(stub())).toBe(true);
+    const kept = () =>
+      runInDurableObject(stub(), (_, state) =>
+        state.storage.sql.exec<{ seq: number }>("SELECT seq FROM events WHERE inbox = ? ORDER BY seq", inbox).toArray().map((r) => r.seq),
+      );
+    expect(await kept()).toEqual([3]);
+    // Events remain, so the alarm set itself again.
+    const next = await runInDurableObject(stub(), (_, state) => state.storage.getAlarm());
+    expect(next).toBeGreaterThan(Date.now());
+
+    // With nothing left, a reader behind `head` still hears of it; the gap
+    // takes `head`, and resumes at the next event to come.
+    await age(inbox, 3);
+    expect(await runDurableObjectAlarm(stub())).toBe(true);
+    expect(await kept()).toEqual([]);
+    const page = await read(inbox, "?after=1");
+    expect(page.events.map((e) => [e.seq, e.kind])).toEqual([[3, "inbox.gap"]]);
+    expect(page.events[0].data).toEqual({ missed_after: 1, resumed_at: 4 });
+    expect(page).toMatchObject({ next: 3, head: 3 });
+    expect((await read(inbox, "?after=3")).events).toEqual([]);
+    await inject(inbox);
+    expect((await read(inbox, "?after=3")).events.map((e) => e.seq)).toEqual([4]);
+  });
+
+  it("sends none to a reader that missed nothing", async () => {
+    const inbox = await newInbox();
+    expect((await read(inbox)).events).toEqual([]);
+    expect((await read(inbox, "?after=0")).events).toEqual([]);
+    await inject(inbox, { count: 2 });
+    expect((await read(inbox, "?after=0")).events.map((e) => e.kind)).toEqual(["debug.ping", "debug.ping"]);
+    expect((await read(inbox, "?after=2")).events).toEqual([]);
+    // A position ahead of `head` (say, from an inbox since deleted and made again).
+    expect((await read(inbox, "?after=9")).events).toEqual([]);
+    const c = await connect(inbox);
+    c.ws.send(JSON.stringify({ type: "hello" }));
+    await c.waitFor((m) => eventsOf(m).length === 2);
+    await sleep(50);
+    expect(eventsOf(c.messages).map((e) => e.kind)).toEqual(["debug.ping", "debug.ping"]);
     c.ws.close();
   });
 });

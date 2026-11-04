@@ -12,7 +12,8 @@ When an event makes the current state worth knowing, ask GitHub.
 
 **Server** events come from the GitHub App's webhooks
 (`packages/server/src/webhook/normalise.ts`), except `watch.*` and
-`repo.*`, which the server makes itself (`packages/server/src/repo-hub.ts`).
+`repo.*`, which the server makes itself (`packages/server/src/repo-hub.ts`),
+and `inbox.gap` (`packages/server/src/account.ts`).
 A subscription on one PR gets events whose `pr` is that PR. A
 repository-wide subscription gets every PR's events and the repo's
 issues, narrowed by its `kinds` and by `base` and `author` if it has
@@ -420,10 +421,21 @@ the repo.
 but the CLI's own `--kinds` filter lets only `watch.*` through, so
 `watcheroni wait --kinds check.*` doesn't print them.
 
-PROTOCOL.md also describes `inbox.gap`, for a reader whose position
-fell behind the oldest event kept. The server doesn't send it yet: an
-inbox keeps its last 1,000 events, and older ones are dropped without
-notice.
+### `inbox.gap`
+
+The reader's position is older than the oldest event the inbox still
+keeps, so it missed some. Re-read what it watches from GitHub.
+
+`data`: `missed_after` (the reader's position), `resumed_at` (the `seq`
+of the first event kept after the gap).
+
+**Server:** at the start of a read (a long poll, or a WebSocket's
+`hello`) from a position before what the inbox keeps: its last 1,000
+events, none older than 7 days. It isn't stored; its `seq` is
+`resumed_at - 1`, so a reader that handles it is past the gap. The CLI
+always lets it through `--kinds`.
+
+**Local mode:** Not sent.
 
 ## Not tracked
 
