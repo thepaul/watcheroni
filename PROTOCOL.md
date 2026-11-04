@@ -170,7 +170,9 @@ DELETE /v1/keys/{key_id}     revoke one; DELETE /v1/keys/current revokes the cal
 Keys list oldest first (`{"keys": [...]}`); a revoked key is left out.
 Revoking answers `204`, or `404` if there was no such live key, and
 closes that key's open WebSockets with `4001`. `last_used_at` is
-approximate (updated at most once an hour).
+approximate (updated at most once an hour). A client that signs in again
+should revoke the key the new one replaces, since every live key counts
+toward `limits.keys_per_account`.
 
 If the user revokes the App's authorization in GitHub's settings, the
 server revokes all of that account's keys.

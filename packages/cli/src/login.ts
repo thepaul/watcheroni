@@ -185,10 +185,37 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
     },
   };
   const creds = readCredentials();
+  const replaced = creds.servers[server];
   creds.servers[server] = entry;
+  // Saved first, so a revoke that goes wrong can't lose the new key.
   writeCredentials(creds);
   print(`Signed in to ${server} as ${body.account.login}.`);
+  if (replaced?.api_key && replaced.api_key !== entry.api_key) await revokeReplaced(server, replaced, entry, deps);
   return entry;
+}
+
+// Revokes the key a new login replaced, which would otherwise stay live
+// and count against the account's keys. The new key revokes it by ID if
+// it's on the same account; a key from another account (or saved with no
+// ID) revokes itself. Failing only warns: the login has worked.
+async function revokeReplaced(server: string, old: ServerCredentials, entry: ServerCredentials, deps: LoginDeps): Promise<void> {
+  const byId = Boolean(old.key_id) && old.account?.id === entry.account.id;
+  if (byId && old.key_id === entry.key_id) return;
+  try {
+    const res = byId
+      ? await deps.fetch(`${server}/v1/keys/${encodeURIComponent(old.key_id)}`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${entry.api_key}` },
+        })
+      : await deps.fetch(`${server}/v1/keys/current`, {
+          method: "DELETE",
+          headers: { Authorization: `Bearer ${old.api_key}` },
+        });
+    // 404 by ID, or 401 for the old key itself: already revoked.
+    if (!res.ok && res.status !== (byId ? 404 : 401)) deps.print(`The server didn't revoke the previous key (${res.status}); it stays live.`);
+  } catch (e) {
+    deps.print(`Couldn't reach ${server} to revoke the previous key (${(e as Error).message}); it stays live.`);
+  }
 }
 
 // The longest a login waits out a 429 before giving up.
