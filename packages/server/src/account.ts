@@ -335,7 +335,7 @@ export class Account extends DurableObject<Env> {
     this.open();
     this.sql.exec("UPDATE inboxes SET last_read_at = ? WHERE name = ?", Date.now(), name);
     const from = after ?? inbox.acked;
-    const events = this.eventsAfter(name, from, limit);
+    const events = this.eventsAfter(name, from, limit, inbox.head);
     return {
       events,
       next: events.length ? events[events.length - 1].seq : from,
@@ -452,9 +452,12 @@ export class Account extends DurableObject<Env> {
       if (event.sub && event.kind.startsWith("watch.")) this.sql.exec("DELETE FROM subscriptions WHERE id = ?", event.sub);
     }
     // Whenever events are stored, an alarm is due to delete them once
-    // they're too old; it sets the next one itself.
+    // they're too old; it sets the next one itself. It's due when the oldest
+    // kept gets too old, which may be now for an account whose events
+    // predate the alarm.
     if (delivered && (await this.ctx.storage.getAlarm()) === null) {
-      await this.ctx.storage.setAlarm(Date.now() + INBOX_MAX_AGE_MS);
+      const oldest = this.sql.exec<{ at: number }>("SELECT MIN(at) AS at FROM events").one().at;
+      await this.ctx.storage.setAlarm(Math.max(oldest + INBOX_MAX_AGE_MS, Date.now()));
     }
     for (const name of touched) this.push(name);
     return { delivered, duplicates };
@@ -562,7 +565,10 @@ export class Account extends DurableObject<Env> {
       case "hello": {
         const inbox = this.inbox(attachment.inbox);
         if (!inbox) return ws.close(4004, "inbox deleted");
-        attachment.pos = typeof msg.after === "number" ? msg.after : inbox.acked;
+        if (msg.after != null && !(Number.isSafeInteger(msg.after) && msg.after >= 0)) {
+          return send(ws, { type: "error", code: "invalid_request", detail: "after must be a non-negative integer" });
+        }
+        attachment.pos = msg.after ?? inbox.acked;
         ws.serializeAttachment(attachment);
         this.sql.exec("UPDATE inboxes SET last_read_at = ? WHERE name = ?", Date.now(), inbox.name);
         send(ws, { type: "ready", inbox: inbox.name, head: inbox.head, acked: inbox.acked });
@@ -597,7 +603,11 @@ export class Account extends DurableObject<Env> {
       const events = this.eventsAfter(attachment.inbox, attachment.pos, MAX_LIMIT);
       if (!events.length) return;
       send(ws, { type: "events", events });
-      attachment.pos = events[events.length - 1].seq;
+      const last = events[events.length - 1].seq;
+      // Every page should move the position on; if one doesn't, stop
+      // rather than send it forever.
+      if (last <= attachment.pos) return;
+      attachment.pos = last;
       ws.serializeAttachment(attachment);
     }
   }
@@ -614,9 +624,12 @@ export class Account extends DurableObject<Env> {
   // before `head`). Such a reader first gets an `inbox.gap`, made here,
   // not stored. It takes the seq just before the first event kept (the
   // last one dropped), so handling it moves the reader past the gap, and
-  // asking again from there brings no second one.
-  private eventsAfter(name: string, after: number, limit: number): WatchEvent[] {
+  // asking again from there brings no second one. `head` saves looking up
+  // the inbox when the caller has it.
+  private eventsAfter(name: string, after: number, limit: number, head?: number): WatchEvent[] {
     const now = Date.now();
+    // Leaving out old events by `at` keeps what's left consecutive only
+    // because `at` rises with `seq`.
     const events = this.sql
       .exec<{ body: string }>(
         "SELECT body FROM events WHERE inbox = ? AND seq > ? AND at >= ? ORDER BY seq LIMIT ?",
@@ -625,7 +638,7 @@ export class Account extends DurableObject<Env> {
       .toArray()
       .map((row) => JSON.parse(row.body) as WatchEvent);
     if (events.length && events[0].seq === after + 1) return events;
-    const resumedAt = events.length ? events[0].seq : (this.inbox(name)?.head ?? 0) + 1;
+    const resumedAt = events.length ? events[0].seq : (head ?? this.inbox(name)?.head ?? 0) + 1;
     if (after + 1 >= resumedAt) return events;
     return [gapEvent(name, after, resumedAt, now), ...events.slice(0, limit - 1)];
   }

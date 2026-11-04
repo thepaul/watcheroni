@@ -152,6 +152,20 @@ describe("WebSocket", () => {
     ws.close();
   });
 
+  it("refuses a hello whose after isn't a non-negative integer", async () => {
+    const inbox = await newInbox();
+    await inject(inbox, { count: 2 });
+    const c = await connect(inbox);
+    for (const after of [-1, 1.5, "1"]) c.ws.send(JSON.stringify({ type: "hello", after }));
+    await c.waitFor((m) => m.length === 3);
+    expect(c.messages.map((m) => m.type === "error" && m.code)).toEqual(["invalid_request", "invalid_request", "invalid_request"]);
+    // Nothing was sent from those, and a good hello still works.
+    c.ws.send(JSON.stringify({ type: "hello", after: 1 }));
+    await c.waitFor((m) => eventsOf(m).length === 1);
+    expect(eventsOf(c.messages).map((e) => [e.seq, e.kind])).toEqual([[2, "debug.ping"]]);
+    c.ws.close();
+  });
+
   it("pushes nothing before hello", async () => {
     const inbox = await newInbox();
     const c = await connect(inbox);
@@ -163,14 +177,32 @@ describe("WebSocket", () => {
 });
 
 describe("gaps", () => {
-  const stub = () => env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${ACCOUNT_ID}`));
+  const stub = (account = ACCOUNT_ID) => env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${account}`));
   const read = async (inbox: string, query = "") => (await call(`/v1/inboxes/${inbox}/events${query}`)).json<EventsPage>();
   const DAY = 24 * 3600 * 1000;
   // Makes an inbox's events up to `seq` older than an inbox keeps.
-  const age = (inbox: string, seq: number) =>
-    runInDurableObject(stub(), (_, state) => {
+  const age = (inbox: string, seq: number, account = ACCOUNT_ID) =>
+    runInDurableObject(stub(account), (_, state) => {
       state.storage.sql.exec("UPDATE events SET at = ? WHERE inbox = ? AND seq <= ?", Date.now() - (INBOX_MAX_AGE_DAYS + 1) * DAY, inbox, seq);
     });
+  const kept = (inbox: string, account = ACCOUNT_ID) =>
+    runInDurableObject(stub(account), (_, state) =>
+      state.storage.sql.exec<{ seq: number }>("SELECT seq FROM events WHERE inbox = ? ORDER BY seq", inbox).toArray().map((r) => r.seq),
+    );
+  const alarmAt = (account = ACCOUNT_ID) => runInDurableObject(stub(account), (_, state) => state.storage.getAlarm());
+  // An account of its own, for tests that look at its one alarm.
+  let accountCounter = 2000;
+  async function ownAccount() {
+    const account = accountCounter++;
+    const res = await exports.default.fetch(`${BASE}/debug/accounts/${account}/keys`, { method: "POST", headers: DEBUG });
+    const auth = { Authorization: `Bearer ${(await res.json<LoginResponse>()).api_key}` };
+    const newBox = async (name: string) => {
+      expect((await exports.default.fetch(`${BASE}/v1/inboxes/${name}`, { method: "PUT", headers: auth })).status).toBe(200);
+    };
+    const add = (inbox: string, count = 1) =>
+      exports.default.fetch(`${BASE}/debug/accounts/${account}/inboxes/${inbox}/events`, { method: "POST", headers: DEBUG, body: JSON.stringify({ count }) });
+    return { account, newBox, add };
+  }
 
   it(`starts a read from before the last ${INBOX_MAX_EVENTS} events with inbox.gap`, async () => {
     const inbox = await newInbox();
@@ -217,11 +249,7 @@ describe("gaps", () => {
     expect((await read(inbox, "?after=0")).events.map((e) => [e.seq, e.kind])).toEqual([[2, "inbox.gap"], [3, "debug.ping"]]);
 
     expect(await runDurableObjectAlarm(stub())).toBe(true);
-    const kept = () =>
-      runInDurableObject(stub(), (_, state) =>
-        state.storage.sql.exec<{ seq: number }>("SELECT seq FROM events WHERE inbox = ? ORDER BY seq", inbox).toArray().map((r) => r.seq),
-      );
-    expect(await kept()).toEqual([3]);
+    expect(await kept(inbox)).toEqual([3]);
     // Events remain, so the alarm set itself again.
     const next = await runInDurableObject(stub(), (_, state) => state.storage.getAlarm());
     expect(next).toBeGreaterThan(Date.now());
@@ -230,7 +258,7 @@ describe("gaps", () => {
     // takes `head`, and resumes at the next event to come.
     await age(inbox, 3);
     expect(await runDurableObjectAlarm(stub())).toBe(true);
-    expect(await kept()).toEqual([]);
+    expect(await kept(inbox)).toEqual([]);
     const page = await read(inbox, "?after=1");
     expect(page.events.map((e) => [e.seq, e.kind])).toEqual([[3, "inbox.gap"]]);
     expect(page.events[0].data).toEqual({ missed_after: 1, resumed_at: 4 });
@@ -238,6 +266,58 @@ describe("gaps", () => {
     expect((await read(inbox, "?after=3")).events).toEqual([]);
     await inject(inbox);
     expect((await read(inbox, "?after=3")).events.map((e) => e.seq)).toEqual([4]);
+  });
+
+  it(`sends inbox.gap through the bridge to a long poll that more than ${INBOX_MAX_EVENTS} events overtake`, async () => {
+    const inbox = await newInbox();
+    const poll = call(`/v1/inboxes/${inbox}/events?after=0&wait=30`);
+    await sleep(200);
+    expect((await stats()).sockets.filter((s) => s.inbox === inbox && s.mode === "bridge")).toHaveLength(1);
+    // More than the debug endpoint takes at once, straight to the account.
+    const now = new Date().toISOString();
+    await stub().deliver(
+      Array.from({ length: INBOX_MAX_EVENTS + 5 }, (_, i) => ({
+        inbox,
+        event: { v: 1, id: `bulk:${inbox}:${i}`, sub: null, kind: "debug.ping", at: now, received_at: now, repo: null, pr: null, actor: null, data: {}, links: {} },
+      })),
+    );
+    const page = await (await poll).json<EventsPage>();
+    expect(page.events.slice(0, 2).map((e) => [e.seq, e.kind])).toEqual([[5, "inbox.gap"], [6, "debug.ping"]]);
+    expect(page.events[0].data).toEqual({ missed_after: 0, resumed_at: 6 });
+  });
+
+  it("sets the alarm for when the oldest event kept gets too old, even if that's now", async () => {
+    const { account, newBox, add } = await ownAccount();
+    await newBox("box");
+    await add("box", 2);
+    // As for an account whose events predate the alarm.
+    await age("box", 1, account);
+    await runInDurableObject(stub(account), (_, state) => state.storage.deleteAlarm());
+    await add("box");
+    // It's due at once, so it runs and prunes by itself.
+    for (let i = 0; i < 200 && (await kept("box", account))[0] === 1; i++) await sleep(10);
+    expect(await kept("box", account)).toEqual([2, 3]);
+  });
+
+  it("prunes every inbox at the alarm, and leaves none set once nothing's kept", async () => {
+    const { account, newBox, add } = await ownAccount();
+    await newBox("a");
+    await newBox("b");
+    await add("a", 3);
+    await add("b", 3);
+    await age("a", 2, account);
+    await age("b", 1, account);
+    expect(await runDurableObjectAlarm(stub(account))).toBe(true);
+    expect(await kept("a", account)).toEqual([3]);
+    expect(await kept("b", account)).toEqual([2, 3]);
+    expect(await alarmAt(account)).not.toBeNull();
+
+    await age("a", 3, account);
+    await age("b", 3, account);
+    expect(await runDurableObjectAlarm(stub(account))).toBe(true);
+    expect(await kept("a", account)).toEqual([]);
+    expect(await kept("b", account)).toEqual([]);
+    expect(await alarmAt(account)).toBeNull();
   });
 
   it("sends none to a reader that missed nothing", async () => {

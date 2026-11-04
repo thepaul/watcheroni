@@ -157,6 +157,17 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(40);
   });
 
+  it("prints inbox.gap with --format json", async () => {
+    const run = cli(["wait", "--settle", "0", "--format", "json"]);
+    await until(() => fake.sockets.size === 1);
+    fake.gap("box", 3, 10);
+    expect(await run.code, run.stderr()).toBe(0);
+    const out = JSON.parse(run.stdout()) as { events: { seq: number; kind: string; repo: unknown; data: unknown }[] };
+    expect(out.events).toHaveLength(1);
+    expect(out.events[0]).toMatchObject({ seq: 9, kind: "inbox.gap", repo: null, data: { missed_after: 3, resumed_at: 10 } });
+    expect(fake.inbox("box").acked).toBe(9);
+  });
+
   it("remembers --kinds given with a PR, until it's changed", async () => {
     fake.repos.set("octo/widgets", { private: false });
     fake.inject("box", "comment.created");
