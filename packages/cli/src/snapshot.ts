@@ -76,6 +76,9 @@ export interface Snapshot {
   workflowRuns: WorkflowRun[] | null;
   // Why they couldn't be read, when they couldn't.
   workflowRunsError?: string;
+  // While a head's runs haven't been read, the IDs of runs a check showed
+  // still running at an earlier poll on that head (see runningRuns()).
+  runningRuns?: number[];
 }
 
 const QUERY = `

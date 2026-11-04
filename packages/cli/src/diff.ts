@@ -157,20 +157,28 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
   return events;
 }
 
+// The IDs of the runs known to have been still running at some poll on
+// `snap`'s head since its runs were last read, when they weren't read for
+// `snap`: those a check of its showed still running, and those carried
+// from the polls before it on that head (poll.ts saves them with it).
+export function runningRuns(snap: Snapshot): number[] {
+  const ids = new Set(snap.runningRuns ?? []);
+  for (const c of snap.checks) if (!c.done && c.workflowRunId !== null) ids.add(c.workflowRunId);
+  return [...ids];
+}
+
 // What's known of the workflow runs at the last poll, to compare `next`'s
 // with: `all` of them, by ID (none after a push, as every run on a new
 // head is new), or, when they weren't read (a snapshot saved before runs
-// were, or while they couldn't be), only the runs one of the last poll's
-// checks shows was still running then, as not done. Null when `next`'s
-// runs weren't read either.
+// were, or while they couldn't be), only the runs known to have been
+// still running at a poll since (see runningRuns()), as not done. Null
+// when `next`'s runs weren't read either.
 export function runsBefore(prev: Snapshot, next: Snapshot): { all: boolean; runs: Map<number, Pick<WorkflowRun, "done" | "attempt" | "conclusion">> } | null {
   if (!next.workflowRuns) return null;
   if (next.head !== prev.head) return { all: true, runs: new Map() };
   if (prev.workflowRuns) return { all: true, runs: new Map(prev.workflowRuns.map((r) => [r.id, r])) };
   const running = new Map<number, Pick<WorkflowRun, "done" | "attempt" | "conclusion">>();
-  for (const c of prev.checks) {
-    if (!c.done && c.workflowRunId !== null) running.set(c.workflowRunId, { done: false, attempt: 0, conclusion: null });
-  }
+  for (const id of runningRuns(prev)) running.set(id, { done: false, attempt: 0, conclusion: null });
   return { all: false, runs: running };
 }
 

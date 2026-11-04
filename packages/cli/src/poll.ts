@@ -1,5 +1,5 @@
 import type { WatchEvent } from "@watcheroni/protocol";
-import { diff, type LocalKind, unknownRuns } from "./diff.ts";
+import { diff, type LocalKind, runningRuns, unknownRuns } from "./diff.ts";
 import { GitHubError, LoginNeeded } from "./github.ts";
 import type { Inbox } from "./inbox.ts";
 import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
@@ -87,6 +87,9 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
     if (next.workflowRuns === null) {
       next = { ...next, workflowRuns: next.head === w.snapshot.head ? w.snapshot.workflowRuns ?? null : [] };
     }
+    // Still none on a head whose runs haven't been read: what earlier polls
+    // on it showed still running is carried forward (see runningRuns()).
+    if (next.workflowRuns === null) next = { ...next, runningRuns: runningRuns(w.snapshot) };
     // Runs read for the first time on a head after the first poll (a
     // snapshot saved before runs were read, or runs that couldn't be read
     // until now) can't all be compared with the last poll's: said once.

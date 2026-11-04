@@ -267,6 +267,25 @@ describe("polling", () => {
     other.close();
   });
 
+  it("remembers a run seen running at any poll while the runs couldn't be read", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const unreadable = (s: Snapshot) => ({ ...s, workflowRuns: null, workflowRunsError: "fetch failed" });
+    const snapshots: Snapshot[] = [
+      // Run 500's job running at the first poll, done by the second, and
+      // the runs read only at the third.
+      unreadable(snap({ checks: [check("lint", { done: false, conclusion: null })] })),
+      unreadable(snap({ checks: [check("lint")] })),
+      snap({ checks: [check("lint")], workflowRuns: [run()] }),
+    ];
+    const logged: string[] = [];
+    const events: WatchEvent[] = [];
+    for (let i = 0; i < 3; i++) events.push(...await pollOnce(inbox, (m) => logged.push(m), async () => snapshots.shift()!));
+    expect(events.filter((e) => e.kind === "workflow.completed").map((e) => e.data.run_id)).toEqual([500]);
+    expect(logged.at(-1)).toBe("octo/widgets#7: its workflow runs can be read again");
+    inbox.close();
+  });
+
   it("forgets it said so once the PR is unwatched or ends, so watching it again says so again", async () => {
     const unreadable = (o: Partial<Snapshot> = {}) => ({ ...snap({ workflowRuns: null, ...o }), workflowRunsError: "fetch failed" });
     const warning = "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read";
