@@ -696,7 +696,9 @@ describe("what the server says", () => {
     const run = cli(["wait", "--settle", "0", "--kinds", "comment.created"]);
     expect(await run.code).toBe(0);
     expect(run.stdout()).toMatch(/^octo\/widgets#7: 1 new event\n- comment.created\n/);
-    expect(run.stderr()).toMatch(/^watcheroni: skipped an event from .* \(seq 1, id "fake:[^"]*"\)\n$/);
+    expect(run.stderr()).toMatch(
+      /^watcheroni: dropped a malformed event from \S+ \(octo\/widgets#7, seq 1, id "fake:[^"]*"\): it isn't shaped as the protocol says, so it's acknowledged unshown; if this keeps happening, report it to the server's operator\n$/,
+    );
     expect(fake.inbox("box").acked).toBe(2);
   });
 

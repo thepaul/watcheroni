@@ -263,21 +263,41 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
   }
 }
 
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const isSeq = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
 // Whether an event from the server has the shape the CLI reads: fields
 // it reads as text or numbers are text or numbers, and what it looks
-// inside is an object.
+// inside is an object. The fields that may be null may also be missing.
+// New kinds and new fields always pass.
 function wellFormed(e: unknown): e is WatchEvent {
-  const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-  if (!object(e)) return false;
+  if (!isObject(e)) return false;
   const { id, kind, seq, sub, data, links, repo, pr, actor } = e;
-  return typeof id === "string" && typeof kind === "string"
-    && typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0
-    && (sub === null || sub === undefined || typeof sub === "string")
-    && object(data) && object(links)
-    && (repo === null || (object(repo) && typeof repo.full_name === "string"))
-    && (pr === null || typeof pr === "number")
-    && (actor === null || actor === undefined || object(actor));
+  return typeof id === "string" && typeof kind === "string" && isSeq(seq)
+    && (sub == null || typeof sub === "string")
+    && isObject(data) && isObject(links)
+    && (repo == null || (isObject(repo) && typeof repo.full_name === "string"))
+    && (pr == null || typeof pr === "number")
+    && (actor == null || isObject(actor));
 }
+
+// What can be told of a malformed event, cleaned: its kind, repo, PR,
+// seq and ID, where they're the right type.
+function describeMalformed(e: unknown): string {
+  const f = isObject(e) ? e : {};
+  const repo = isObject(f.repo) && typeof f.repo.full_name === "string" ? clean(f.repo.full_name, 140) : null;
+  const pr = typeof f.pr === "number" && Number.isSafeInteger(f.pr) ? f.pr : null;
+  return [
+    typeof f.kind === "string" ? `kind ${JSON.stringify(clean(f.kind))}` : null,
+    repo && (pr === null ? repo : `${repo}#${pr}`),
+    isSeq(f.seq) ? `seq ${f.seq}` : null,
+    typeof f.id === "string" ? `id ${JSON.stringify(clean(f.id))}` : null,
+  ].filter(Boolean).join(", ");
+}
+
+// What to do about something from the server that isn't as the protocol
+// has it.
+const REPORT = "if this keeps happening, report it to the server's operator";
 
 export interface ReaderOptions {
   log: (msg: string) => void;
@@ -434,6 +454,13 @@ export class ServerReader {
             continue;
           }
           this.crowded = false;
+          // A page that can't be read is taken like a 5xx: tried again
+          // with backoff, the position unmoved.
+          if (!isObject(page) || !Array.isArray(page.events) || !isSeq(page.next) || (this.pos === null && !isSeq(page.acked))) {
+            this.malformed("page of events");
+            this.outage = true;
+            throw new Unreachable(`${this.client.url} sent a malformed page of events`);
+          }
           this.markConnected();
           if (this.pos === null) this.pos = page.acked;
           this.add(page.events);
@@ -462,6 +489,7 @@ export class ServerReader {
 
   private wasConnected = false;
   private outage = false;
+  private readonly warned = new Set<string>();
   private crowded = false;
 
   // Sleeps for `ms`, or until close().
@@ -483,6 +511,14 @@ export class ServerReader {
     this.connected = true;
     this.wasConnected = true;
     this.settleFirst(true);
+  }
+
+  // Warns, once for each `what`, of something from the server that isn't
+  // as the protocol has it.
+  private malformed(what: string): void {
+    if (this.warned.has(what)) return;
+    this.warned.add(what);
+    this.o.log(`${this.client.url} sent a malformed ${what}: it isn't shaped as the protocol says; ${REPORT}`);
   }
 
   private settleFirst(connected: boolean): void {
@@ -525,12 +561,23 @@ export class ServerReader {
         } catch {
           return;
         }
-        if (msg.type === "ready") {
+        // A message that isn't as the protocol has it is ignored, but for
+        // a `ready` that can't be read: the connection is closed, to be
+        // made again with the usual backoff.
+        if (!isObject(msg)) {
+          this.malformed("message");
+        } else if (msg.type === "ready") {
+          if (!isSeq(msg.acked)) {
+            this.malformed("ready message");
+            ws.close(4000, "malformed ready");
+            return;
+          }
           this.ws = ws;
           if (this.pos === null) this.pos = msg.acked;
           this.markConnected();
         } else if (msg.type === "events") {
-          this.add(msg.events);
+          if (Array.isArray(msg.events)) this.add(msg.events);
+          else this.malformed("events message");
         } else if (msg.type === "error") {
           // The server's own words, cleaned like the rest.
           this.o.log(`${this.client.url}: ${clean(msg.code)}${msg.detail ? `: ${clean(msg.detail, PROSE_LENGTH)}` : ""}`);
@@ -559,31 +606,32 @@ export class ServerReader {
   }
 
   // Keeps new events, dropping ones already seen (delivery is at least once).
-  // An event that isn't the shape PROTOCOL.md gives would throw wherever
-  // it's read, and, never acknowledged, come back on every run. It's
-  // skipped with a warning instead, and acknowledged once nothing before
-  // it is waiting. One without a sound seq can't be placed or
-  // acknowledged; acknowledging a later event moves past it.
+  // An event that isn't the shape PROTOCOL.md gives can throw where it's
+  // read (a kind that isn't text, data that isn't an object), and, never
+  // acknowledged, would come back on every run. It's dropped with a
+  // warning instead, and acknowledged once nothing before it is waiting.
+  // One without a sound seq can't be placed or acknowledged;
+  // acknowledging a later event moves past it. A missing nullable field
+  // is kept as null.
   private add(events: WatchEvent[]): void {
     let added = false;
-    for (const e of events) {
+    for (const e of events as unknown[]) {
       if (!wellFormed(e)) {
-        const seq = (e as { seq?: unknown } | null)?.seq;
-        const sound = typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0;
-        if (sound && this.pos !== null && seq <= this.pos) continue;
-        if (sound) {
+        const seq = isObject(e) ? e.seq : undefined;
+        if (isSeq(seq)) {
+          if (this.pos !== null && seq <= this.pos) continue;
           this.pos = seq;
           this.skipped.push(seq);
         }
-        const id = (e as { id?: unknown } | null)?.id;
-        this.o.log(`skipped an event from ${this.client.url} that isn't one this version understands (${sound ? `seq ${seq}` : "no seq"}${typeof id === "string" ? `, id ${JSON.stringify(clean(id))}` : ""})`);
+        const what = describeMalformed(e);
+        this.o.log(`dropped a malformed event from ${this.client.url}${what ? ` (${what})` : ""}: it isn't shaped as the protocol says${isSeq(seq) ? ", so it's acknowledged unshown" : ""}; ${REPORT}`);
         continue;
       }
       if (this.pos !== null && e.seq <= this.pos) continue;
       this.pos = e.seq;
       if (this.seen.has(e.id)) continue;
       this.seen.add(e.id);
-      this.queue.push(e);
+      this.queue.push({ ...e, sub: e.sub ?? null, actor: e.actor ?? null, repo: e.repo ?? null, pr: e.pr ?? null });
       added = true;
     }
     if (this.seen.size > 2000) this.seen = new Set([...this.seen].slice(-1000));

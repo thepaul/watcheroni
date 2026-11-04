@@ -118,6 +118,10 @@ export class FakeServer {
   // or with a 307 to this address.
   problem: { status: number; body: Record<string, unknown> | string } | null = null;
   redirectTo: string | null = null;
+  // Send `ready` with an acked that isn't a number, or answer every poll
+  // with this page instead.
+  malformedReady = false;
+  malformedPage: unknown = null;
   private http: Server | null = null;
   private waiting = new Set<() => void>();
   private holding = false;
@@ -213,7 +217,7 @@ export class FakeServer {
     const inbox = this.inbox(s.inbox);
     if (msg.type === "hello") {
       s.pos = msg.after ?? inbox.acked;
-      s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: inbox.acked });
+      s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
       this.sendFrom(s);
     } else if (msg.type === "ack") {
       inbox.acked = Math.max(inbox.acked, Math.min(msg.seq, inbox.head));
@@ -332,6 +336,7 @@ export class FakeServer {
       inbox.acked = Math.max(inbox.acked, Math.min(seq, inbox.head));
       return json(200, { name, head: inbox.head, acked: inbox.acked });
     }
+    if (route === "GET /events" && this.malformedPage !== null) return json(200, this.malformedPage);
     if (route === "GET /events") {
       const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : inbox.acked;
       const wait = Number(url.searchParams.get("wait") ?? 0);
