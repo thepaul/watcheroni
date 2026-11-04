@@ -667,7 +667,18 @@ describe("GitHub's errors", () => {
       expect(denied.message).toMatch(/^GitHub \/repos\/octo\/widgets\/actions\/runs: 403 \[31mred .* end$/);
       fetches.mockResolvedValueOnce(new Response(NASTY, { status: 500 }));
       const failed = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
-      for (const m of [down.message, missing.message, denied.message, failed.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+      // A next page outside GitHub's API, or one already read, is named
+      // cleaned too. (A header can't hold a line break or a NUL.)
+      const LINK = "\x1b[31mred\x1b]8;;x\x07link\x7fend";
+      const page = (next: string) => Response.json([], { headers: { link: `<${next}>; rel="next"` } });
+      fetches.mockResolvedValueOnce(page(`https://evil.test/${LINK}`));
+      const outside = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(outside.message).toMatch(/^GitHub \/repos\/octo\/widgets\/actions\/runs: next page outside https:\/\/api\.github\.com\/: https:\/\/evil\.test\/ \[31mred/);
+      const again = `https://api.github.com/repos/octo/widgets/actions/runs?x=${LINK}`;
+      fetches.mockResolvedValueOnce(page(again)).mockResolvedValueOnce(page(again));
+      const repeated = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(repeated.message).toMatch(/: next page already read: https:\/\/api\.github\.com\/repos\/octo\/widgets\/actions\/runs\?x= \[31mred/);
+      for (const m of [down.message, missing.message, denied.message, failed.message, outside.message, repeated.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     } finally {
       fetches.mockRestore();
       vi.unstubAllEnvs();

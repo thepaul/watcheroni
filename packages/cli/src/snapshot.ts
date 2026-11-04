@@ -181,7 +181,9 @@ export async function fetchSnapshot(target: Target): Promise<Snapshot> {
     runs = await restList(
       `/repos/${repo.nameWithOwner}/actions/runs?head_sha=${sha}&per_page=100&exclude_pull_requests=true`,
       (body) => (body as RawRuns).workflow_runs.map((r) => {
-        // Without it a re-run can't be told apart: the runs aren't read.
+        // Without an ID a run can't be followed, nor a re-run told apart
+        // without its attempt: the runs aren't read this time.
+        if (typeof r.id !== "number" || !Number.isSafeInteger(r.id)) throw new GitHubError("a workflow run has no ID", 502);
         if (typeof r.run_attempt !== "number") throw new GitHubError(`workflow run ${r.id} has no run_attempt`, 502);
         return {
           id: r.id,

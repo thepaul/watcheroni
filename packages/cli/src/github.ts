@@ -79,7 +79,7 @@ export async function restList<T>(path: string, pick: (body: unknown) => T[]): P
     // The token goes to GitHub's API only, and each page once.
     if (!url.startsWith(API)) throw new GitHubError(`GitHub ${clean(where, PROSE_LENGTH)}: next page outside ${API}: ${clean(url, PROSE_LENGTH)}`, 502);
     if (seen.has(url)) throw new GitHubError(`GitHub ${clean(where, PROSE_LENGTH)}: next page already read: ${clean(url, PROSE_LENGTH)}`, 502);
-    if (seen.size === MAX_PAGES) throw new GitHubError(`GitHub ${where}: more than ${MAX_PAGES} pages`, 502);
+    if (seen.size === MAX_PAGES) throw new GitHubError(`GitHub ${clean(where, PROSE_LENGTH)}: more than ${MAX_PAGES} pages`, 502);
     seen.add(url);
     const cached = etags.get(url);
     if (cached) {

@@ -105,6 +105,7 @@ describe("fetchSnapshot", () => {
       () => new Response("Server Error", { status: 502 }),
       () => { throw new TypeError("fetch failed"); },
       () => Response.json({ workflow_runs: [{ ...runsBody.workflow_runs[0], run_attempt: undefined }] }),
+      () => Response.json({ workflow_runs: [{ ...runsBody.workflow_runs[0], id: "500" }] }),
     ];
     const why: (string | undefined)[] = [];
     for (const r of unreadable) {
@@ -120,6 +121,7 @@ describe("fetchSnapshot", () => {
       `${path}: 502 Server Error`,
       "fetch failed",
       "workflow run 500 has no run_attempt",
+      "a workflow run has no ID",
     ]);
     // GitHub's JSON error body is reduced to its message.
     runs = () => Response.json({ message: "Must have admin rights", documentation_url: "https://docs.github.com/x" }, { status: 403 });
