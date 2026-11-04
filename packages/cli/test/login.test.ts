@@ -42,6 +42,8 @@ function fake(
   const opened: string[] = [];
   const printed: string[] = [];
   let clock = 0;
+  // Each login gets a new key: key_1, then key_2...
+  let keys = 0;
   const deps: LoginDeps = {
     now: () => clock,
     sleep: async (ms) => void (clock += ms),
@@ -63,9 +65,9 @@ function fake(
           if (status === 429) {
             return Response.json({ code: "rate_limited", title: "Too many sign-in requests from this address" }, { status, headers: { "Retry-After": "60" } });
           }
-          return status === 200
-            ? Response.json({ api_key: "wk2_7_secret_tag", key_id: "key_1", account: { id: 7, login: "octocat" } })
-            : Response.json(refusal, { status });
+          if (status !== 200) return Response.json(refusal, { status });
+          const n = ++keys;
+          return Response.json({ api_key: n === 1 ? "wk2_7_secret_tag" : `wk2_7_secret${n}_tag`, key_id: `key_${n}`, account: { id: 7, login: "octocat" } });
         }
         case `${SERVER}/v1/keys/current`:
           return new Response(null, { status: 204 });
@@ -255,6 +257,90 @@ describe("opening the browser", () => {
     const { deps } = fake([{ access_token: "ghu_tok" }], 422, true, DEVICE_PAGE, "ABCD-1234", { code: "quota_exceeded", title });
     await expect(login(SERVER, deps)).rejects.toThrow(`(422: ${title}); run \`watcheroni logout\` on a machine you no longer use`);
     expect(readCredentials().servers).toEqual({});
+  });
+});
+
+describe("logging in again", () => {
+  const deletes = (calls: { url: string; auth: string | null }[]) =>
+    calls.filter((c) => c.url.startsWith(`${SERVER}/v1/keys/`)).map((c) => [c.url, c.auth]);
+  // Answers a revoke with `revoke`, recording it in `calls`.
+  const revokeWith = (deps: LoginDeps, calls: { url: string; body: unknown; auth: string | null }[], revoke: () => Promise<Response>) => {
+    const fetch = deps.fetch;
+    deps.fetch = async (input, init) =>
+      init?.method === "DELETE" ? (calls.push({ url: String(input), body: null, auth: new Headers(init.headers).get("Authorization") }), revoke()) : fetch(input, init);
+  };
+
+  it("revokes the key it replaces, with itself, once the new one is saved", async () => {
+    const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
+    await login(SERVER, deps);
+    expect(deletes(calls)).toEqual([]);
+    expect(printed).not.toContain("Revoked the previous key.");
+    revokeWith(deps, calls, async () => {
+      expect(readCredentials().servers[SERVER]?.api_key).toBe("wk2_7_secret2_tag");
+      return new Response(null, { status: 204 });
+    });
+    await login(SERVER, deps);
+    expect(deletes(calls)).toEqual([[`${SERVER}/v1/keys/current`, "Bearer wk2_7_secret_tag"]]);
+    expect(readCredentials().servers[SERVER]).toMatchObject({ api_key: "wk2_7_secret2_tag", key_id: "key_2" });
+    expect(printed.at(-1)).toBe("Revoked the previous key.");
+    expect(printed.join("\n")).not.toMatch(/wk2_/);
+  });
+
+  it("takes a 401 as already revoked", async () => {
+    const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
+    await login(SERVER, deps);
+    revokeWith(deps, calls, async () => Response.json({}, { status: 401 }));
+    await login(SERVER, deps);
+    expect(deletes(calls)).toHaveLength(1);
+    expect(printed.at(-1)).toBe(`Signed in to ${SERVER} as octocat.`);
+  });
+
+  it("keeps the new key and only warns when the revoke fails", async () => {
+    for (const fail of [
+      async () => Response.json({}, { status: 500 }),
+      async () => {
+        throw new Error("connection reset");
+      },
+    ]) {
+      const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
+      await login(SERVER, deps);
+      revokeWith(deps, calls, fail);
+      await expect(login(SERVER, deps)).resolves.toMatchObject({ api_key: "wk2_7_secret2_tag" });
+      expect(readCredentials().servers[SERVER]?.api_key).toBe("wk2_7_secret2_tag");
+      expect(printed.at(-1)).toMatch(/^(The server didn't revoke the previous key \(500\)|Couldn't reach .* to revoke the previous key \(connection reset\)); it stays live\.$/);
+    }
+  });
+
+  it("revokes a key from another account, or saved with no ID, the same way", async () => {
+    for (const old of [
+      { api_key: "wk2_9_other_tag", key_id: "key_9", account: { id: 9, login: "someone" } },
+      { api_key: "wk2_7_old_tag", account: { id: 7, login: "octocat" } },
+    ]) {
+      writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { [SERVER]: { ...old, github: {} } } }));
+      const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
+      await login(SERVER, deps);
+      expect(deletes(calls)).toEqual([[`${SERVER}/v1/keys/current`, `Bearer ${old.api_key}`]]);
+    }
+  });
+
+  it("revokes nothing when the server hands back the same key", async () => {
+    writeFileSync(
+      process.env.WATCHERONI_CREDENTIALS!,
+      JSON.stringify({ servers: { [SERVER]: { api_key: "wk2_7_secret_tag", key_id: "key_1", account: { id: 7, login: "octocat" }, github: {} } } }),
+    );
+    const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }]);
+    await login(SERVER, deps);
+    expect(deletes(calls)).toEqual([]);
+    expect(printed).not.toContain("Revoked the previous key.");
+  });
+
+  it("leaves other servers' keys alone", async () => {
+    const other = { api_key: "wk2_7_elsewhere_tag", key_id: "key_5", account: { id: 7, login: "octocat" }, github: {} };
+    writeFileSync(process.env.WATCHERONI_CREDENTIALS!, JSON.stringify({ servers: { "https://other.test": other } }));
+    const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
+    await login(SERVER, deps);
+    expect(deletes(calls)).toEqual([]);
+    expect(readCredentials().servers["https://other.test"]).toEqual(other);
   });
 });
 

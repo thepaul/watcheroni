@@ -128,8 +128,12 @@ another, name it in `WATCHERONI_SERVER` or `~/.config/watcheroni/config.json`
 (`{"server": "https://..."}`). For CI, `WATCHERONI_API_KEY` stands in for
 the credentials file. The environment wins, and `WATCHERONI_SERVER=`
 (empty) forces local mode. `WATCHERONI_CONFIG_DIR` moves both files, and
-`WATCHERONI_CREDENTIALS` moves just the credentials. `watcheroni logout`
-revokes the key and forgets it.
+`WATCHERONI_CREDENTIALS` moves just the credentials. Signing in again
+revokes the key it replaces, so a key you copied elsewhere (say, into
+CI's `WATCHERONI_API_KEY`) stops working when you sign in again on the
+machine it came from; to sign in for CI, give it its own credentials file
+with `WATCHERONI_CREDENTIALS`. `watcheroni logout` revokes the key and
+forgets it.
 
 The server URL must be `https://`: the API key goes with every request,
 and the GitHub tokens with sign-in and refreshes. Plain `http://` is only
