@@ -10,7 +10,7 @@ import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { UsageError, parseTarget, repoKey, targetKey, type Target } from "../src/targets.ts";
-import { alice, bob, check, run, snap } from "./fixtures.ts";
+import { HEAD1, HEAD2, alice, bob, check, run, snap } from "./fixtures.ts";
 
 let n = 0;
 beforeEach(() => {
@@ -163,6 +163,50 @@ describe("polling", () => {
     expect(await polled()).toEqual([]);
     expect(await polled()).toEqual([["workflow.completed", 500, "success"], ["workflow.completed", 600, "success"]]);
     inbox.close();
+  });
+
+  it("after a push with runs unreadable, keeps none of the old head's and reports the new head's", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const snapshots: Snapshot[] = [
+      snap({ workflowRuns: [run({ done: false, conclusion: null })] }),
+      snap({ workflowRuns: [run()] }),
+      // Pushed; the new head's runs can't be read yet, and then are.
+      snap({ head: HEAD2, workflowRuns: null }),
+      snap({ head: HEAD2, workflowRuns: [run({ id: 700, done: false, conclusion: null })] }),
+      // Pushed again; a run on that head finishes before its runs can be read.
+      snap({ head: HEAD1, workflowRuns: null }),
+      snap({ head: HEAD1, workflowRuns: [run({ id: 800, conclusion: "failure" })] }),
+    ];
+    const fetch = async () => snapshots.shift()!;
+    const polled = async () => (await pollOnce(inbox, () => {}, fetch)).map((e) => [e.kind, e.data.run_id ?? null]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["workflow.completed", 500]]);
+    expect(await polled()).toEqual([["pr.pushed", null]]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["pr.pushed", null]]);
+    expect(await polled()).toEqual([["workflow.completed", 800]]);
+    inbox.close();
+  });
+
+  it("has nothing to compare when runs have never been read on this head", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const { workflowRuns: _, ...saved } = snap();
+    const snapshots: Snapshot[] = [snap({ workflowRuns: null }), snap({ workflowRuns: null }), snap({ workflowRuns: [run()] })];
+    const fetch = async () => snapshots.shift()!;
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    // A snapshot saved by an older version, without runs.
+    const old = open();
+    old.watch(targetKey(target), target);
+    old.record(targetKey(target), saved as Snapshot, []);
+    const later = [snap({ workflowRuns: null }), snap({ workflowRuns: [run()] })];
+    expect(await pollOnce(old, () => {}, async () => later.shift()!)).toEqual([]);
+    expect(await pollOnce(old, () => {}, async () => later.shift()!)).toEqual([]);
+    inbox.close();
+    old.close();
   });
 
   it("says at once if the PR has already ended", async () => {

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REST_CACHE_SIZE, clearRestCache, restList } from "../src/github.ts";
 import { fetchSnapshot } from "../src/snapshot.ts";
 import { HEAD1 } from "./fixtures.ts";
 
@@ -30,6 +31,7 @@ describe("fetchSnapshot", () => {
   beforeEach(() => {
     process.env.GH_TOKEN = "test-token";
     asked.length = 0;
+    clearRestCache();
     vi.stubGlobal("fetch", async (url: string, init: RequestInit) => {
       const headers = new Headers(init.headers);
       asked.push({ url, headers });
@@ -73,14 +75,58 @@ describe("fetchSnapshot", () => {
     expect(asked.slice(4).map((a) => a.headers.get("if-none-match"))).toEqual(['"p1"', '"p2"']);
   });
 
-  it("leaves the runs out when the token can't read Actions, and retries when out of requests", async () => {
-    for (const status of [403, 404]) {
-      runs = () => new Response("Resource not accessible by personal access token", { status });
-      expect((await fetchSnapshot({ ...target, number: 8 })).workflowRuns).toBeNull();
+  it("sends the token to GitHub's API only, and reads each page once", async () => {
+    const elsewhere = "https://evil.example/repos/octo/widgets/actions/runs?page=2";
+    runs = (_h, url) => url === elsewhere
+      ? Response.json(runsBody)
+      : Response.json(runsBody, { headers: { link: `<${elsewhere}>; rel="next"` } });
+    expect((await fetchSnapshot(target)).workflowRuns).toBeNull();
+    expect(asked.map((a) => a.url)).not.toContain(elsewhere);
+
+    // A `next` that leads back to a page already read.
+    asked.length = 0;
+    const page2 = "https://api.github.com/repositories/99/actions/runs?page=2";
+    runs = (_h, url) => Response.json(runsBody, { headers: { link: `<${url === page2 ? asked[1].url : page2}>; rel="next"` } });
+    expect((await fetchSnapshot(target)).workflowRuns).toBeNull();
+    expect(asked.length).toBe(3);
+
+    // One that never ends.
+    asked.length = 0;
+    runs = (_h, url) => Response.json(runsBody, { headers: { link: `<${url.replace(/&n=\d+$/, "")}&n=${asked.length}>; rel="next"` } });
+    expect((await fetchSnapshot(target)).workflowRuns).toBeNull();
+    expect(asked.length).toBe(1 + 20);
+  });
+
+  it("leaves the runs out when they can't be read, and retries when out of requests", async () => {
+    // No access, GitHub failing, the network failing, a run without an attempt.
+    const unreadable: (() => Response)[] = [
+      () => new Response("Resource not accessible by personal access token", { status: 403 }),
+      () => new Response("Not Found", { status: 404 }),
+      () => new Response("Server Error", { status: 502 }),
+      () => { throw new TypeError("fetch failed"); },
+      () => Response.json({ workflow_runs: [{ ...runsBody.workflow_runs[0], run_attempt: undefined }] }),
+    ];
+    for (const r of unreadable) {
+      runs = r;
+      expect((await fetchSnapshot(target)).workflowRuns).toBeNull();
     }
     for (const headers of [{ "x-ratelimit-remaining": "0" }, { "retry-after": "60" }]) {
       runs = () => new Response("API rate limit exceeded", { status: 403, headers });
-      await expect(fetchSnapshot({ ...target, number: 8 })).rejects.toMatchObject({ status: 429 });
+      await expect(fetchSnapshot(target)).rejects.toMatchObject({ status: 429 });
     }
+  });
+
+  it("keeps the most recently used pages", async () => {
+    runs = (_h, url) => Response.json({ items: [url] }, { headers: { etag: `"${url}"` } });
+    const pick = (body: unknown) => (body as { items: string[] }).items;
+    for (let i = 0; i <= REST_CACHE_SIZE; i++) await restList(`/list/${i}`, pick);
+    // /list/0 was used least recently, and has gone; /list/1 hasn't.
+    await restList("/list/1", pick);
+    await restList("/list/0", pick);
+    expect(asked.slice(-2).map((a) => a.headers.get("if-none-match"))).toEqual(['"https://api.github.com/list/1"', null]);
+    // Asking for /list/1 made it recent: /list/2 went when /list/0 came back.
+    await restList("/list/2", pick);
+    await restList("/list/1", pick);
+    expect(asked.slice(-2).map((a) => a.headers.get("if-none-match"))).toEqual([null, '"https://api.github.com/list/1"']);
   });
 });

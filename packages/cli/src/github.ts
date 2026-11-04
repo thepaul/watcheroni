@@ -49,17 +49,40 @@ export async function graphql<T>(query: string, variables: Record<string, unknow
   return body.data as T;
 }
 
+const API = "https://api.github.com/";
+
 // Earlier pages of REST lists, by URL, keeping only what the caller took
-// from them. Asking again with the ETag costs nothing from the rate limit
-// when GitHub answers 304 Not Modified.
+// from them, least recently used first. Asking again with the ETag costs
+// nothing from the rate limit when GitHub answers 304 Not Modified. Room
+// for a page or two of each of a few hundred watched PRs; a PR's earlier
+// heads aren't asked about again, and go first.
+export const REST_CACHE_SIZE = 500;
 const etags = new Map<string, { etag: string; items: unknown[]; next: string | null }>();
+
+export function clearRestCache(): void {
+  etags.clear();
+}
+
+// A list's pages to follow at most: GitHub gives at most 1,000 results
+// (10 pages of 100) for a filtered list of workflow runs.
+const MAX_PAGES = 20;
 
 // Every page of a REST list, following the Link header's `next`. `pick`
 // takes the wanted fields from a page's body.
 export async function restList<T>(path: string, pick: (body: unknown) => T[]): Promise<T[]> {
   const out: T[] = [];
-  for (let url: string | null = `https://api.github.com${path}`; url;) {
+  const seen = new Set<string>();
+  for (let url: string | null = `${API}${path.replace(/^\//, "")}`; url;) {
+    // The token goes to GitHub's API only, and each page once.
+    if (!url.startsWith(API)) throw new GitHubError(`GitHub ${path}: next page outside ${API}: ${url}`, 502);
+    if (seen.has(url)) throw new GitHubError(`GitHub ${path}: next page already read: ${url}`, 502);
+    if (seen.size === MAX_PAGES) throw new GitHubError(`GitHub ${path}: more than ${MAX_PAGES} pages`, 502);
+    seen.add(url);
     const cached = etags.get(url);
+    if (cached) {
+      etags.delete(url);
+      etags.set(url, cached);
+    }
     const res: Response = await fetch(url, {
       headers: {
         Authorization: `Bearer ${githubToken()}`,
@@ -86,8 +109,7 @@ export async function restList<T>(path: string, pick: (body: unknown) => T[]): P
     if (etag) {
       etags.delete(url);
       etags.set(url, { etag, items, next });
-      // Oldest first: a PR's earlier heads aren't asked about again.
-      for (const old of etags.keys()) if (etags.size > 100) etags.delete(old);
+      for (const old of etags.keys()) if (etags.size > REST_CACHE_SIZE) etags.delete(old);
     }
     out.push(...items);
     url = next;

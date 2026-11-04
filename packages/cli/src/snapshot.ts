@@ -1,4 +1,4 @@
-import { GitHubError, graphql, restList } from "./github.ts";
+import { GitHubError, LoginNeeded, graphql, restList } from "./github.ts";
 import type { Target } from "./targets.ts";
 
 // What local mode knows about a PR at one moment: one GraphQL query (1
@@ -173,22 +173,28 @@ export async function fetchSnapshot(target: Target): Promise<Snapshot> {
     const sha = encodeURIComponent(repo.pullRequest.headRefOid);
     runs = await restList(
       `/repos/${repo.nameWithOwner}/actions/runs?head_sha=${sha}&per_page=100&exclude_pull_requests=true`,
-      (body) => (body as RawRuns).workflow_runs.map((r) => ({
-        id: r.id,
-        attempt: r.run_attempt ?? 1,
-        name: r.name,
-        done: r.status === "completed",
-        conclusion: r.conclusion,
-        url: r.html_url,
-        api: r.url,
-        at: r.updated_at,
-      })),
+      (body) => (body as RawRuns).workflow_runs.map((r) => {
+        // Without it a re-run can't be told apart: the runs aren't read.
+        if (typeof r.run_attempt !== "number") throw new GitHubError(`workflow run ${r.id} has no run_attempt`, 502);
+        return {
+          id: r.id,
+          attempt: r.run_attempt,
+          name: r.name,
+          done: r.status === "completed",
+          conclusion: r.conclusion,
+          url: r.html_url,
+          api: r.url,
+          at: r.updated_at,
+        };
+      }),
     );
     // A run can move to another page between two pages' requests.
     runs = [...new Map(runs.map((r) => [r.id, r])).values()];
   } catch (e) {
-    // A token that can read the PR but not its Actions: no workflow events.
-    if (!(e instanceof GitHubError) || (e.status !== 403 && e.status !== 404)) throw e;
+    // A token that can read the PR but not its Actions, or a request that
+    // failed: no workflow runs this time (poll.ts keeps the last ones
+    // read). Out of requests, or logged out, stops the poll to try later.
+    if (e instanceof LoginNeeded || (e instanceof GitHubError && e.status === 429)) throw e;
     runs = null;
   }
   return toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString(), runs);

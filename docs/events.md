@@ -41,8 +41,12 @@ miss:
 - anything beyond what one query reads: the last 100 reviews, review
   threads and PR comments, the last 100 comments in each thread, the
   first 50 review requests and the first 100 checks on the head commit;
+  and beyond the 1,000 workflow runs GitHub lists for one commit;
 - checks and workflow runs on a commit that is no longer the head by the
-  next poll (the server reports workflow runs finishing there).
+  next poll (the server reports workflow runs finishing there);
+- workflow runs finishing before their head's runs have been read once:
+  on the head a watch starts on, while the runs can't be read
+  (`workflow.completed`, below).
 
 Its events' `at` is the time GitHub gives for reviews, comments and
 checks, and the time of the poll for everything else. Their `id`s start
@@ -341,9 +345,12 @@ is sent again when it finishes; of several attempts finishing between
 two polls, only the last is sent. A run completed again with another
 conclusion is sent again: a run from a fork that needs approval is
 completed as `action_required`, and once a maintainer approves it, runs
-and is completed with its real conclusion. While the GitHub login can't
-read the repo's Actions nothing is sent; once it can again, runs that
-finished meanwhile on the same head are.
+and is completed with its real conclusion. While the runs can't be read
+(the GitHub login can't read the repo's Actions, or the request fails)
+nothing is sent; once they can again, runs that finished meanwhile are,
+compared with the head's runs as last read, or, after a push, as runs
+on a new head. Only on the head a watch starts on, before the runs have
+been read once, is there nothing to compare them with.
 
 ## The watch itself
 
