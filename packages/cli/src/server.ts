@@ -336,10 +336,21 @@ export class ServerReader {
   // Set when reading has stopped for good; the next wait throws it.
   failure: Error | null = null;
 
+  // The last seq read: everything at or below it has been received.
   private pos: number | null = null;
+  // Events received and not yet handled, in the order to show them: those
+  // held from before an inbox.gap that moved the position back first (see
+  // add()), then the rest by seq.
   private queue: WatchEvent[] = [];
-  // Malformed events not yet acknowledged, by seq (see add()).
-  private skipped: number[] = [];
+  // Which queued events are from before such a gap. Their seqs mean
+  // nothing to the server now, so they're handled here only, never
+  // acknowledged to it.
+  private held = new Set<WatchEvent>();
+  // The server's acknowledged position, as it last said or was last told.
+  private acked: number | null = null;
+  // IDs of events received, to drop one sent again (delivery is at least
+  // once). An event held from before a gap isn't here, so that one sent
+  // again after it is kept, in its place.
   private seen = new Set<string>();
   private fresh = false;
   private waiters = new Set<() => void>();
@@ -369,7 +380,7 @@ export class ServerReader {
     });
   }
 
-  // Events received and not yet acknowledged, oldest first.
+  // Events received and not yet handled, in the order to show them.
   pending(): WatchEvent[] {
     this.fresh = false;
     return [...this.queue];
@@ -391,14 +402,28 @@ export class ServerReader {
     });
   }
 
+  // Takes exactly these events (as pending() gave them) as handled, and
+  // acknowledges what that lets the server forget (see acknowledge()).
+  // Events that came meanwhile, whatever their seq, stay pending.
+  handled(events: WatchEvent[]): void {
+    const done = new Set(events);
+    this.queue = this.queue.filter((e) => !done.has(e));
+    for (const e of events) this.held.delete(e);
+    this.acknowledge();
+  }
+
   // Moves the server's acknowledged position, over the socket if there is
-  // one, else over HTTP, past any skipped events (see add()) that nothing
-  // unread is now before.
-  ack(seq: number): void {
-    this.queue = this.queue.filter((e) => e.seq > seq);
-    const first = this.firstQueued();
-    for (const s of this.skipped) if (s < first && s > seq) seq = s;
-    this.skipped = this.skipped.filter((s) => s > seq);
+  // one, else over HTTP, to the highest seq read with nothing still
+  // pending at or below it: events handled, sent again, or malformed and
+  // dropped. Events held from before a gap don't count, as their seqs
+  // aren't the server's now. Sends nothing if that isn't past where the
+  // server already is.
+  private acknowledge(): void {
+    if (this.pos === null) return;
+    let seq = this.pos;
+    for (const e of this.queue) if (!this.held.has(e) && e.seq <= seq) seq = e.seq - 1;
+    if (seq < 0 || (this.acked !== null && seq <= this.acked)) return;
+    this.acked = seq;
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "ack", seq }));
       return;
@@ -494,8 +519,10 @@ export class ServerReader {
           }
           this.markConnected();
           if (this.pos === null) this.pos = page.acked;
+          if (isSeq(page.acked)) this.acked = page.acked;
           this.add(page.events);
           this.pos = Math.max(this.pos ?? 0, page.next);
+          this.acknowledge();
           delay = this.o.backoff[0];
         }
       } catch (e) {
@@ -619,14 +646,17 @@ export class ServerReader {
         } else if (msg.type === "ready") {
           if (!isSeq(msg.acked)) return broken("ready message");
           this.ws = ws;
-          this.readSince = false;
+          this.acked = msg.acked;
           if (this.pos === null) this.pos = msg.acked;
           this.markConnected();
+          // Anything handled while there was no connection.
+          this.acknowledge();
         } else if (msg.type === "events") {
           if (!Array.isArray(msg.events)) return broken("events message");
-          // Only a batch whose sound events moved the position counts as
-          // read soundly: an empty one, or one of duplicates, says nothing
-          // of the server.
+          // Only a batch with a sound event past the position counts as
+          // read soundly. An empty one, one whose events are all at or
+          // below the position, or one that only moves it back (an
+          // inbox.gap) says nothing of the server.
           if (this.add(msg.events)) this.readSince = true;
         } else if (msg.type === "error") {
           // The server's own words, cleaned like the rest.
@@ -655,69 +685,84 @@ export class ServerReader {
     });
   }
 
-  // Keeps new events, dropping ones already seen (delivery is at least once).
-  // An event that isn't the shape PROTOCOL.md gives can throw where it's
-  // read (a kind that isn't text, data that isn't an object), and, never
-  // acknowledged, would come back on every run. It's dropped with a
-  // warning instead, and acknowledged once nothing before it is waiting.
-  // One without a sound seq can't be placed or acknowledged;
+  // Keeps new events, dropping ones already received (delivery is at
+  // least once). An event that isn't the shape PROTOCOL.md gives can throw
+  // where it's read (a kind that isn't text, data that isn't an object),
+  // and, never acknowledged, would come back on every run. It's dropped
+  // with a warning instead, and acknowledged once nothing before it is
+  // pending (see acknowledge()). One without a sound seq can't be placed;
   // acknowledging a later event moves past it. A missing nullable field
-  // is kept as null. Says whether a sound event moved the position.
+  // is kept as null. Says whether a sound event moved the position on.
   private add(events: WatchEvent[]): boolean {
     let added = false;
     let advanced = false;
+    // Events whose seq was at or below the position (see below).
+    const late: number[] = [];
+    let lateAfter = 0;
     for (const e of events as unknown[]) {
       const sound = wellFormed(e);
       // An `inbox.gap` for a position ahead of the inbox's `head` takes it
-      // back (PROTOCOL.md, "Gaps"); what's queued or skipped past it is
-      // from before. This comes before anything at or below the position
-      // is passed over, since the gap itself is below it.
+      // back (PROTOCOL.md, "Gaps"). This comes before anything at or below
+      // the position is passed over, since the gap itself is below it.
+      // What's pending is from before the gap: still shown, first, but
+      // handled here only (see `held`), and no longer counted as received,
+      // so the same event sent again after the gap takes its place.
       const back = sound && e.kind === "inbox.gap" && this.pos !== null && e.seq < this.pos && e.data.missed_after === this.pos;
       if (back) {
-        this.queue = this.queue.filter((q) => q.seq < e.seq);
-        this.skipped = this.skipped.filter((s) => s < e.seq);
+        for (const q of this.queue) {
+          this.held.add(q);
+          this.seen.delete(q.id);
+        }
       }
       if (!sound) {
         const seq = isObject(e) ? e.seq : undefined;
         // Only one past the position is placed, to be acknowledged; one
         // at or below it is still warned of, never dropped unsaid.
         const placed = isSeq(seq) && (this.pos === null || seq > this.pos);
-        if (placed) {
-          this.pos = seq;
-          this.skipped.push(seq);
-        }
+        if (placed) this.pos = seq;
         const what = describeMalformed(e);
         this.o.log(`dropped a malformed event from ${this.client.url}${what ? ` (${what})` : ""}: it isn't shaped as the protocol says${placed ? ", so it's acknowledged unshown" : ""}; ${REPORT}`);
         continue;
       }
       const event: WatchEvent = { ...e, sub: e.sub ?? null, actor: e.actor ?? null, repo: e.repo ?? null, pr: e.pr ?? null };
       if (!back && this.pos !== null && e.seq <= this.pos) {
-        // At or below the position: a redelivery of one already seen is
-        // dropped quietly. Any other is the server's seqs going back,
-        // which a sound server never does; it's kept, in seq order, so
-        // nothing is lost, and warned of.
+        // At or below the position: one already received is dropped
+        // quietly. Any other is the server's seqs going back, which a
+        // sound server never does; it's kept, in seq order, so nothing is
+        // lost, and warned of (once for the batch).
         if (this.seen.has(e.id)) continue;
         this.seen.add(e.id);
-        this.o.log(`${this.client.url} sent an event out of order (seq ${e.seq} after ${this.pos}, id ${JSON.stringify(clean(e.id))}); it's shown anyway; ${REPORT}`);
+        this.release(e.id);
+        late.push(e.seq);
+        lateAfter = this.pos;
         let i = this.queue.length;
-        while (i > 0 && this.queue[i - 1].seq > e.seq) i--;
+        while (i > 0 && !this.held.has(this.queue[i - 1]) && this.queue[i - 1].seq > e.seq) i--;
         this.queue.splice(i, 0, event);
         added = true;
         continue;
       }
       this.pos = e.seq;
-      advanced = true;
+      if (!back) advanced = true;
       if (this.seen.has(e.id)) continue;
       this.seen.add(e.id);
+      this.release(e.id);
       this.queue.push(event);
       added = true;
     }
+    if (late.length) {
+      let lo = late[0];
+      let hi = late[0];
+      for (const s of late) {
+        if (s < lo) lo = s;
+        if (s > hi) hi = s;
+      }
+      const which = late.length === 1 ? `an event out of order (seq ${lo}` : `${late.length} events out of order (seqs ${lo} to ${hi}`;
+      this.o.log(`${this.client.url} sent ${which} after ${lateAfter}); ${late.length === 1 ? "it's" : "they're"} shown anyway; ${REPORT}`);
+    }
     if (this.seen.size > 2000) this.seen = new Set([...this.seen].slice(-1000));
-    // Skipped ones with nothing unread before them are acknowledged now.
-    const first = this.firstQueued();
-    let due = -1;
-    for (const seq of this.skipped) if (seq < first && seq > due) due = seq;
-    if (due >= 0) this.ack(due);
+    // Malformed ones and ones sent again, with nothing pending before
+    // them, are acknowledged now.
+    this.acknowledge();
     if (added) {
       this.fresh = true;
       this.wake();
@@ -725,11 +770,14 @@ export class ServerReader {
     return advanced;
   }
 
-  // The lowest seq waiting to be read, or Infinity if none is.
-  private firstQueued(): number {
-    let first = Infinity;
-    for (const e of this.queue) if (e.seq < first) first = e.seq;
-    return first;
+  // Drops an event held from before a gap (see add()) that the server has
+  // sent again: the new one takes its place.
+  private release(id: string): void {
+    if (!this.held.size) return;
+    const old = this.queue.find((q) => this.held.has(q) && q.id === id);
+    if (!old) return;
+    this.held.delete(old);
+    this.queue = this.queue.filter((q) => q !== old);
   }
 
   private wake(): void {

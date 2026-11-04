@@ -11,12 +11,16 @@ import { repoKey, targetKey } from "./targets.ts";
 
 interface Source {
   pending(): WatchEvent[];
-  ack(seq: number): void;
+  // Exactly these events are done with; any others stay pending, even
+  // ones that came meanwhile.
+  handled(events: WatchEvent[]): void;
 }
 
 export interface Item {
   event: WatchEvent;
   source: Source;
+  // Unwanted events just before it, let go when it's acknowledged.
+  passed: WatchEvent[];
 }
 
 export interface FeedOptions {
@@ -61,25 +65,38 @@ export class Feed {
         const key = prKey(e);
         return wants(kinds, e) && (!key || wants(this.inbox.kindsFor(key), e));
       };
-      const keep = pending.filter(want);
-      const skip = pending.filter((e) => !want(e));
-      // Acknowledge up to the first wanted event only, so the order holds.
-      const firstKept = keep[0]?.seq ?? Infinity;
-      const skippable = skip.filter((e) => e.seq < firstKept).map((e) => e.seq);
-      if (skippable.length) source.ack(Math.max(...skippable));
-      if (!keep.length && skip.length) source.ack(Math.max(...skip.map((e) => e.seq)));
-      items.push(...keep.map((event) => ({ event, source })));
-      // Skipped events after the first kept one are still pending.
+      // Unwanted events before the first wanted one are let go now; later
+      // ones go with the wanted event after them, so the order holds, and
+      // ones after the last wanted event wait. With nothing wanted, all go.
+      let passed: WatchEvent[] = [];
+      let first = true;
+      for (const event of pending) {
+        if (!want(event)) {
+          passed.push(event);
+          continue;
+        }
+        if (first) {
+          if (passed.length) source.handled(passed);
+          passed = [];
+          first = false;
+        }
+        items.push({ event, source, passed });
+        passed = [];
+      }
+      if (first && passed.length) source.handled(passed);
+      // Unwanted events after the first wanted one are still pending.
       for (const e of source.pending()) left.add(prKey(e)?.toLowerCase() ?? "");
     }
     this.inbox.forgetEnded(left);
     return items;
   }
 
+  // Acknowledges exactly these items, with the unwanted events before
+  // each; whatever else came meanwhile stays pending.
   ack(items: Item[]): void {
-    const last = new Map<Source, number>();
-    for (const { event, source } of items) last.set(source, Math.max(last.get(source) ?? 0, event.seq));
-    for (const [source, seq] of last) source.ack(seq);
+    const done = new Map<Source, WatchEvent[]>();
+    for (const { event, source, passed } of items) done.set(source, [...(done.get(source) ?? []), ...passed, event]);
+    for (const [source, events] of done) source.handled(events);
   }
 
   // Polls GitHub for the targets watched from this machine. While the

@@ -38,6 +38,11 @@ function reader(name = "box", token = fake.token): ServerReader {
   return r;
 }
 
+// Handles every pending event up to `seq`.
+function handleThrough(r: ServerReader, seq: number): void {
+  r.handled(r.pending().filter((e) => e.seq <= seq));
+}
+
 // Waits until `check` passes, or fails after a second.
 async function until(check: () => boolean): Promise<void> {
   for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
@@ -57,7 +62,7 @@ describe("server reader", () => {
     fake.inject("box", "check.failed");
     expect(await r.changed(1000)).toBe(true);
     expect(r.pending().map((e) => e.seq)).toEqual([2, 3]);
-    r.ack(3);
+    handleThrough(r, 3);
     expect(r.pending()).toEqual([]);
     await until(() => fake.inbox("box").acked === 3);
     expect(fake.requests.filter((q) => q.includes("/ack"))).toEqual([]);
@@ -82,50 +87,118 @@ describe("server reader", () => {
     ]);
   });
 
-  it("moves back to an inbox.gap for a position ahead of the inbox's head", async () => {
+  // An event as the server sends it, by seq, ID and kind.
+  const event = (seq: number, id: string, kind = "x", data: WatchEvent["data"] = {}): WatchEvent => ({
+    v: 1, seq, id, sub: null, kind, at: "t", received_at: "t", repo: null, pr: null, actor: null, data, links: {},
+  });
+  const send = (...events: WatchEvent[]) => {
+    for (const s of fake.sockets) if (s.inbox === "box") s.send({ type: "events", events });
+  };
+  const gap = (missedAfter: number, resumedAt: number, id = `gap-${missedAfter}`) =>
+    event(resumedAt - 1, id, "inbox.gap", { missed_after: missedAfter, resumed_at: resumedAt });
+
+  it("moves back to an inbox.gap for a position ahead of the inbox's head, still showing what it holds", async () => {
     const r = reader();
     await r.start();
     for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
     await until(() => r.pending().length === 3);
-    r.ack(2);
+    handleThrough(r, 2);
+    await until(() => fake.inbox("box").acked === 2);
     // The server had no record of seq 3: it answers with a gap from it,
-    // and the events it keeps, all lower.
-    const event = (seq: number, kind: string, data: WatchEvent["data"] = {}): WatchEvent => ({
-      v: 1, seq, id: `again-${seq}`, sub: null, kind, at: "t", received_at: "t", repo: null, pr: null, actor: null, data, links: {},
-    });
-    const send = (...events: WatchEvent[]) => {
-      for (const s of fake.sockets) s.send({ type: "events", events });
-    };
-    send(event(0, "inbox.gap", { missed_after: 3, resumed_at: 1 }), event(1, "x"));
-    await until(() => r.pending().length === 2);
-    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[0, "inbox.gap"], [1, "x"]]);
-    expect(formatText(r.pending().slice(0, 1), [])).toContain("inbox.gap: the server didn't recognise the position read up to");
-    // From there it reads on as usual; a stale gap for an old position doesn't move it.
-    send(event(0, "inbox.gap", { missed_after: 3, resumed_at: 1 }), event(2, "y"));
+    // and the events it keeps, all lower. c, received but not handled,
+    // is still shown, first.
+    send(gap(3, 1), event(1, "again-1"));
     await until(() => r.pending().length === 3);
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[3, "c"], [0, "inbox.gap"], [1, "x"]]);
+    expect(formatText(r.pending().slice(1, 2), [])).toContain("inbox.gap: the server didn't recognise the position read up to");
+    // From there it reads on as usual; a stale gap for an old position doesn't move it.
+    send(gap(3, 1), event(2, "again-2"));
+    await until(() => r.pending().length === 4);
+    expect(r.pending().map((e) => e.seq)).toEqual([3, 0, 1, 2]);
+    // c's seq is from before the gap, so handling it alone acknowledges
+    // nothing; handling the rest acknowledges them.
+    r.handled(r.pending().slice(0, 1));
     expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
+    handleThrough(r, 2);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.inbox("box").acked).toBe(2);
+    expect(fake.messages.filter((m) => m.includes('"ack"'))).toEqual([JSON.stringify({ type: "ack", seq: 2 })]);
   });
 
-  it("keeps an event whose seq goes back, in order, warning of it, but drops a repeated one quietly", async () => {
+  it("shows what it held from before a gap that's sent again after it once, in its new place", async () => {
     const r = reader();
     await r.start();
-    const event = (seq: number, id: string): WatchEvent => ({
-      v: 1, seq, id, sub: null, kind: "x", at: "t", received_at: "t", repo: null, pr: null, actor: null, data: {}, links: {},
-    });
-    for (const s of fake.sockets) s.send({ type: "events", events: [event(7, "a"), event(6, "b")] });
+    for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
+    await until(() => r.pending().length === 3);
+    const [a, b, c] = r.pending();
+    handleThrough(r, 1);
+    await until(() => fake.inbox("box").acked === 1);
+    // a was shown, so it's dropped again; b takes its new place; c, not
+    // sent again, is still shown.
+    send(gap(3, 1), { ...a, seq: 1 }, { ...b, seq: 2 });
+    await until(() => r.pending().length === 3);
+    expect(r.pending().map((e) => [e.seq, e.id])).toEqual([[3, c.id], [0, "gap-3"], [2, b.id]]);
+    expect(messages).toEqual([]);
+    // Nothing is acknowledged past an event not yet handled.
+    r.handled(r.pending().slice(0, 1));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.messages.filter((m) => m.includes('"ack"'))).toEqual([JSON.stringify({ type: "ack", seq: 1 })]);
+  });
+
+  it("keeps events that come while one is being handled, below it or not", async () => {
+    const r = reader();
+    await r.start();
+    for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
+    await until(() => r.pending().length === 3);
+    handleThrough(r, 2);
+    // c is being handled (a command running for it, say) when a gap that
+    // moves the position back, and a new event, come.
+    const [c] = r.pending();
+    send(gap(3, 1), event(1, "new-1"));
+    await until(() => r.pending().length === 3);
+    r.handled([c]);
+    expect(r.pending().map((e) => [e.seq, e.id])).toEqual([[0, "gap-3"], [1, "new-1"]]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.inbox("box").acked).toBe(2);
+
+    // An event out of order, below one being handled, stays too.
+    const r2 = reader("box2");
+    const send2 = (...events: WatchEvent[]) => {
+      for (const s of fake.sockets) if (s.inbox === "box2") s.send({ type: "events", events });
+    };
+    await r2.start();
+    send2(event(8, "e8"));
+    await until(() => r2.pending().length === 1);
+    const [e8] = r2.pending();
+    send2(event(5, "e5"));
+    await until(() => r2.pending().length === 2);
+    r2.handled([e8]);
+    expect(r2.pending().map((e) => e.id)).toEqual(["e5"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.inbox("box2").acked).toBeLessThan(5);
+  });
+
+  it("keeps an event whose seq goes back, in order, warning of it once a batch, but drops a repeated one quietly", async () => {
+    const r = reader();
+    await r.start();
+    send(event(7, "a"), event(6, "b"));
     await until(() => r.pending().length === 2);
     expect(r.pending().map((e) => [e.seq, e.id])).toEqual([[6, "b"], [7, "a"]]);
-    expect(messages).toEqual([
-      `${fake.url} sent an event out of order (seq 6 after 7, id "b"); it's shown anyway; if this keeps happening, report it to the server's operator`,
-    ]);
+    const report = "if this keeps happening, report it to the server's operator";
+    expect(messages).toEqual([`${fake.url} sent an event out of order (seq 6 after 7); it's shown anyway; ${report}`]);
     // One already seen, again under a lower seq, as a redelivery can be.
-    for (const s of fake.sockets) s.send({ type: "events", events: [event(5, "a"), event(8, "c")] });
+    send(event(5, "a"), event(8, "c"));
     await until(() => r.pending().length === 3);
     expect(r.pending().map((e) => e.id)).toEqual(["b", "a", "c"]);
     expect(messages).toHaveLength(1);
+    // Several in one batch: one warning.
+    send(event(2, "d"), event(4, "e"), event(3, "f"));
+    await until(() => r.pending().length === 6);
+    expect(r.pending().map((e) => e.id)).toEqual(["d", "f", "e", "b", "a", "c"]);
+    expect(messages.slice(1)).toEqual([`${fake.url} sent 3 events out of order (seqs 2 to 4 after 8); they're shown anyway; ${report}`]);
   });
 
-  it("forgets malformed events skipped past an inbox.gap that moves it back", async () => {
+  it("acknowledges a malformed event from before a gap that moves it back only locally", async () => {
     const r = reader();
     await r.start();
     fake.inject("box", "a");
@@ -133,14 +206,10 @@ describe("server reader", () => {
     await until(() => r.pending().length === 1 && messages.length === 1);
     // The skipped seq 2 was from the inbox's earlier life: acknowledging
     // what comes after the gap mustn't acknowledge it.
-    const gap: WatchEvent = {
-      v: 1, seq: 0, id: "gap", sub: null, kind: "inbox.gap", at: "t", received_at: "t", repo: null, pr: null, actor: null,
-      data: { missed_after: 2, resumed_at: 1 }, links: {},
-    };
-    for (const s of fake.sockets) s.send({ type: "events", events: [gap, { ...gap, seq: 1, id: "new-x", kind: "x", data: {} }] });
-    await until(() => r.pending().length === 2);
-    expect(r.pending().map((e) => e.seq)).toEqual([0, 1]);
-    r.ack(1);
+    send(gap(2, 1, "gap"), event(1, "new-x"));
+    await until(() => r.pending().length === 3);
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[1, "a"], [0, "inbox.gap"], [1, "x"]]);
+    r.handled(r.pending());
     await until(() => fake.inbox("box").acked === 1);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(fake.inbox("box").acked).toBe(1);
@@ -156,13 +225,13 @@ describe("server reader", () => {
     // The inbox starts again from nothing, as one made again used to.
     Object.assign(fake.inbox("box"), { head: 0, acked: 0, events: [] });
     fake.inject("box", "x", {}, "new-x");
-    await until(() => r.pending().length === 2);
-    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[0, "inbox.gap"], [1, "x"]]);
-    expect(r.pending()[0].data).toEqual({ missed_after: 3, resumed_at: 1 });
+    await until(() => r.pending().length === 5);
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[1, "a"], [2, "b"], [3, "c"], [0, "inbox.gap"], [1, "x"]]);
+    expect(r.pending()[3].data).toEqual({ missed_after: 3, resumed_at: 1 });
     // The next poll is from there, and gets what follows.
     fake.inject("box", "y", {}, "new-y");
-    await until(() => r.pending().length === 3);
-    expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
+    await until(() => r.pending().length === 6);
+    expect(r.pending().map((e) => e.seq)).toEqual([1, 2, 3, 0, 1, 2]);
     expect(fake.requests).toContain("GET /v1/inboxes/box/events?wait=300&after=1");
   });
 
@@ -188,7 +257,7 @@ describe("server reader", () => {
     expect(r.pending().map((e) => e.kind)).toEqual(["comment.created"]);
     expect(fake.requests).toContain("GET /v1/inboxes/box/events?wait=0");
     expect(fake.requests).toContain("GET /v1/inboxes/box/events?wait=300&after=0");
-    r.ack(1);
+    handleThrough(r, 1);
     await until(() => fake.inbox("box").acked === 1);
     // The next poll starts after what it has.
     await until(() => fake.requests.includes("GET /v1/inboxes/box/events?wait=300&after=1"));
@@ -290,6 +359,37 @@ describe("feed", () => {
     const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
     expect(feed.ended()).toBe(false);
     expect(new Feed(inbox, null, { interval: 60_000, log: () => {} }).ended()).toBe(true);
+    inbox.close();
+  });
+
+  it("acknowledges what it shows, and the unwanted events before each, but not what came meanwhile", async () => {
+    const inbox = Inbox.open("feed8");
+    const r = reader("feed8");
+    await r.start();
+    fake.inject("feed8", "check.failed");
+    fake.inject("feed8", "comment.created");
+    fake.inject("feed8", "check.failed");
+    fake.inject("feed8", "comment.created");
+    await until(() => r.pending().length === 4);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    const items = feed.wanted(["check.*"]);
+    expect(items.map((i) => i.event.seq)).toEqual([1, 3]);
+    // While they're shown (`wait`, or a command `exec` runs for them),
+    // the inbox is made again, and the server moves the position back.
+    for (const s of fake.sockets) {
+      s.send({ type: "events", events: [
+        { v: 1, seq: 0, id: "gap", sub: null, kind: "inbox.gap", at: "t", received_at: "t", repo: null, pr: null, actor: null, data: { missed_after: 4, resumed_at: 1 }, links: {} },
+        { v: 1, seq: 1, id: "new", sub: null, kind: "check.failed", at: "t", received_at: "t", repo: null, pr: null, actor: null, data: {}, links: {} },
+      ] });
+    }
+    await until(() => r.pending().length === 6);
+    feed.ack(items);
+    // The comment between them goes with the second; the one after it,
+    // and what came meanwhile, wait.
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[4, "comment.created"], [0, "inbox.gap"], [1, "check.failed"]]);
+    expect(feed.wanted(["check.*"]).map((i) => i.event.id)).toEqual(["gap", "new"]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.inbox("feed8").acked).toBe(0);
     inbox.close();
   });
 
@@ -584,7 +684,7 @@ describe("a malformed event", () => {
         const good = fake.inject("box", "comment.created");
         await until(() => r.pending().length === 1);
         expect(r.pending()[0].id).toBe(good.id);
-        r.ack(good.seq);
+        handleThrough(r, good.seq);
         await until(() => fake.inbox("box").acked === good.seq);
       }
       expect(messages).toHaveLength(shapes.length);
@@ -599,7 +699,7 @@ describe("a malformed event", () => {
     await until(() => messages.length === 1 && r.pending().length === 1);
     expect(fake.inbox("box").acked).toBe(0);
     // Reading the first acknowledges the skipped one too.
-    r.ack(first.seq);
+    handleThrough(r, first.seq);
     await until(() => fake.inbox("box").acked === 2);
 
     fake.injectMalformed("box", { seq: 2.5 });
@@ -607,7 +707,7 @@ describe("a malformed event", () => {
     expect(messages[1]).toMatch(/ \(kind "debug\.ping", octo\/widgets#7, id "fake:[^"]*"\): it isn't shaped as the protocol says; if this keeps/);
     const next = fake.inject("box", "comment.created");
     await until(() => r.pending().length === 1);
-    r.ack(next.seq);
+    handleThrough(r, next.seq);
     await until(() => fake.inbox("box").acked === next.seq);
   });
 
@@ -619,11 +719,11 @@ describe("a malformed event", () => {
     fake.inject("box", "comment.created");
     fake.injectMalformed("box", { kind: 42 });
     await until(() => r.pending().length === 2 && messages.length === 1);
-    r.ack(5);
+    handleThrough(r, 5);
     await until(() => fake.inbox("box").acked === 5);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(fake.inbox("box").acked).toBe(5);
-    r.ack(6);
+    handleThrough(r, 6);
     await until(() => fake.inbox("box").acked === 7);
   });
 
@@ -639,7 +739,7 @@ describe("a malformed event", () => {
     expect(messages[0]).toBe(
       `dropped a malformed event from ${fake.url} (seq 1, id "bad"): it isn't shaped as the protocol says; if this keeps happening, report it to the server's operator`,
     );
-    r.ack(1);
+    handleThrough(r, 1);
     await until(() => fake.inbox("box").acked === 1);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(fake.inbox("box").acked).toBe(1);

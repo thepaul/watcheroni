@@ -330,6 +330,16 @@ export class Inbox {
     return [...this.state.events];
   }
 
+  // Takes exactly these events (as pending() gave them) as handled.
+  handled(events: WatchEvent[]): void {
+    if (!events.length) return;
+    const done = new Set(events.map((e) => e.seq));
+    this.change((s) => {
+      s.events = s.events.filter((e) => !done.has(e.seq));
+      for (const seq of done) s.acked = Math.max(s.acked, seq);
+    });
+  }
+
   ack(seq: number): void {
     this.change((s) => {
       s.events = s.events.filter((e) => e.seq > seq);
