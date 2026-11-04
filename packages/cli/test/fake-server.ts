@@ -122,7 +122,7 @@ export class FakeServer {
   redirectTo: string | null = null;
   // Send `ready` with an acked that isn't a number, or follow every sound
   // `ready` with a frame that isn't JSON, or answer every poll with this
-  // page instead. Each hello's time is kept.
+  // page instead (a string as it is, not JSON). Each hello's time is kept.
   malformedReady = false;
   garbageAfterReady = false;
   readonly helloTimes: number[] = [];
@@ -362,6 +362,10 @@ export class FakeServer {
       const { seq } = await readBody<{ seq: number }>();
       inbox.acked = Math.max(inbox.acked, Math.min(seq, inbox.head));
       return json(200, { name, head: inbox.head, acked: inbox.acked });
+    }
+    if (route === "GET /events" && typeof this.malformedPage === "string") {
+      res.writeHead(200, { "content-type": "text/html" }).end(this.malformedPage);
+      return;
     }
     if (route === "GET /events" && this.malformedPage !== undefined) return json(200, this.malformedPage);
     if (route === "GET /events") {

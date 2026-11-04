@@ -430,10 +430,13 @@ export class ServerReader {
           }
           // Closed for a malformed message: reconnected with backoff that
           // grows as for a server that's down, even after a sound ready,
-          // so a server that keeps doing it isn't asked every second.
+          // so a server that sends nothing else isn't asked every second.
+          // One that also sent events soundly starts the backoff again.
           if (this.brokenBy) {
             const what = this.brokenBy;
             this.brokenBy = null;
+            if (this.readSince) delay = this.o.backoff[0];
+            this.readSince = false;
             throw new Unreachable(`${this.client.url} sent a malformed ${what}`);
           }
           if (code === 4001) throw new LoginNeeded(`${this.client.url} rejected the API key (${reason || "4001"}); check WATCHERONI_API_KEY`);
@@ -454,6 +457,12 @@ export class ServerReader {
           } catch (e) {
             // Too many long polls already waiting on this account: still
             // connected, but ask again later rather than at once.
+            // An answer that isn't JSON at all (a captive portal's page,
+            // say) is a malformed page, tried again.
+            if (e instanceof SyntaxError) {
+              this.malformed("page of events");
+              throw new Unreachable(`${this.client.url} sent a malformed page of events`);
+            }
             if (!(e instanceof Unreachable && e.code === "too_many_connections")) throw e;
             const seconds = e.retryAfter ?? CROWDED_RETRY_SECONDS;
             if (!this.crowded) this.o.log(`${this.client.url} has too many long polls waiting for this account; asking every ${seconds} s instead`);
@@ -496,8 +505,10 @@ export class ServerReader {
   private wasConnected = false;
   private outage = false;
   private readonly warned = new Set<string>();
-  // What the last WebSocket was closed for, if it was malformed.
+  // What the last WebSocket was closed for, if it was malformed, and
+  // whether it brought a sound events message since its ready.
   private brokenBy: string | null = null;
+  private readSince = false;
   private crowded = false;
 
   // Sleeps for `ms`, or until close().
@@ -570,29 +581,32 @@ export class ServerReader {
         // JSON included, may have carried events, which the server now
         // counts as sent on this connection. So it's closed, and the next
         // one's hello asks again from the last event read (see run()).
-        // One of a type this version doesn't know is ignored.
+        // One of a type this version doesn't know is ignored; one with no
+        // type at all is malformed.
         const broken = (what: string) => {
           this.malformed(what);
           this.brokenBy = what;
           ws.close(4000, `malformed ${what}`);
         };
-        if (typeof m.data !== "string") return broken("message");
+        if (typeof m.data !== "string") return broken("binary message");
         let msg: ServerMessage;
         try {
           msg = JSON.parse(m.data) as ServerMessage;
         } catch {
           return broken("message");
         }
-        if (!isObject(msg)) {
+        if (!isObject(msg) || typeof msg.type !== "string") {
           broken("message");
         } else if (msg.type === "ready") {
           if (!isSeq(msg.acked)) return broken("ready message");
           this.ws = ws;
+          this.readSince = false;
           if (this.pos === null) this.pos = msg.acked;
           this.markConnected();
         } else if (msg.type === "events") {
-          if (Array.isArray(msg.events)) this.add(msg.events);
-          else broken("events message");
+          if (!Array.isArray(msg.events)) return broken("events message");
+          this.add(msg.events);
+          this.readSince = true;
         } else if (msg.type === "error") {
           // The server's own words, cleaned like the rest.
           this.o.log(`${this.client.url}: ${clean(msg.code)}${msg.detail ? `: ${clean(msg.detail, PROSE_LENGTH)}` : ""}`);

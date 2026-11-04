@@ -564,7 +564,10 @@ describe("a malformed message or page", () => {
     ["a bare list", "message", (events) => events],
     ["null", "message", () => null],
     ["text that isn't JSON", "message", (events) => `{"type":"events","events":${JSON.stringify(events)}`],
-    ["a binary frame", "message", (events) => Buffer.from(JSON.stringify({ type: "events", events }))],
+    // Sound events as JSON, but in a binary frame, which isn't read.
+    ["a binary frame", "binary message", (events) => Buffer.from(JSON.stringify({ type: "events", events }))],
+    ["no type", "message", (events) => ({ events })],
+    ["a type that isn't text", "message", (events) => ({ type: 1, events })],
   ];
   for (const [label, what, wrap] of wrappers) {
     it(`closes a WebSocket that sent a malformed ${what} (${label}), and reads its events again`, async () => {
@@ -587,6 +590,21 @@ describe("a malformed message or page", () => {
     expect(r.pending()[0].id).toBe(good.id);
     expect(messages).toEqual([]);
     expect(fake.helloTimes).toHaveLength(1);
+  });
+
+  it("starts the backoff again after a malformed message from a server that also sends events soundly", async () => {
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 2000] });
+    readers.push(r);
+    await r.start();
+    for (let i = 1; i <= 4; i++) {
+      const sent = Date.now();
+      fake.injectWrapped("box", (events) => `{${JSON.stringify(events)}`);
+      await until(() => fake.helloTimes.length === i + 1 && r.pending().length === 2 * i - 1);
+      // 10-20 ms each time; doubling, the fourth would be 80-160 ms.
+      expect(fake.helloTimes[i] - sent).toBeLessThan(60);
+      fake.inject("box", "comment.created");
+      await until(() => r.pending().length === 2 * i);
+    }
   });
 
   it("backs off further each time a server keeps sending malformed messages", async () => {
@@ -638,7 +656,7 @@ describe("a malformed message or page", () => {
     expect(r.pending()[0].id).toBe(good.id);
   });
 
-  for (const page of [null, [], { events: null, next: 0, acked: 0 }, { events: [], next: "x", acked: 0 }, { events: [], next: 1.5, acked: 0 }, { events: [], next: 0, acked: null }]) {
+  for (const page of ["<html>Sign in to the Wi-Fi</html>", null, [], { events: null, next: 0, acked: 0 }, { events: [], next: "x", acked: 0 }, { events: [], next: 1.5, acked: 0 }, { events: [], next: 0, acked: null }]) {
     it(`is tried again long-polling, as after a 5xx: ${JSON.stringify(page)}`, async () => {
       fake.refuseSockets = true;
       fake.malformedPage = page;
