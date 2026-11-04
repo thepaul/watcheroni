@@ -1118,7 +1118,8 @@ server doesn't send it, with a `--jq` filter that keeps just the text.
 
 When the App isn't installed on a target (`app_not_installed`), the server
 is unreachable, or the repo is throttled, the CLI polls GitHub directly for
-that target every 2 minutes with one GraphQL query, and turns what changed
+that target every 2 minutes with one GraphQL query (and a conditional
+REST request for the head commit's workflow runs), and turns what changed
 into the same event kinds. It needs GitHub credentials that can read the
 repo; it uses `gh auth token` or `GITHUB_TOKEN`, **locally only**. These
 are never sent to the watcheroni server. `doctor` explains which mode

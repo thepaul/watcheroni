@@ -22,7 +22,9 @@ delivered.
 
 **Local mode** is the CLI polling GitHub itself, every 2 minutes by
 default (`--interval`), when there's no server or the server won't watch
-a PR. Each poll is one GraphQL query per PR (`packages/cli/src/snapshot.ts`);
+a PR. Each poll is one GraphQL query per PR, and a REST request per 100
+of the head commit's workflow runs, which costs nothing when they
+haven't changed (`packages/cli/src/snapshot.ts`);
 `packages/cli/src/diff.ts` turns the difference from the last poll into
 events. The first poll is the starting point and reports nothing. Local
 mode watches single PRs only, never whole repositories. What it can
@@ -32,12 +34,19 @@ miss:
   unresolved again, a draft marked ready and back, a review submitted and
   dismissed (no event at all), a check failing and then passing on a
   re-run of the same commit status;
-- intermediate states: several pushes are one `pr.pushed`, and a check
-  run completed twice with different conclusions reports the last one;
+- intermediate states: several pushes are one `pr.pushed`, a check
+  run completed twice with different conclusions reports the last one,
+  and several attempts of one workflow run finishing between two polls
+  report the last;
 - anything beyond what one query reads: the last 100 reviews, review
   threads and PR comments, the last 100 comments in each thread, the
   first 50 review requests and the first 100 checks on the head commit;
-- checks on a commit that is no longer the head by the next poll.
+  and beyond the 1,000 workflow runs GitHub lists for one commit;
+- checks and workflow runs on a commit that is no longer the head by the
+  next poll (the server reports workflow runs finishing there);
+- workflow runs finishing before their head's runs have been read once:
+  on the head a watch starts on, while the runs can't be read
+  (`workflow.completed`, below).
 
 Its events' `at` is the time GitHub gives for reviews, comments and
 checks, and the time of the poll for everything else. Their `id`s start
@@ -326,11 +335,26 @@ A GitHub Actions workflow run finished.
 **Server:** `workflow_run` / `completed`, one per PR the run lists (or
 matched by head commit, like a check run), with GitHub's conclusion.
 
-**Local mode:** every check run of one workflow run on the head commit is
-finished, and wasn't at the last poll. The conclusion is worked out from
-the jobs: `failure` if any failed, else `cancelled` if any was cancelled,
-else `success`. A job that GitHub hasn't created yet (one that waits on
-another) isn't counted, so a workflow can be reported finished early.
+**Local mode:** a workflow run on the head commit that GitHub's workflow
+runs API (`GET /repos/{owner}/{repo}/actions/runs?head_sha=...`) says is
+`completed` now and wasn't at the last poll, with GitHub's conclusion.
+That is the run's own status, the one its `workflow_run` webhook
+carries, not worked out from its jobs, so a job still waiting on another
+keeps the run unfinished. A re-run is the same run's next attempt, and
+is sent again when it finishes; of several attempts finishing between
+two polls, only the last is sent. A run completed again with another
+conclusion is sent again: a run from a fork that needs approval is
+completed as `action_required`, and once a maintainer approves it, runs
+and is completed with its real conclusion. While the runs can't be read
+(the GitHub login can't read the repo's Actions, or the request fails)
+nothing is sent; once they can again, runs that finished meanwhile are,
+compared with the head's runs as last read, or, after a push, as runs
+on a new head. Only on the head a watch starts on, before the runs have
+been read once, is there nothing to compare them with. The CLI says so on
+stderr, with GitHub's reason, once per run of the CLI while the runs
+can't be read, and once when they can again. A 403 is GitHub refusing
+the GitHub login access to them: a fine-grained token, for one, needs
+read access to the repo's Actions.
 
 ## The watch itself
 

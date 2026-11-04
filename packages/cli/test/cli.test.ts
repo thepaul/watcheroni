@@ -177,6 +177,8 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(9);
   });
 
+  // Runs the CLI 13 times, two of them waiting 1 s: too close to the
+  // default 5 s timeout on a busy machine.
   it("remembers --kinds given with a PR, until it's changed", async () => {
     fake.repos.set("octo/widgets", { private: false });
     fake.inject("box", "comment.created");
@@ -218,7 +220,7 @@ describe("wait against a server", () => {
     expect(await cli(["unwatch", "octo/widgets#7"]).code).toBe(0);
     expect(await cli(["watch", "octo/widgets#7"]).code).toBe(0);
     expect(await kindsNow()).toBeUndefined();
-  });
+  }, 15_000);
 
   it("lets watch and unwatch change the inbox while it waits", async () => {
     fake.repos.set("octo/widgets", { private: false });

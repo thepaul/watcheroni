@@ -1,9 +1,10 @@
-import { graphql } from "./github.ts";
+import { GitHubError, LoginNeeded, graphql, restList } from "./github.ts";
 import type { Target } from "./targets.ts";
 
 // What local mode knows about a PR at one moment: one GraphQL query (1
-// point of GitHub's 5,000 an hour), reduced to IDs and states. diff.ts
-// turns two of these into events.
+// point of GitHub's 5,000 an hour) and a REST request per 100 of the head
+// commit's workflow runs (free when nothing changed: see restList()),
+// reduced to IDs and states. diff.ts turns two of these into events.
 
 export interface Actor { id: number; login: string; bot: boolean }
 
@@ -15,12 +16,26 @@ export interface Check {
   type: "check_run" | "status";
   checkRunId: number | null;
   workflowRunId: number | null;
-  workflow: string | null;
   done: boolean;
   // Lower case: success, failure, timed_out, cancelled, skipped, ...
   conclusion: string | null;
   url: string | null;
   at: string | null;
+}
+
+// A GitHub Actions workflow run, as GitHub reports it: the same object the
+// `workflow_run` webhook carries. Its status is the whole run's, not
+// worked out from its jobs. A re-run keeps the ID with a new attempt.
+export interface WorkflowRun {
+  id: number;
+  attempt: number;
+  name: string | null;
+  done: boolean;
+  // Lower case: success, failure, cancelled, ...
+  conclusion: string | null;
+  url: string;
+  api: string;
+  at: string;
 }
 
 export interface Snapshot {
@@ -55,6 +70,11 @@ export interface Snapshot {
   comments: { id: number; at: string; url: string; author: Actor | null }[];
   // Checks on the head commit only.
   checks: Check[];
+  // Workflow runs on the head commit; null when the token can't read them
+  // (or in a snapshot saved before they were read).
+  workflowRuns: WorkflowRun[] | null;
+  // Why they couldn't be read, when they couldn't.
+  workflowRunsError?: string;
 }
 
 const QUERY = `
@@ -74,7 +94,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       comments(last: 100) { nodes { databaseId createdAt url author { ...actor } } }
       commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes {
         __typename
-        ... on CheckRun { databaseId name status conclusion detailsUrl completedAt checkSuite { workflowRun { databaseId workflow { name } } } }
+        ... on CheckRun { databaseId name status conclusion detailsUrl completedAt checkSuite { workflowRun { databaseId } } }
         ... on StatusContext { context state targetUrl createdAt }
       } } } } } }
     }
@@ -92,7 +112,7 @@ interface RawContext {
   conclusion?: string | null;
   detailsUrl?: string | null;
   completedAt?: string | null;
-  checkSuite?: { workflowRun: { databaseId: number; workflow: { name: string } } | null };
+  checkSuite?: { workflowRun: { databaseId: number } | null };
   context?: string;
   state?: string;
   targetUrl?: string | null;
@@ -132,15 +152,68 @@ interface RawPr {
 interface Raw {
   repository: { databaseId: number; nameWithOwner: string; pullRequest: RawPr | null } | null;
 }
+// From GET /repos/{owner}/{repo}/actions/runs.
+interface RawRuns {
+  workflow_runs: {
+    id: number;
+    run_attempt?: number;
+    name: string | null;
+    status: string | null;
+    conclusion: string | null;
+    html_url: string;
+    url: string;
+    updated_at: string;
+  }[];
+}
 
 export async function fetchSnapshot(target: Target): Promise<Snapshot> {
   const data = await graphql<Raw>(QUERY, { owner: target.owner, name: target.name, number: target.number });
   const repo = data.repository;
   if (!repo?.pullRequest) throw new Error(`${target.owner}/${target.name}#${target.number}: no such pull request`);
-  return toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString());
+  let runs: WorkflowRun[] | null;
+  let why: string | undefined;
+  try {
+    const sha = encodeURIComponent(repo.pullRequest.headRefOid);
+    runs = await restList(
+      `/repos/${repo.nameWithOwner}/actions/runs?head_sha=${sha}&per_page=100&exclude_pull_requests=true`,
+      (body) => (body as RawRuns).workflow_runs.map((r) => {
+        // Without it a re-run can't be told apart: the runs aren't read.
+        if (typeof r.run_attempt !== "number") throw new GitHubError(`workflow run ${r.id} has no run_attempt`, 502);
+        return {
+          id: r.id,
+          attempt: r.run_attempt,
+          name: r.name,
+          done: r.status === "completed",
+          conclusion: r.conclusion,
+          url: r.html_url,
+          api: r.url,
+          at: r.updated_at,
+        };
+      }),
+    );
+    // A run can move to another page between two pages' requests.
+    runs = [...new Map(runs.map((r) => [r.id, r])).values()];
+  } catch (e) {
+    // A token that can read the PR but not its Actions, or a request that
+    // failed: no workflow runs this time (poll.ts keeps the last ones
+    // read). Out of requests, or logged out, stops the poll to try later.
+    if (e instanceof LoginNeeded || (e instanceof GitHubError && e.status === 429)) throw e;
+    runs = null;
+    why = printable(String((e as Error)?.message || e || "unknown error"), 200);
+  }
+  const snapshot = toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString(), runs);
+  return why ? { ...snapshot, workflowRunsError: why } : snapshot;
 }
 
-export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string): Snapshot {
+// Text from GitHub, made safe to print to a terminal: control, bidi and
+// zero-width characters become spaces, and it's cut to `max` characters
+// (whole ones, not halves of a surrogate pair).
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g;
+export function printable(text: string, max: number): string {
+  return Array.from(text.replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim()).slice(0, max).join("");
+}
+
+export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string, runs: WorkflowRun[] | null = null): Snapshot {
   const commit = pr.commits.nodes[0]?.commit;
   const contexts = commit?.oid === pr.headRefOid ? commit.statusCheckRollup?.contexts.nodes ?? [] : [];
   return {
@@ -177,6 +250,7 @@ export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedA
     })),
     comments: pr.comments.nodes.map((c) => ({ id: c.databaseId, at: c.createdAt, url: c.url, author: actor(c.author) })),
     checks: contexts.map(toCheck),
+    workflowRuns: runs,
   };
 }
 
@@ -192,7 +266,6 @@ function toCheck(c: RawContext): Check {
       type: "check_run",
       checkRunId: c.databaseId ?? null,
       workflowRunId: c.checkSuite?.workflowRun?.databaseId ?? null,
-      workflow: c.checkSuite?.workflowRun?.workflow.name ?? null,
       done: c.status === "COMPLETED",
       conclusion: c.conclusion?.toLowerCase() ?? null,
       url: c.detailsUrl ?? null,
@@ -208,7 +281,6 @@ function toCheck(c: RawContext): Check {
     type: "status",
     checkRunId: null,
     workflowRunId: null,
-    workflow: null,
     done,
     conclusion: done ? (state === "success" ? "success" : "failure") : null,
     url: c.targetUrl ?? null,

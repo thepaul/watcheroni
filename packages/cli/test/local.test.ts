@@ -7,14 +7,15 @@ import { Feed } from "../src/feed.ts";
 import { formatText } from "../src/format.ts";
 import { GitHubError } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
-import { pollOnce } from "../src/poll.ts";
+import { forgetWarnings, pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { UsageError, parseTarget, repoKey, targetKey, type Target } from "../src/targets.ts";
-import { alice, bob, check, snap } from "./fixtures.ts";
+import { HEAD1, HEAD2, alice, bob, check, run, snap } from "./fixtures.ts";
 
 let n = 0;
 beforeEach(() => {
   process.env.WATCHERONI_STATE_DIR = mkdtempSync(join(tmpdir(), "watcheroni-test-"));
+  forgetWarnings();
 });
 const open = () => Inbox.open(`t${n++}`);
 const age = (file: string, days: number) => {
@@ -141,6 +142,104 @@ describe("polling", () => {
     expect((await pollOnce(inbox, log, fetch)).map((e) => e.kind)).toEqual(["pr.merged", "watch.ended"]);
     expect(inbox.watched()).toEqual([]);
     inbox.close();
+  });
+
+  it("keeps the last workflow runs read while they can't be, and records each conclusion GitHub gives", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const snapshots: Snapshot[] = [
+      snap({ workflowRuns: [run({ done: false, conclusion: null }), run({ id: 600, done: false, conclusion: null })] }),
+      snap({ workflowRuns: [run({ conclusion: "action_required" }), run({ id: 600, done: false, conclusion: null })] }),
+      // Runs unreadable for a while: run 600 finishes meanwhile.
+      snap({ workflowRuns: null }),
+      snap({ workflowRuns: null }),
+      // Back, with 500 approved and finished.
+      snap({ workflowRuns: [run(), run({ id: 600 })] }),
+    ];
+    const fetch = async () => snapshots.shift()!;
+    const polled = async () => (await pollOnce(inbox, () => {}, fetch)).map((e) => [e.kind, e.data.run_id, e.data.conclusion]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["workflow.completed", 500, "action_required"]]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["workflow.completed", 500, "success"], ["workflow.completed", 600, "success"]]);
+    inbox.close();
+  });
+
+  it("after a push with runs unreadable, keeps none of the old head's and reports the new head's", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const snapshots: Snapshot[] = [
+      // Run 500 had finished when watching started: never reported.
+      snap({ workflowRuns: [run()] }),
+      // Pushed; the new head's runs can't be read yet, and then are.
+      snap({ head: HEAD2, workflowRuns: null }),
+      snap({ head: HEAD2, workflowRuns: [run({ id: 700, done: false, conclusion: null })] }),
+      // Pushed again; a run on that head finishes before its runs can be read.
+      snap({ head: HEAD1, workflowRuns: null }),
+      snap({ head: HEAD1, workflowRuns: [run({ id: 800, conclusion: "failure" })] }),
+    ];
+    const fetch = async () => snapshots.shift()!;
+    const polled = async () => (await pollOnce(inbox, () => {}, fetch)).map((e) => [e.kind, e.data.run_id ?? null]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["pr.pushed", null]]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["pr.pushed", null]]);
+    expect(await polled()).toEqual([["workflow.completed", 800]]);
+    inbox.close();
+  });
+
+  it("says once that workflow runs can't be read, and once that they can again", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const unreadable = (why: string) => ({ ...snap({ workflowRuns: null }), workflowRunsError: why });
+    const snapshots: Snapshot[] = [
+      unreadable("GitHub /repos/octo/widgets/actions/runs: 403 Resource not accessible by personal access token"),
+      unreadable("GitHub /repos/octo/widgets/actions/runs: 502 Server Error"),
+      snap(),
+      snap(),
+      unreadable("fetch failed"),
+    ];
+    const logged: string[] = [];
+    for (let i = 0; i < 5; i++) await pollOnce(inbox, (m) => logged.push(m), async () => snapshots.shift()!);
+    expect(logged).toEqual([
+      "octo/widgets#7: can't read its workflow runs (GitHub /repos/octo/widgets/actions/runs: 403 Resource not accessible by personal access token); no workflow.completed until they can be read",
+      "octo/widgets#7: its workflow runs can be read again",
+      "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
+    ]);
+
+    // Still unreadable: not said again in this process, but said in the
+    // next one (a later `watcheroni wait`), even though the inbox already
+    // knew.
+    logged.length = 0;
+    for (let i = 0; i < 2; i++) await pollOnce(inbox, (m) => logged.push(m), async () => unreadable("fetch failed"));
+    expect(logged).toEqual([]);
+    forgetWarnings();
+    for (let i = 0; i < 2; i++) await pollOnce(inbox, (m) => logged.push(m), async () => unreadable("fetch failed"));
+    expect(logged).toEqual([
+      "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
+    ]);
+    inbox.close();
+  });
+
+  it("has nothing to compare when runs have never been read on this head", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const { workflowRuns: _, ...saved } = snap();
+    const snapshots: Snapshot[] = [snap({ workflowRuns: null }), snap({ workflowRuns: null }), snap({ workflowRuns: [run()] })];
+    const fetch = async () => snapshots.shift()!;
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    // A snapshot saved by an older version, without runs.
+    const old = open();
+    old.watch(targetKey(target), target);
+    old.record(targetKey(target), saved as Snapshot, []);
+    const later = [snap({ workflowRuns: null }), snap({ workflowRuns: [run()] })];
+    expect(await pollOnce(old, () => {}, async () => later.shift()!)).toEqual([]);
+    expect(await pollOnce(old, () => {}, async () => later.shift()!)).toEqual([]);
+    inbox.close();
+    old.close();
   });
 
   it("says at once if the PR has already ended", async () => {
@@ -310,9 +409,10 @@ describe("text output", () => {
     const inbox = open();
     const target = { owner: "octo", name: "widgets", number: 7 };
     inbox.watch(targetKey(target), target);
-    const before = snap({ checks: [check("lint", { done: false, conclusion: null })] });
+    const before = snap({ checks: [check("lint", { done: false, conclusion: null })], workflowRuns: [run({ done: false, conclusion: null })] });
     const after = snap({
       checks: [check("lint", { conclusion: "failure" })],
+      workflowRuns: [run({ conclusion: "failure" })],
       reviews: [{ id: 10, state: "CHANGES_REQUESTED", empty: false, at: "t", url: "u", author: alice }],
       reviewComments: [
         { id: 20, reviewId: 10, inReplyTo: null, path: "a.ts", line: 3, at: "t", url: "u", author: alice },
