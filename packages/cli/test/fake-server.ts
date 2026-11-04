@@ -29,7 +29,9 @@ class FakeSocket {
     socket.on("error", () => {});
   }
 
-  send(msg: ServerMessage | string): void {
+  // A Buffer goes as a binary frame.
+  send(msg: ServerMessage | string | Buffer): void {
+    if (Buffer.isBuffer(msg)) return this.frame(0x2, msg);
     this.frame(0x1, Buffer.from(typeof msg === "string" ? msg : JSON.stringify(msg)));
   }
 
@@ -118,9 +120,12 @@ export class FakeServer {
   // or with a 307 to this address.
   problem: { status: number; body: Record<string, unknown> | string } | null = null;
   redirectTo: string | null = null;
-  // Send `ready` with an acked that isn't a number, or answer every poll
-  // with this page instead.
+  // Send `ready` with an acked that isn't a number, or follow every sound
+  // `ready` with a frame that isn't JSON, or answer every poll with this
+  // page instead. Each hello's time is kept.
   malformedReady = false;
+  garbageAfterReady = false;
+  readonly helloTimes: number[] = [];
   malformedPage: unknown = undefined;
   private http: Server | null = null;
   private waiting = new Set<() => void>();
@@ -180,6 +185,7 @@ export class FakeServer {
 
   // Sends a new event to the inbox's sockets inside a message `wrap` makes
   // of it, counting it as sent, as a server would with a sound message.
+  // What `wrap` returns goes as JSON, but a string or Buffer as it is.
   injectWrapped(name: string, wrap: (events: WatchEvent[]) => unknown): WatchEvent {
     this.holding = true;
     let event: WatchEvent;
@@ -190,7 +196,8 @@ export class FakeServer {
     }
     for (const s of this.sockets) {
       if (s.inbox !== name || s.pos === null) continue;
-      s.send(JSON.stringify(wrap(this.inbox(name).events.filter((e) => e.seq > s.pos!))));
+      const msg = wrap(this.inbox(name).events.filter((e) => e.seq > s.pos!));
+      s.send(typeof msg === "string" || Buffer.isBuffer(msg) ? msg : JSON.stringify(msg));
       s.pos = event.seq;
     }
     return event;
@@ -234,8 +241,10 @@ export class FakeServer {
     const msg = JSON.parse(text) as ClientMessage;
     const inbox = this.inbox(s.inbox);
     if (msg.type === "hello") {
+      this.helloTimes.push(Date.now());
       s.pos = msg.after ?? inbox.acked;
       s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
+      if (this.garbageAfterReady) s.send("{not json");
       this.sendFrom(s);
     } else if (msg.type === "ack") {
       inbox.acked = Math.max(inbox.acked, Math.min(msg.seq, inbox.head));

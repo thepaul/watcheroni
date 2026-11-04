@@ -558,14 +558,16 @@ describe("a malformed event", () => {
 describe("a malformed message or page", () => {
   const warning = (what: string) => `${fake.url} sent a malformed ${what}: it isn't shaped as the protocol says; if this keeps happening, report it to the server's operator`;
 
-  const wrappers: [string, (events: WatchEvent[]) => unknown][] = [
-    ["events message", () => ({ type: "events", events: null })],
-    ["events message", (events) => ({ type: "events", events: { 0: events[0] } })],
-    ["message", (events) => events],
-    ["message", () => null],
+  const wrappers: [label: string, what: string, wrap: (events: WatchEvent[]) => unknown][] = [
+    ["null events", "events message", () => ({ type: "events", events: null })],
+    ["events in an object", "events message", (events) => ({ type: "events", events: { 0: events[0] } })],
+    ["a bare list", "message", (events) => events],
+    ["null", "message", () => null],
+    ["text that isn't JSON", "message", (events) => `{"type":"events","events":${JSON.stringify(events)}`],
+    ["a binary frame", "message", (events) => Buffer.from(JSON.stringify({ type: "events", events }))],
   ];
-  for (const [what, wrap] of wrappers) {
-    it(`closes a WebSocket that sent a malformed ${what}, and reads its events again: ${String(wrap)}`, async () => {
+  for (const [label, what, wrap] of wrappers) {
+    it(`closes a WebSocket that sent a malformed ${what} (${label}), and reads its events again`, async () => {
       const r = reader();
       await r.start();
       const lost = fake.injectWrapped("box", wrap);
@@ -575,6 +577,32 @@ describe("a malformed message or page", () => {
       expect(fake.messages.filter((m) => m.includes("hello"))).toEqual([JSON.stringify({ type: "hello" }), JSON.stringify({ type: "hello", after: 0 })]);
     });
   }
+
+  it("ignores a message of a type it doesn't know", async () => {
+    const r = reader();
+    await r.start();
+    for (const s of fake.sockets) s.send(JSON.stringify({ type: "news", events: null }));
+    const good = fake.inject("box", "comment.created");
+    await until(() => r.pending().length === 1);
+    expect(r.pending()[0].id).toBe(good.id);
+    expect(messages).toEqual([]);
+    expect(fake.helloTimes).toHaveLength(1);
+  });
+
+  it("backs off further each time a server keeps sending malformed messages", async () => {
+    fake.garbageAfterReady = true;
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 400] });
+    readers.push(r);
+    await r.start();
+    await until(() => fake.helloTimes.length >= 5);
+    const gaps = fake.helloTimes.slice(1).map((t, i) => t - fake.helloTimes[i]);
+    // 10-20 ms at first, then doubling: the fourth wait is 80-160 ms.
+    expect(gaps[0]).toBeLessThan(60);
+    expect(gaps[3]).toBeGreaterThanOrEqual(80);
+    expect(messages[0]).toBe(warning("message"));
+    for (const m of messages.slice(1)) expect([`reconnected to ${fake.url}`, `${fake.url} sent a malformed message; reconnecting`]).toContain(m);
+    expect(messages).toContain(`${fake.url} sent a malformed message; reconnecting`);
+  });
 
   it("says so each time a page goes bad mid-run, warning in full only once", async () => {
     fake.refuseSockets = true;

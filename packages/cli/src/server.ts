@@ -428,6 +428,14 @@ export class ServerReader {
             this.mode = "longpoll";
             continue;
           }
+          // Closed for a malformed message: reconnected with backoff that
+          // grows as for a server that's down, even after a sound ready,
+          // so a server that keeps doing it isn't asked every second.
+          if (this.brokenBy) {
+            const what = this.brokenBy;
+            this.brokenBy = null;
+            throw new Unreachable(`${this.client.url} sent a malformed ${what}`);
+          }
           if (code === 4001) throw new LoginNeeded(`${this.client.url} rejected the API key (${reason || "4001"}); check WATCHERONI_API_KEY`);
           if (code === 4004) throw new ServerError(`inbox ${this.name} was deleted on ${this.client.url}`, 404, "not_found");
           if (code === 4029) {
@@ -488,6 +496,8 @@ export class ServerReader {
   private wasConnected = false;
   private outage = false;
   private readonly warned = new Set<string>();
+  // What the last WebSocket was closed for, if it was malformed.
+  private brokenBy: string | null = null;
   private crowded = false;
 
   // Sleeps for `ms`, or until close().
@@ -555,21 +565,24 @@ export class ServerReader {
       });
       ws.addEventListener("message", (m) => {
         heard = Date.now();
-        if (m.data === "pong" || typeof m.data !== "string") return;
+        if (m.data === "pong") return;
+        // A message that isn't as the protocol has it, binary or not even
+        // JSON included, may have carried events, which the server now
+        // counts as sent on this connection. So it's closed, and the next
+        // one's hello asks again from the last event read (see run()).
+        // One of a type this version doesn't know is ignored.
+        const broken = (what: string) => {
+          this.malformed(what);
+          this.brokenBy = what;
+          ws.close(4000, `malformed ${what}`);
+        };
+        if (typeof m.data !== "string") return broken("message");
         let msg: ServerMessage;
         try {
           msg = JSON.parse(m.data) as ServerMessage;
         } catch {
-          return;
+          return broken("message");
         }
-        // A message that isn't as the protocol has it may have carried
-        // events, which the server now counts as sent on this connection.
-        // So it's closed, and the next one's hello asks again from the
-        // last event read.
-        const broken = (what: string) => {
-          this.malformed(what);
-          ws.close(4000, `malformed ${what}`);
-        };
         if (!isObject(msg)) {
           broken("message");
         } else if (msg.type === "ready") {
