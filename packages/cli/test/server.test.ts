@@ -468,6 +468,57 @@ describe("subscribing on the server", () => {
   });
 });
 
+describe("a malformed event", () => {
+  const shapes: Record<string, unknown>[] = [
+    { kind: 42 }, { kind: null }, { id: null }, { id: 7 }, { data: null }, { data: [] }, { data: "x" },
+    { repo: "octo/widgets" }, { repo: { id: 1, full_name: 1 } }, { pr: "7" }, { links: null }, { sub: 5 }, { actor: "x" },
+  ];
+
+  for (const longPoll of [false, true]) {
+    it(`is skipped with a warning and acknowledged, and later ones still come, ${longPoll ? "long-polling" : "over a WebSocket"}`, async () => {
+      fake.refuseSockets = longPoll;
+      const r = reader();
+      await r.start();
+      messages.length = 0;
+      for (const [i, shape] of shapes.entries()) {
+        // A fresh seq, so a bad one in `shape` replaces a sound one.
+        const seq = fake.inbox("box").head + 1;
+        fake.injectMalformed("box", { id: "\x1b[31mbad", ...shape });
+        await until(() => fake.inbox("box").acked === seq);
+        expect(messages[i]).toBe(
+          `skipped an event from ${fake.url} that isn't one this version understands (seq ${seq}${!("id" in shape) ? `, id "[31mbad"` : ""})`,
+        );
+        const good = fake.inject("box", "comment.created");
+        await until(() => r.pending().length === 1);
+        expect(r.pending()[0].id).toBe(good.id);
+        r.ack(good.seq);
+        await until(() => fake.inbox("box").acked === good.seq);
+      }
+      expect(messages).toHaveLength(shapes.length);
+    });
+  }
+
+  it("waits for what comes before it to be read, and can't be placed without a sound seq", async () => {
+    const r = reader();
+    await r.start();
+    const first = fake.inject("box", "comment.created");
+    fake.injectMalformed("box", { kind: 42 });
+    await until(() => messages.length === 1 && r.pending().length === 1);
+    expect(fake.inbox("box").acked).toBe(0);
+    // Reading the first acknowledges the skipped one too.
+    r.ack(first.seq);
+    await until(() => fake.inbox("box").acked === 2);
+
+    fake.injectMalformed("box", { seq: 2.5 });
+    await until(() => messages.length === 2);
+    expect(messages[1]).toMatch(/\(no seq, id "fake:[^"]*"\)$/);
+    const next = fake.inject("box", "comment.created");
+    await until(() => r.pending().length === 1);
+    r.ack(next.seq);
+    await until(() => fake.inbox("box").acked === next.seq);
+  });
+});
+
 describe("what the server says", () => {
   // Colour, an OSC 8 link, a carriage return, a C1 CSI and a NUL.
   const NASTY = "\x1b[31mred\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\rover\u009b2J\x00end";
@@ -524,9 +575,11 @@ describe("what the server says", () => {
 
   it("can't redirect a request, which fails saying why", async () => {
     const fetches = vi.spyOn(globalThis, "fetch");
+    // The hint names the config file where it really is.
+    vi.stubEnv("WATCHERONI_CONFIG_DIR", "/etc/watcheroni-test");
     try {
       fake.redirectTo = `http://127.0.0.1:${fake.port}/elsewhere`;
-      const moved = `answered 307 redirecting to "http://127.0.0.1:${fake.port}/elsewhere", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json`;
+      const moved = `answered 307 redirecting to "http://127.0.0.1:${fake.port}/elsewhere", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or /etc/watcheroni-test/config.json`;
       const err = (await client().ack("box", 1).catch((e: Error) => e)) as Error;
       expect(fetches.mock.calls[0][1]).toMatchObject({ method: "POST", redirect: "manual" });
       expect(err).toBeInstanceOf(ServerError);
@@ -545,10 +598,11 @@ describe("what the server says", () => {
       const refresh = (await githubTokenFor(fake.url).catch((e: Error) => e)) as Error;
       expect(fetches.mock.calls.at(-1)![1]).toMatchObject({ method: "POST", redirect: "manual" });
       expect(refresh).toBeInstanceOf(Unreachable);
-      expect(refresh.message).toBe(`${fake.url}/v1/github/refresh answered 307 redirecting to "http://evil.test/ 2J", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json`);
+      expect(refresh.message).toBe(`${fake.url}/v1/github/refresh answered 307 redirecting to "http://evil.test/ 2J", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or /etc/watcheroni-test/config.json`);
       expect(fake.refreshed).toEqual([]);
     } finally {
       fetches.mockRestore();
+      vi.unstubAllEnvs();
       delete process.env.WATCHERONI_CREDENTIALS;
     }
   });

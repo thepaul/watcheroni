@@ -661,27 +661,83 @@ describe("what the server says", () => {
     expect(garbled.stderr()).not.toMatch(CONTROLS);
   });
 
+  // Anything but line breaks, as CONTROLS, and formatting characters too.
+  const RAW = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+  const hostile = `${NASTY}\u200b\u2028\u202e\ufeff`;
+  // JSON output carries `hostile` escaped, not lost.
+  const escaped = (out: string) => {
+    expect(out).not.toMatch(RAW);
+    expect(out).toContain(String.raw`\u001b[31mred`);
+    expect(out).toContain(String.raw`\u009b2J\u0000end\u200b\u2028\u202e\ufeff`);
+  };
+  const injectHostile = (id: string, pr = 7) => fake.inject("box", hostile, { state: hostile, path: hostile, name: hostile }, id, null, pr);
+
   it("never reaches stdout raw from an event, as text or JSON", async () => {
-    const pr = "7\x1b]0;pwned\x07\u202e" as unknown as number;
-    const hostile = `${NASTY}\u200b\u2028\ufeff`;
-    // Anything but line breaks, as CONTROLS, and formatting characters too.
-    const RAW = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
-    fake.inject("box", hostile, { state: hostile, path: hostile, name: hostile }, hostile, null, pr);
+    // A PR number that isn't a whole number is shown as "?".
+    injectHostile(hostile, 7.5);
     const text = cli(["wait", "--settle", "0"]);
     expect(await text.code).toBe(0);
     expect(text.stdout()).toMatch(/^octo\/widgets#\?: 1 new event\n/);
     expect(text.stdout()).not.toMatch(RAW);
 
     for (const args of [["wait", "--settle", "0", "--json"], ["wait", "--settle", "0", "--format", "json"]]) {
-      fake.inject("box", hostile, { state: hostile }, `${hostile}${args.length}`, null, pr);
+      injectHostile(`${hostile}${args.length}`);
       const json = cli(args);
       expect(await json.code).toBe(0);
-      expect(json.stdout()).not.toMatch(RAW);
-      // Escaped, not lost.
-      expect(json.stdout()).toContain(String.raw`\u001b]0;pwned\u0007\u202e`);
-      expect(json.stdout()).toContain(String.raw`\u200b\u2028\ufeff`);
-      const first = JSON.parse(json.stdout().split("\n")[0]) as { kind?: string; events?: { kind: string; pr: unknown }[] };
+      escaped(json.stdout());
+      const first = JSON.parse(json.stdout().split("\n")[0]) as { kind?: string; events?: { kind: string }[] };
       expect(first.kind ?? first.events![0].kind).toBe(hostile);
+    }
+  });
+
+  it("can't break wait with a malformed event", async () => {
+    fake.injectMalformed("box", { kind: 42, data: null });
+    fake.inject("box", "comment.created", { comment_id: 9 });
+    const run = cli(["wait", "--settle", "0", "--kinds", "comment.created"]);
+    expect(await run.code).toBe(0);
+    expect(run.stdout()).toMatch(/^octo\/widgets#7: 1 new event\n- comment.created\n/);
+    expect(run.stderr()).toMatch(/^watcheroni: skipped an event from .* \(seq 1, id "fake:[^"]*"\)\n$/);
+    expect(fake.inbox("box").acked).toBe(2);
+  });
+
+  it("never reaches stdout raw from stream --json", async () => {
+    injectHostile("e1");
+    const run = cli(["stream", "--json"]);
+    await until(() => fake.inbox("box").acked === 1);
+    run.kill();
+    await run.code;
+    escaped(run.stdout());
+    expect((JSON.parse(run.stdout()) as { data: { state: string } }).data.state).toBe(hostile);
+  });
+
+  it("never reaches exec's command raw on its stdin, one by one or in a batch", async () => {
+    for (const batch of [false, true]) {
+      const got = join(cwd, `stdin-${batch}`);
+      injectHostile(`e-${batch}`);
+      const run = cli(["exec", ...(batch ? ["--batch", "--settle", "0"] : []), "--", "sh", "-c", `cat > ${got}`]);
+      await until(() => fake.inbox("box").acked === (batch ? 2 : 1));
+      run.kill();
+      await run.code;
+      const stdin = readFileSync(got, "utf8");
+      escaped(stdin);
+      const parsed = JSON.parse(stdin) as { kind: string } | { kind: string }[];
+      expect((Array.isArray(parsed) ? parsed[0] : parsed).kind).toBe(hostile);
+    }
+  });
+
+  it("never reaches stdout raw from ls --json, even from an inbox file", async () => {
+    const dir = join(env.WATCHERONI_STATE_DIR, "inboxes");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "box.json"), JSON.stringify({
+      version: 1, seq: 0, acked: 0, events: [], seen: [],
+      watched: { "octo/widgets#7": { target: { owner: "octo", name: "widgets", number: 7 }, addedAt: hostile, snapshot: null } },
+    }));
+    for (const args of [["ls", "--json"], ["ls", "--all", "--json"]]) {
+      const run = cli(args, { WATCHERONI_SERVER: "" });
+      expect(await run.code).toBe(0);
+      escaped(run.stdout());
+      const out = JSON.parse(run.stdout()) as { prs: { since: string }[] } | { prs: { since: string }[] }[];
+      expect((Array.isArray(out) ? out[0] : out).prs[0].since).toBe(hostile);
     }
   });
 
@@ -701,7 +757,7 @@ describe("what the server says", () => {
     fake.redirectTo = "http://evil.test/";
     const run = cli(["wait", "--settle", "0"]);
     expect(await run.code).toBe(1);
-    expect(run.stderr()).toBe(`watcheroni: ${fake.url}: PUT /v1/inboxes/box: answered 307 redirecting to "http://evil.test/", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json\n`);
+    expect(run.stderr()).toBe(`watcheroni: ${fake.url}: PUT /v1/inboxes/box: answered 307 redirecting to "http://evil.test/", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ${join(env.WATCHERONI_CONFIG_DIR, "config.json")}\n`);
   });
 });
 

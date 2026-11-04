@@ -9,7 +9,7 @@ import { dirname, join, win32 } from "node:path";
 import type { LoginResponse, Meta } from "@watcheroni/protocol";
 import { checkServerUrl, configDir, serverSetting } from "./config.ts";
 import { clean, PROSE_LENGTH } from "./format.ts";
-import { CHECK_SERVER_URL, NO_REDIRECTS, redirect, Unreachable } from "./server.ts";
+import { checkServerUrlHint, NO_REDIRECTS, redirect, Unreachable } from "./server.ts";
 
 export const DEFAULT_SERVER = "https://watcheroni.dev";
 
@@ -226,7 +226,7 @@ async function revokeKey(server: string, apiKey: string, what: string, outcome: 
 // NO_REDIRECTS): `url` needs fixing, not trying again.
 function refuseRedirect(res: Response, url: string): void {
   const moved = redirect(res);
-  if (moved) throw new LoginFailed(`${url} ${moved}; ${CHECK_SERVER_URL}`);
+  if (moved) throw new LoginFailed(`${url} ${moved}; ${checkServerUrlHint()}`);
 }
 
 // The longest a login waits out a 429 before giving up.
@@ -289,7 +289,7 @@ export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetc
   // Thrown rather than answered with null, which would send the user to
   // `watcheroni login`, where the same server would redirect again.
   const moved = redirect(res);
-  if (moved) throw new Unreachable(`${server}/v1/github/refresh ${moved}; ${CHECK_SERVER_URL}`);
+  if (moved) throw new Unreachable(`${server}/v1/github/refresh ${moved}; ${checkServerUrlHint()}`);
   if (res.status === 429) {
     throw new Unreachable(`${server} is limiting GitHub token refreshes from this address; try again in ${retryAfter(res)} seconds`);
   }

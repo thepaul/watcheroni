@@ -462,7 +462,7 @@ describe("text output", () => {
 
 describe("GitHub's errors", () => {
   it("are cleaned, and not cut short", async () => {
-    process.env.GH_TOKEN ??= "ghp_test";
+    vi.stubEnv("GH_TOKEN", "ghp_test");
     const NASTY = `\x1b[31mred\x1b]8;;https://evil.test\x07link\r\x00 ${"because ".repeat(20)}end`;
     const fetches = vi.spyOn(globalThis, "fetch");
     try {
@@ -476,6 +476,7 @@ describe("GitHub's errors", () => {
       for (const m of [down.message, missing.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     } finally {
       fetches.mockRestore();
+      vi.unstubAllEnvs();
     }
   });
 });

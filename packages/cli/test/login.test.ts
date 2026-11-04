@@ -2,7 +2,7 @@ import type { spawn, SpawnOptions } from "node:child_process";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { checkServerUrl, loadServer } from "../src/config.ts";
 import {
   browserCommand,
@@ -377,6 +377,7 @@ describe("what the server says", () => {
     deps.fetch = async (input, init) => (modes.push(init?.redirect), String(input) === url ? answer() : fetch(input, init));
     return modes;
   };
+  afterEach(() => void vi.unstubAllEnvs());
 
   it("is cleaned when it names the account", async () => {
     const { deps, printed } = fake([{ access_token: "ghu_tok" }]);
@@ -406,10 +407,11 @@ describe("what the server says", () => {
   });
 
   it("can't redirect a sign-in, which fails saying why, saving nothing", async () => {
+    vi.stubEnv("WATCHERONI_CONFIG_DIR", "/etc/watcheroni-test");
     const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
     const modes = answering(deps, `${SERVER}/v1/login`, async () => new Response(null, { status: 307, headers: { Location: "http://watcheroni.test/v1/login" } }));
     await expect(login(SERVER, deps)).rejects.toThrow(
-      `${SERVER}/v1/login answered 307 redirecting to "http://watcheroni.test/v1/login", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json`,
+      `${SERVER}/v1/login answered 307 redirecting to "http://watcheroni.test/v1/login", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or /etc/watcheroni-test/config.json`,
     );
     // Every request refuses redirects, GitHub's too.
     expect(calls.map((c) => c.url)).toEqual([`${SERVER}/v1/meta`, `${GITHUB}/login/device/code`, `${GITHUB}/login/oauth/access_token`]);

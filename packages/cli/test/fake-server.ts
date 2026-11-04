@@ -162,6 +162,18 @@ export class FakeServer {
     return event;
   }
 
+  // An event as a broken server might send it: a sound one with `fields`
+  // put over it.
+  injectMalformed(name: string, fields: Record<string, unknown>): void {
+    this.holding = true;
+    try {
+      Object.assign(this.inject(name), fields);
+    } finally {
+      this.holding = false;
+    }
+    this.deliver(name);
+  }
+
   // An `inbox.gap`, as the server sends to a reader behind what it keeps:
   // about no repo, with the seq just before `resumedAt`.
   gap(name: string, missedAfter: number, resumedAt: number): void {

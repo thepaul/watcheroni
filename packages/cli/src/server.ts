@@ -1,6 +1,7 @@
+import { join } from "node:path";
 import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
-import { type ServerConfig, checkServerUrl } from "./config.ts";
+import { type ServerConfig, checkServerUrl, configDir } from "./config.ts";
 import { clean, PROSE_LENGTH } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { githubUrl } from "./login.ts";
@@ -58,8 +59,10 @@ const GITHUB_TOKEN_CODES = new Set(["github_token_required", "github_token_inval
 // included.
 export const NO_REDIRECTS = { redirect: "manual" } as const;
 
-// What to do about a server that redirects (see config.ts).
-export const CHECK_SERVER_URL = "check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json";
+// What to do about a server that redirects: where its URL is set.
+export function checkServerUrlHint(): string {
+  return `check the server URL in $WATCHERONI_SERVER or ${join(configDir(), "config.json")}`;
+}
 
 // What to say about an answer that is a redirect, or null if it isn't.
 export function redirect(res: Response): string | null {
@@ -108,7 +111,7 @@ export class ServerClient {
     // Not worth retrying: the server URL, or the server, needs fixing.
     const moved = redirect(res);
     if (moved) {
-      const detail = `${moved}; ${CHECK_SERVER_URL}`;
+      const detail = `${moved}; ${checkServerUrlHint()}`;
       throw new ServerError(`${this.url}: ${method} ${path}: ${detail}`, res.status, "redirect", { detail });
     }
     if (res.status === 204) return undefined as T;
@@ -260,6 +263,22 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
   }
 }
 
+// Whether an event from the server has the shape the CLI reads: fields
+// it reads as text or numbers are text or numbers, and what it looks
+// inside is an object.
+function wellFormed(e: unknown): e is WatchEvent {
+  const object = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  if (!object(e)) return false;
+  const { id, kind, seq, sub, data, links, repo, pr, actor } = e;
+  return typeof id === "string" && typeof kind === "string"
+    && typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0
+    && (sub === null || sub === undefined || typeof sub === "string")
+    && object(data) && object(links)
+    && (repo === null || (object(repo) && typeof repo.full_name === "string"))
+    && (pr === null || typeof pr === "number")
+    && (actor === null || actor === undefined || object(actor));
+}
+
 export interface ReaderOptions {
   log: (msg: string) => void;
   // Reconnect delays: the first, and the most (PROTOCOL.md: 1 s doubling to 60 s).
@@ -283,6 +302,8 @@ export class ServerReader {
 
   private pos: number | null = null;
   private queue: WatchEvent[] = [];
+  // Malformed events not yet acknowledged, by seq (see add()).
+  private skipped: number[] = [];
   private seen = new Set<string>();
   private fresh = false;
   private waiters = new Set<() => void>();
@@ -335,9 +356,13 @@ export class ServerReader {
   }
 
   // Moves the server's acknowledged position, over the socket if there is
-  // one, else over HTTP.
+  // one, else over HTTP, past any skipped events (see add()) that nothing
+  // unread is now before.
   ack(seq: number): void {
     this.queue = this.queue.filter((e) => e.seq > seq);
+    const first = Math.min(...this.queue.map((e) => e.seq));
+    seq = Math.max(seq, ...this.skipped.filter((s) => s < first));
+    this.skipped = this.skipped.filter((s) => s > seq);
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "ack", seq }));
       return;
@@ -534,9 +559,26 @@ export class ServerReader {
   }
 
   // Keeps new events, dropping ones already seen (delivery is at least once).
+  // An event that isn't the shape PROTOCOL.md gives would throw wherever
+  // it's read, and, never acknowledged, come back on every run. It's
+  // skipped with a warning instead, and acknowledged once nothing before
+  // it is waiting. One without a sound seq can't be placed or
+  // acknowledged; acknowledging a later event moves past it.
   private add(events: WatchEvent[]): void {
     let added = false;
     for (const e of events) {
+      if (!wellFormed(e)) {
+        const seq = (e as { seq?: unknown } | null)?.seq;
+        const sound = typeof seq === "number" && Number.isSafeInteger(seq) && seq >= 0;
+        if (sound && this.pos !== null && seq <= this.pos) continue;
+        if (sound) {
+          this.pos = seq;
+          this.skipped.push(seq);
+        }
+        const id = (e as { id?: unknown } | null)?.id;
+        this.o.log(`skipped an event from ${this.client.url} that isn't one this version understands (${sound ? `seq ${seq}` : "no seq"}${typeof id === "string" ? `, id ${JSON.stringify(clean(id))}` : ""})`);
+        continue;
+      }
       if (this.pos !== null && e.seq <= this.pos) continue;
       this.pos = e.seq;
       if (this.seen.has(e.id)) continue;
@@ -545,6 +587,10 @@ export class ServerReader {
       added = true;
     }
     if (this.seen.size > 2000) this.seen = new Set([...this.seen].slice(-1000));
+    // Skipped ones with nothing unread before them are acknowledged now.
+    const first = Math.min(...this.queue.map((e) => e.seq));
+    const due = this.skipped.filter((seq) => seq < first);
+    if (due.length) this.ack(Math.max(...due));
     if (added) {
       this.fresh = true;
       this.wake();
