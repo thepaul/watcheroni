@@ -106,7 +106,8 @@ export async function restList<T>(path: string, pick: (body: unknown) => T[]): P
       const text = await res.text();
       let message = text;
       try {
-        message = (JSON.parse(text) as { message?: string }).message ?? text;
+        const parsed = (JSON.parse(text) as { message?: unknown } | null)?.message;
+        if (typeof parsed === "string") message = parsed;
       } catch {
         // Not JSON: the text as it is.
       }

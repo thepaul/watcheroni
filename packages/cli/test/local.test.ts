@@ -7,7 +7,7 @@ import { Feed } from "../src/feed.ts";
 import { formatText } from "../src/format.ts";
 import { GitHubError } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
-import { pollOnce } from "../src/poll.ts";
+import { forgetWarnings, pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { UsageError, parseTarget, repoKey, targetKey, type Target } from "../src/targets.ts";
 import { HEAD1, HEAD2, alice, bob, check, run, snap } from "./fixtures.ts";
@@ -15,6 +15,7 @@ import { HEAD1, HEAD2, alice, bob, check, run, snap } from "./fixtures.ts";
 let n = 0;
 beforeEach(() => {
   process.env.WATCHERONI_STATE_DIR = mkdtempSync(join(tmpdir(), "watcheroni-test-"));
+  forgetWarnings();
 });
 const open = () => Inbox.open(`t${n++}`);
 const age = (file: string, days: number) => {
@@ -204,6 +205,18 @@ describe("polling", () => {
     expect(logged).toEqual([
       "octo/widgets#7: can't read its workflow runs (GitHub /repos/octo/widgets/actions/runs: 403 Resource not accessible by personal access token); no workflow.completed until they can be read",
       "octo/widgets#7: its workflow runs can be read again",
+      "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
+    ]);
+
+    // Still unreadable: not said again in this process, but said in the
+    // next one (a later `watcheroni wait`), even though the inbox already
+    // knew.
+    logged.length = 0;
+    for (let i = 0; i < 2; i++) await pollOnce(inbox, (m) => logged.push(m), async () => unreadable("fetch failed"));
+    expect(logged).toEqual([]);
+    forgetWarnings();
+    for (let i = 0; i < 2; i++) await pollOnce(inbox, (m) => logged.push(m), async () => unreadable("fetch failed"));
+    expect(logged).toEqual([
       "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
     ]);
     inbox.close();

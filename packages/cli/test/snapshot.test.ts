@@ -124,6 +124,16 @@ describe("fetchSnapshot", () => {
     // GitHub's JSON error body is reduced to its message.
     runs = () => Response.json({ message: "Must have admin rights", documentation_url: "https://docs.github.com/x" }, { status: 403 });
     expect((await fetchSnapshot(target)).workflowRunsError).toBe(`${path}: 403 Must have admin rights`);
+    // Only a string message; otherwise the body as it is.
+    runs = () => Response.json({ message: { nested: true } }, { status: 403 });
+    expect((await fetchSnapshot(target)).workflowRunsError).toBe(`${path}: 403 {"message":{"nested":true}}`);
+    // Nothing that a terminal would act on, and no half characters.
+    runs = () => Response.json({ message: "\u001b]0;pwned\u0007red\u001b[31m\u009b2J\u202eevil\u200b\ufeffend\u007f" }, { status: 403 });
+    expect((await fetchSnapshot(target)).workflowRunsError).toBe(`${path}: 403 ]0;pwned red [31m 2J evil end`);
+    runs = () => new Response("😀".repeat(300), { status: 500 });
+    const cut = (await fetchSnapshot(target)).workflowRunsError!;
+    expect(Array.from(cut)).toHaveLength(200);
+    expect(cut.endsWith("😀")).toBe(true);
     // Readable runs have no error.
     runs = () => Response.json(runsBody);
     expect((await fetchSnapshot(target)).workflowRunsError).toBeUndefined();

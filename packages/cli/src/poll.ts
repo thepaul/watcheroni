@@ -6,6 +6,14 @@ import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
 
 export type Fetch = typeof fetchSnapshot;
 
+// PRs whose unreadable workflow runs this process has warned about.
+const unreadableRuns = new Set<string>();
+
+// As if in a new process: for tests.
+export function forgetWarnings(): void {
+  unreadableRuns.clear();
+}
+
 // Polls every PR watched in the inbox once, or those in `only`, saving any
 // new events. A PR seen for the first time sets the starting point and
 // reports nothing, unless it has already ended. Ended PRs stop being
@@ -33,12 +41,17 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       log(`${key}: ${(e as Error).message}; trying again next time`);
       continue;
     }
-    // Said when workflow runs stop being readable, and when they're back,
-    // rather than at every poll.
-    if (next.workflowRunsError && !w.snapshot?.workflowRunsError) {
-      log(`${key}: can't read its workflow runs (${next.workflowRunsError}); no workflow.completed until they can be read`);
-    } else if (!next.workflowRunsError && w.snapshot?.workflowRunsError) {
-      log(`${key}: its workflow runs can be read again`);
+    // Said once per process while workflow runs can't be read (each `wait`
+    // is a new process), and once when they can be again, rather than at
+    // every poll.
+    if (next.workflowRunsError) {
+      if (!unreadableRuns.has(key)) {
+        unreadableRuns.add(key);
+        log(`${key}: can't read its workflow runs (${next.workflowRunsError}); no workflow.completed until they can be read`);
+      }
+    } else {
+      unreadableRuns.delete(key);
+      if (w.snapshot?.workflowRunsError) log(`${key}: its workflow runs can be read again`);
     }
     if (!w.snapshot) {
       if (next.state !== "OPEN") {
