@@ -55,8 +55,22 @@ describe("inbox", () => {
     const inbox = open();
     expect(inbox.append([event("a"), event("b")]).map((e) => e.seq)).toEqual([1, 2]);
     expect(inbox.append([event("b"), event("c")]).map((e) => e.id)).toEqual(["c"]);
-    inbox.ack(2);
+    inbox.handled(inbox.pending().filter((e) => e.seq <= 2));
     expect(inbox.pending().map((e) => e.seq)).toEqual([3]);
+    inbox.close();
+  });
+
+  it("handles exactly the events given, and keeps what's held, under its own numbering, till handled", () => {
+    const inbox = open();
+    inbox.append([event("a"), event("b"), event("c")]);
+    inbox.handled(inbox.pending().filter((e) => e.id === "b"));
+    expect(inbox.pending().map((e) => e.id)).toEqual(["a", "c"]);
+    // From a server's inbox, numbered there.
+    inbox.hold([{ ...event("s1"), seq: 40 }, { ...event("s2"), seq: 41 }]);
+    expect(inbox.pending().map((e) => [e.seq, e.id])).toEqual([[1, "a"], [3, "c"], [4, "s1"], [5, "s2"]]);
+    expect([...inbox.heldSeqs()]).toEqual([4, 5]);
+    inbox.handled(inbox.pending().filter((e) => e.id === "s1"));
+    expect([...inbox.heldSeqs()]).toEqual([5]);
     inbox.close();
   });
 
@@ -97,11 +111,11 @@ describe("inbox", () => {
     const [old, dead, recent, busy, current] = [`t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`];
     for (const name of [old, dead, recent, current]) {
       const i = Inbox.open(name);
-      i.ack(0);
+      i.append([]);
       i.close();
     }
     const held = Inbox.open(busy);
-    held.ack(0);
+    held.append([]);
     // One left locked by a process that has gone.
     writeFileSync(at(`${dead}.lock`), "999999");
     // Opened, never saved: by a process that has gone, and by one still running.
@@ -405,7 +419,7 @@ describe("changing an inbox a wait holds", () => {
     const editor = Inbox.edit(name);
     expect(editor.watch(targetKey(seven), seven)).toBe(true);
     // The reader's own change keeps the watch it hadn't seen.
-    reader.ack(1);
+    reader.handled(reader.pending());
     expect(reader.watched().map((w) => targetKey(w.target))).toEqual(["octo/widgets#7"]);
     expect(Inbox.peek(name)).toMatchObject({ pending: 0 });
     reader.close();

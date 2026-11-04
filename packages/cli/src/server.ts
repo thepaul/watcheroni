@@ -317,6 +317,10 @@ const REPORT = "if this keeps happening, report it to the server's operator";
 
 export interface ReaderOptions {
   log: (msg: string) => void;
+  // Takes the events pending when an inbox.gap moves the position back
+  // (see add()), to keep them where they outlive this process: their seqs
+  // are from before, and mean nothing to the server now.
+  takeBack: (events: WatchEvent[]) => void;
   // Reconnect delays: the first, and the most (PROTOCOL.md: 1 s doubling to 60 s).
   backoff?: [number, number];
   pingMs?: number;
@@ -338,19 +342,18 @@ export class ServerReader {
 
   // The last seq read: everything at or below it has been received.
   private pos: number | null = null;
-  // Events received and not yet handled, in the order to show them: those
-  // held from before an inbox.gap that moved the position back first (see
-  // add()), then the rest by seq.
+  // Events received and not yet handled, by seq.
   private queue: WatchEvent[] = [];
-  // Which queued events are from before such a gap. Their seqs mean
-  // nothing to the server now, so they're handled here only, never
-  // acknowledged to it.
-  private held = new Set<WatchEvent>();
   // The server's acknowledged position, as it last said or was last told.
   private acked: number | null = null;
+  // Whether the position is ahead of the inbox's head, as the server said
+  // at the start of this connection: the inbox's numbering went back, and
+  // an inbox.gap that moves the position back is on its way. Till then
+  // nothing is acknowledged, as the server would take a position past its
+  // head as its head, and so events of the inbox's new life not yet read.
+  private ahead = false;
   // IDs of events received, to drop one sent again (delivery is at least
-  // once). An event held from before a gap isn't here, so that one sent
-  // again after it is kept, in its place.
+  // once).
   private seen = new Set<string>();
   private fresh = false;
   private waiters = new Set<() => void>();
@@ -408,20 +411,20 @@ export class ServerReader {
   handled(events: WatchEvent[]): void {
     const done = new Set(events);
     this.queue = this.queue.filter((e) => !done.has(e));
-    for (const e of events) this.held.delete(e);
     this.acknowledge();
   }
 
   // Moves the server's acknowledged position, over the socket if there is
   // one, else over HTTP, to the highest seq read with nothing still
   // pending at or below it: events handled, sent again, or malformed and
-  // dropped. Events held from before a gap don't count, as their seqs
-  // aren't the server's now. Sends nothing if that isn't past where the
-  // server already is.
+  // dropped. Sends nothing if that isn't past where the server already is,
+  // while the position is ahead of the inbox's head (see `ahead`), or
+  // while not connected: the next connection's ready does it then.
   private acknowledge(): void {
-    if (this.pos === null) return;
+    if (this.pos === null || this.ahead || !this.connected) return;
+    if (this.mode === "ws" && this.ws?.readyState !== WebSocket.OPEN) return;
     let seq = this.pos;
-    for (const e of this.queue) if (!this.held.has(e) && e.seq <= seq) seq = e.seq - 1;
+    for (const e of this.queue) if (e.seq <= seq) seq = e.seq - 1;
     if (seq < 0 || (this.acked !== null && seq <= this.acked)) return;
     this.acked = seq;
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -520,6 +523,7 @@ export class ServerReader {
           this.markConnected();
           if (this.pos === null) this.pos = page.acked;
           if (isSeq(page.acked)) this.acked = page.acked;
+          this.ahead = isSeq(page.head) && this.pos > page.head;
           this.add(page.events);
           this.pos = Math.max(this.pos ?? 0, page.next);
           this.acknowledge();
@@ -647,6 +651,7 @@ export class ServerReader {
           if (!isSeq(msg.acked)) return broken("ready message");
           this.ws = ws;
           this.acked = msg.acked;
+          this.ahead = this.pos !== null && isSeq(msg.head) && this.pos > msg.head;
           if (this.pos === null) this.pos = msg.acked;
           this.markConnected();
           // Anything handled while there was no connection.
@@ -704,15 +709,14 @@ export class ServerReader {
       // An `inbox.gap` for a position ahead of the inbox's `head` takes it
       // back (PROTOCOL.md, "Gaps"). This comes before anything at or below
       // the position is passed over, since the gap itself is below it.
-      // What's pending is from before the gap: still shown, first, but
-      // handled here only (see `held`), and no longer counted as received,
-      // so the same event sent again after the gap takes its place.
+      // What's pending is from before the gap: it's handed to takeBack,
+      // which keeps it to be shown, and is no longer this reader's (nor
+      // the server's) to acknowledge.
       const back = sound && e.kind === "inbox.gap" && this.pos !== null && e.seq < this.pos && e.data.missed_after === this.pos;
       if (back) {
-        for (const q of this.queue) {
-          this.held.add(q);
-          this.seen.delete(q.id);
-        }
+        if (this.queue.length) this.o.takeBack(this.queue);
+        this.queue = [];
+        this.ahead = false;
       }
       if (!sound) {
         const seq = isObject(e) ? e.seq : undefined;
@@ -732,11 +736,10 @@ export class ServerReader {
         // lost, and warned of (once for the batch).
         if (this.seen.has(e.id)) continue;
         this.seen.add(e.id);
-        this.release(e.id);
         late.push(e.seq);
         lateAfter = this.pos;
         let i = this.queue.length;
-        while (i > 0 && !this.held.has(this.queue[i - 1]) && this.queue[i - 1].seq > e.seq) i--;
+        while (i > 0 && this.queue[i - 1].seq > e.seq) i--;
         this.queue.splice(i, 0, event);
         added = true;
         continue;
@@ -745,7 +748,6 @@ export class ServerReader {
       if (!back) advanced = true;
       if (this.seen.has(e.id)) continue;
       this.seen.add(e.id);
-      this.release(e.id);
       this.queue.push(event);
       added = true;
     }
@@ -768,16 +770,6 @@ export class ServerReader {
       this.wake();
     }
     return advanced;
-  }
-
-  // Drops an event held from before a gap (see add()) that the server has
-  // sent again: the new one takes its place.
-  private release(id: string): void {
-    if (!this.held.size) return;
-    const old = this.queue.find((q) => this.held.has(q) && q.id === id);
-    if (!old) return;
-    this.held.delete(old);
-    this.queue = this.queue.filter((q) => q !== old);
   }
 
   private wake(): void {

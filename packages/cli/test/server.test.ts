@@ -17,11 +17,14 @@ import { alice, snap } from "./fixtures.ts";
 let fake: FakeServer;
 let readers: ServerReader[] = [];
 const messages: string[] = [];
+// What readers took back (see ReaderOptions.takeBack).
+const takenBack: WatchEvent[] = [];
 
 beforeEach(async () => {
   process.env.WATCHERONI_STATE_DIR = mkdtempSync(join(tmpdir(), "watcheroni-test-"));
   fake = await new FakeServer().start();
   messages.length = 0;
+  takenBack.length = 0;
 });
 afterEach(async () => {
   await Promise.all(readers.map((r) => r.close()));
@@ -32,6 +35,7 @@ afterEach(async () => {
 function reader(name = "box", token = fake.token): ServerReader {
   const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: token }), name, {
     log: (m) => messages.push(m),
+    takeBack: (e) => void takenBack.push(...e),
     backoff: [20, 100],
   });
   readers.push(r);
@@ -97,7 +101,7 @@ describe("server reader", () => {
   const gap = (missedAfter: number, resumedAt: number, id = `gap-${missedAfter}`) =>
     event(resumedAt - 1, id, "inbox.gap", { missed_after: missedAfter, resumed_at: resumedAt });
 
-  it("moves back to an inbox.gap for a position ahead of the inbox's head, still showing what it holds", async () => {
+  it("moves back to an inbox.gap for a position ahead of the inbox's head, handing over what it holds", async () => {
     const r = reader();
     await r.start();
     for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
@@ -106,44 +110,46 @@ describe("server reader", () => {
     await until(() => fake.inbox("box").acked === 2);
     // The server had no record of seq 3: it answers with a gap from it,
     // and the events it keeps, all lower. c, received but not handled,
-    // is still shown, first.
+    // is handed over to be kept elsewhere: its seq means nothing now.
     send(gap(3, 1), event(1, "again-1"));
-    await until(() => r.pending().length === 3);
-    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[3, "c"], [0, "inbox.gap"], [1, "x"]]);
-    expect(formatText(r.pending().slice(1, 2), [])).toContain("inbox.gap: the server didn't recognise the position read up to");
+    await until(() => r.pending().length === 2);
+    expect(takenBack.map((e) => [e.seq, e.kind])).toEqual([[3, "c"]]);
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[0, "inbox.gap"], [1, "x"]]);
+    expect(formatText(r.pending().slice(0, 1), [])).toContain("inbox.gap: the server didn't recognise the position read up to");
     // From there it reads on as usual; a stale gap for an old position doesn't move it.
     send(gap(3, 1), event(2, "again-2"));
-    await until(() => r.pending().length === 4);
-    expect(r.pending().map((e) => e.seq)).toEqual([3, 0, 1, 2]);
-    // c's seq is from before the gap, so handling it alone acknowledges
-    // nothing; handling the rest acknowledges them.
-    r.handled(r.pending().slice(0, 1));
+    await until(() => r.pending().length === 3);
     expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
+    expect(takenBack).toHaveLength(1);
     handleThrough(r, 2);
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(fake.inbox("box").acked).toBe(2);
-    expect(fake.messages.filter((m) => m.includes('"ack"'))).toEqual([JSON.stringify({ type: "ack", seq: 2 })]);
+    expect(fake.messages.filter((m) => m.includes('"ack"')).at(-1)).toBe(JSON.stringify({ type: "ack", seq: 2 }));
   });
 
-  it("shows what it held from before a gap that's sent again after it once, in its new place", async () => {
-    const r = reader();
-    await r.start();
-    for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
-    await until(() => r.pending().length === 3);
-    const [a, b, c] = r.pending();
-    handleThrough(r, 1);
-    await until(() => fake.inbox("box").acked === 1);
-    // a was shown, so it's dropped again; b takes its new place; c, not
-    // sent again, is still shown.
-    send(gap(3, 1), { ...a, seq: 1 }, { ...b, seq: 2 });
-    await until(() => r.pending().length === 3);
-    expect(r.pending().map((e) => [e.seq, e.id])).toEqual([[3, c.id], [0, "gap-3"], [2, b.id]]);
-    expect(messages).toEqual([]);
-    // Nothing is acknowledged past an event not yet handled.
-    r.handled(r.pending().slice(0, 1));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(fake.messages.filter((m) => m.includes('"ack"'))).toEqual([JSON.stringify({ type: "ack", seq: 1 })]);
-  });
+  for (const longPoll of [false, true]) {
+    it(`acknowledges nothing of an inbox whose numbering went back till its gap is read, ${longPoll ? "long-polling" : "over a WebSocket"}`, async () => {
+      fake.refuseSockets = longPoll;
+      fake.aheadGaps = true;
+      const r = reader();
+      await r.start();
+      for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
+      await until(() => r.pending().length === 3);
+      handleThrough(r, 3);
+      await until(() => fake.inbox("box").acked === 3);
+      // The inbox starts again, and has x and y before this reader is back.
+      Object.assign(fake.inbox("box"), { head: 0, acked: 0, events: [] });
+      fake.inject("box", "x", {}, "new-x");
+      fake.inject("box", "y", {}, "new-y");
+      if (!longPoll) fake.closeSockets(1012, "restarting");
+      await until(() => r.pending().length === 3);
+      expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[0, "inbox.gap"], [1, "x"], [2, "y"]]);
+      // Position 3 would be taken as head (2), acknowledging x and y unread.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(fake.inbox("box").acked).toBe(0);
+      handleThrough(r, 2);
+      await until(() => fake.inbox("box").acked === 2);
+    });
+  }
 
   it("keeps events that come while one is being handled, below it or not", async () => {
     const r = reader();
@@ -155,7 +161,7 @@ describe("server reader", () => {
     // moves the position back, and a new event, come.
     const [c] = r.pending();
     send(gap(3, 1), event(1, "new-1"));
-    await until(() => r.pending().length === 3);
+    await until(() => r.pending().length === 2);
     r.handled([c]);
     expect(r.pending().map((e) => [e.seq, e.id])).toEqual([[0, "gap-3"], [1, "new-1"]]);
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -198,7 +204,7 @@ describe("server reader", () => {
     expect(messages.slice(1)).toEqual([`${fake.url} sent 3 events out of order (seqs 2 to 4 after 8); they're shown anyway; ${report}`]);
   });
 
-  it("acknowledges a malformed event from before a gap that moves it back only locally", async () => {
+  it("doesn't acknowledge a malformed event from before a gap that moves it back", async () => {
     const r = reader();
     await r.start();
     fake.inject("box", "a");
@@ -207,8 +213,8 @@ describe("server reader", () => {
     // The skipped seq 2 was from the inbox's earlier life: acknowledging
     // what comes after the gap mustn't acknowledge it.
     send(gap(2, 1, "gap"), event(1, "new-x"));
-    await until(() => r.pending().length === 3);
-    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[1, "a"], [0, "inbox.gap"], [1, "x"]]);
+    await until(() => r.pending().length === 2);
+    expect(takenBack.map((e) => e.kind)).toEqual(["a"]);
     r.handled(r.pending());
     await until(() => fake.inbox("box").acked === 1);
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -225,13 +231,14 @@ describe("server reader", () => {
     // The inbox starts again from nothing, as one made again used to.
     Object.assign(fake.inbox("box"), { head: 0, acked: 0, events: [] });
     fake.inject("box", "x", {}, "new-x");
-    await until(() => r.pending().length === 5);
-    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[1, "a"], [2, "b"], [3, "c"], [0, "inbox.gap"], [1, "x"]]);
-    expect(r.pending()[3].data).toEqual({ missed_after: 3, resumed_at: 1 });
+    await until(() => r.pending().length === 2);
+    expect(takenBack.map((e) => [e.seq, e.kind])).toEqual([[1, "a"], [2, "b"], [3, "c"]]);
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[0, "inbox.gap"], [1, "x"]]);
+    expect(r.pending()[0].data).toEqual({ missed_after: 3, resumed_at: 1 });
     // The next poll is from there, and gets what follows.
     fake.inject("box", "y", {}, "new-y");
-    await until(() => r.pending().length === 6);
-    expect(r.pending().map((e) => e.seq)).toEqual([1, 2, 3, 0, 1, 2]);
+    await until(() => r.pending().length === 3);
+    expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
     expect(fake.requests).toContain("GET /v1/inboxes/box/events?wait=300&after=1");
   });
 
@@ -362,9 +369,49 @@ describe("feed", () => {
     inbox.close();
   });
 
+  // A reader that keeps what it takes back in `inbox`, as main.ts has it.
+  const keeping = (name: string, inbox: Inbox) => {
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), name, {
+      log: (m) => messages.push(m),
+      takeBack: (events) => inbox.hold(events),
+      backoff: [20, 100],
+    });
+    readers.push(r);
+    return r;
+  };
+  const sendTo = (name: string, events: WatchEvent[]) => {
+    for (const s of fake.sockets) if (s.inbox === name) s.send({ type: "events", events });
+  };
+  const serverEvent = (seq: number, id: string, kind: string, data: WatchEvent["data"] = {}): WatchEvent => ({
+    v: 1, seq, id, sub: null, kind, at: "t", received_at: "t", repo: null, pr: null, actor: null, data, links: {},
+  });
+
   it("acknowledges what it shows, and the unwanted events before each, but not what came meanwhile", async () => {
+    const inbox = Inbox.open("feed10");
+    const r = keeping("feed10", inbox);
+    await r.start();
+    fake.inject("feed10", "check.failed");
+    fake.inject("feed10", "comment.created");
+    fake.inject("feed10", "check.failed");
+    fake.inject("feed10", "comment.created");
+    await until(() => r.pending().length === 4);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    const items = feed.wanted(["check.*"]);
+    expect(items.map((i) => i.event.seq)).toEqual([1, 3]);
+    // While they're shown, an event out of order comes.
+    sendTo("feed10", [serverEvent(2, "late", "check.failed")]);
+    await until(() => r.pending().length === 5);
+    feed.ack(items);
+    // The comment between them goes with the second; the one after it,
+    // and what came meanwhile, wait.
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[2, "check.failed"], [4, "comment.created"]]);
+    await until(() => fake.inbox("feed10").acked === 1);
+    inbox.close();
+  });
+
+  it("shows again what a gap took back while it was being shown, rather than lose it", async () => {
     const inbox = Inbox.open("feed8");
-    const r = reader("feed8");
+    const r = keeping("feed8", inbox);
     await r.start();
     fake.inject("feed8", "check.failed");
     fake.inject("feed8", "comment.created");
@@ -375,22 +422,44 @@ describe("feed", () => {
     const items = feed.wanted(["check.*"]);
     expect(items.map((i) => i.event.seq)).toEqual([1, 3]);
     // While they're shown (`wait`, or a command `exec` runs for them),
-    // the inbox is made again, and the server moves the position back.
-    for (const s of fake.sockets) {
-      s.send({ type: "events", events: [
-        { v: 1, seq: 0, id: "gap", sub: null, kind: "inbox.gap", at: "t", received_at: "t", repo: null, pr: null, actor: null, data: { missed_after: 4, resumed_at: 1 }, links: {} },
-        { v: 1, seq: 1, id: "new", sub: null, kind: "check.failed", at: "t", received_at: "t", repo: null, pr: null, actor: null, data: {}, links: {} },
-      ] });
-    }
-    await until(() => r.pending().length === 6);
+    // the inbox is made again, and the server moves the position back:
+    // what was pending is kept in the local inbox.
+    sendTo("feed8", [serverEvent(0, "gap", "inbox.gap", { missed_after: 4, resumed_at: 1 }), serverEvent(1, "new", "check.failed")]);
+    await until(() => r.pending().length === 2);
+    expect(inbox.pending().map((e) => e.kind)).toEqual(["check.failed", "comment.created", "check.failed", "comment.created"]);
+    // Acknowledging what was shown can't reach the copies kept now, which
+    // are shown again: twice, but never lost.
     feed.ack(items);
-    // The comment between them goes with the second; the one after it,
-    // and what came meanwhile, wait.
-    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[4, "comment.created"], [0, "inbox.gap"], [1, "check.failed"]]);
-    expect(feed.wanted(["check.*"]).map((i) => i.event.id)).toEqual(["gap", "new"]);
+    expect(inbox.pending()).toHaveLength(4);
+    expect(feed.wanted(["check.*"]).map((i) => i.event.kind)).toEqual(["check.failed", "check.failed", "inbox.gap", "check.failed"]);
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(fake.inbox("feed8").acked).toBe(0);
     inbox.close();
+  });
+
+  it("shows what a gap took back first, even after the process ends, and an event out of order after it", async () => {
+    const inbox = Inbox.open("feed9");
+    const r = keeping("feed9", inbox);
+    await r.start();
+    for (const kind of ["a", "b", "c"]) fake.inject("feed9", kind);
+    await until(() => r.pending().length === 3);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    feed.ack(feed.wanted([]).slice(0, 1));
+    await until(() => fake.inbox("feed9").acked === 1);
+    sendTo("feed9", [serverEvent(0, "gap", "inbox.gap", { missed_after: 3, resumed_at: 1 }), serverEvent(1, "x", "x")]);
+    await until(() => r.pending().length === 2);
+    // Late, below the position.
+    sendTo("feed9", [serverEvent(0, "late", "late")]);
+    await until(() => r.pending().length === 3);
+    expect(feed.wanted([]).map((i) => i.event.kind)).toEqual(["b", "c", "inbox.gap", "late", "x"]);
+    // The process ends before showing anything.
+    await r.close();
+    inbox.close();
+    const again = Inbox.open("feed9");
+    expect(new Feed(again, null, { interval: 60_000, log: () => {} }).wanted([]).map((i) => i.event.kind)).toEqual(["b", "c"]);
+    // None of it was acknowledged on the server.
+    expect(fake.inbox("feed9").acked).toBe(1);
+    again.close();
   });
 
   it("acknowledges unwanted kinds up to the first wanted one", async () => {
@@ -796,7 +865,7 @@ describe("a malformed message or page", () => {
   });
 
   it("starts the backoff again after a malformed message from a server that also sends events soundly", async () => {
-    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 2000] });
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), takeBack: (e) => void takenBack.push(...e), backoff: [20, 2000] });
     readers.push(r);
     await r.start();
     for (let i = 1; i <= 4; i++) {
@@ -812,7 +881,7 @@ describe("a malformed message or page", () => {
 
   it("backs off further each time a server keeps sending malformed messages", async () => {
     fake.garbageAfterReady = true;
-    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 400] });
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), takeBack: (e) => void takenBack.push(...e), backoff: [20, 400] });
     readers.push(r);
     await r.start();
     await until(() => fake.helloTimes.length >= 5);
@@ -828,7 +897,7 @@ describe("a malformed message or page", () => {
   it("backs off further when a server sends only empty events messages between malformed ones", async () => {
     fake.emptyBeforeGarbage = true;
     fake.garbageAfterReady = true;
-    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 400] });
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), takeBack: (e) => void takenBack.push(...e), backoff: [20, 400] });
     readers.push(r);
     await r.start();
     await until(() => fake.helloTimes.length >= 5);
@@ -836,8 +905,22 @@ describe("a malformed message or page", () => {
     expect(gaps[3]).toBeGreaterThanOrEqual(80);
   });
 
+  it("backs off further when a server sends only gaps that move the position back between malformed messages", async () => {
+    fake.inbox("box").head = fake.inbox("box").acked = 10;
+    fake.backGaps = true;
+    fake.garbageAfterReady = true;
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), takeBack: (e) => void takenBack.push(...e), backoff: [20, 400] });
+    readers.push(r);
+    await r.start();
+    await until(() => fake.helloTimes.length >= 5);
+    // Each one was read, moving the position back one at a time.
+    expect(fake.messages.filter((m) => m.includes("hello")).slice(1, 4)).toEqual([10, 9, 8].map((after) => JSON.stringify({ type: "hello", after })));
+    const gaps = fake.helloTimes.slice(1).map((t, i) => t - fake.helloTimes[i]);
+    expect(gaps[3]).toBeGreaterThanOrEqual(80);
+  });
+
   it("doesn't count what an earlier connection read when a later one breaks before its ready", async () => {
-    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [100, 2000] });
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), takeBack: (e) => void takenBack.push(...e), backoff: [100, 2000] });
     readers.push(r);
     await r.start();
     fake.inject("box", "comment.created");

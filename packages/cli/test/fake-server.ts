@@ -95,9 +95,12 @@ export class FakeServer {
   tooManySockets = false;
   tooManyPolls = false;
   tooManyInboxes = false;
-  // Answer a long poll from a position ahead of head as the server does:
-  // an inbox.gap just before the first event kept, then all of them.
+  // Answer a read from a position ahead of head as the server does: an
+  // inbox.gap just before the first event kept, then all of them.
   aheadGaps = false;
+  // Answer each hello with a position with an inbox.gap that moves it
+  // back by one, and no events.
+  backGaps = false;
   // Repos the App is installed on, and whether each is private.
   readonly repos = new Map<string, { private: boolean }>();
   // Where an app_not_installed answer says to install it.
@@ -253,12 +256,25 @@ export class FakeServer {
       this.helloTimes.push(Date.now());
       s.pos = msg.after ?? inbox.acked;
       s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
+      if (this.aheadGaps && s.pos > inbox.head) {
+        const events = [this.gapEvent(s.inbox, s.pos, inbox.events[0]?.seq ?? inbox.head + 1), ...inbox.events];
+        s.send({ type: "events", events });
+        s.pos = events[events.length - 1].seq;
+      }
+      if (this.backGaps && msg.after !== undefined) s.send({ type: "events", events: [this.gapEvent(s.inbox, msg.after, msg.after)] });
       if (this.emptyBeforeGarbage) s.send({ type: "events", events: [] });
       if (this.garbageAfterReady) s.send("{not json");
       this.sendFrom(s);
     } else if (msg.type === "ack") {
       inbox.acked = Math.max(inbox.acked, Math.min(msg.seq, inbox.head));
     }
+  }
+
+  private gapEvent(name: string, after: number, resumedAt: number): WatchEvent {
+    return {
+      v: 1, seq: resumedAt - 1, id: `inbox:${name}.gap.${after}.${resumedAt}`, sub: null, kind: "inbox.gap", at: "t",
+      received_at: "t", repo: null, pr: null, actor: null, data: { missed_after: after, resumed_at: resumedAt }, links: {},
+    };
   }
 
   private sendFrom(s: FakeSocket): void {
@@ -392,12 +408,7 @@ export class FakeServer {
       const wait = Number(url.searchParams.get("wait") ?? 0);
       const page = () => {
         if (this.aheadGaps && after > inbox.head) {
-          const resumedAt = inbox.events[0]?.seq ?? inbox.head + 1;
-          const gap: WatchEvent = {
-            v: 1, seq: resumedAt - 1, id: `inbox:${name}.gap.${after}.${resumedAt}`, sub: null, kind: "inbox.gap", at: "t",
-            received_at: "t", repo: null, pr: null, actor: null, data: { missed_after: after, resumed_at: resumedAt }, links: {},
-          };
-          const events = [gap, ...inbox.events];
+          const events = [this.gapEvent(name, after, inbox.events[0]?.seq ?? inbox.head + 1), ...inbox.events];
           return { events, next: events[events.length - 1].seq, head: inbox.head, acked: inbox.acked };
         }
         const events = inbox.events.filter((e) => e.seq > after);

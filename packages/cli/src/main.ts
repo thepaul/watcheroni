@@ -348,7 +348,7 @@ async function main(argv: string[]): Promise<number> {
 
   let server: ServerReader | null = null;
   if (client) {
-    server = new ServerReader(client, inboxName, { log });
+    server = new ServerReader(client, inboxName, { log, takeBack: (events) => inbox.hold(events) });
     const connected = await server.start();
     if (!connected && reachable) log(`can't read inbox ${inboxName} on ${client.url}; polling GitHub from this machine meanwhile`);
     if (!connected && verb === "wait" && !inbox.watched().length) {

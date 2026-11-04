@@ -48,6 +48,9 @@ interface State {
   // Server subscriptions of PRs unwatched here, whose events still queued
   // on the server are dropped as they arrive.
   unwatched?: string[];
+  // Seqs of the events here that came from the server's inbox and were
+  // taken back from its reader (see hold()): shown before the server's.
+  held?: number[];
 }
 
 const SEEN_KEPT = 2000;
@@ -336,15 +339,25 @@ export class Inbox {
     const done = new Set(events.map((e) => e.seq));
     this.change((s) => {
       s.events = s.events.filter((e) => !done.has(e.seq));
+      if (s.held) s.held = s.held.filter((seq) => !done.has(seq));
       for (const seq of done) s.acked = Math.max(s.acked, seq);
     });
   }
 
-  ack(seq: number): void {
+  // Keeps events from the server's inbox that its reader took back when
+  // an inbox.gap moved its position back (ServerReader's takeBack): saved
+  // here, under this inbox's own numbering, till they're handled, as the
+  // server no longer has them to send again.
+  hold(events: WatchEvent[]): void {
     this.change((s) => {
-      s.events = s.events.filter((e) => e.seq > seq);
-      s.acked = Math.max(s.acked, seq);
+      const added = add(s, events.map(({ seq: _, ...e }) => e));
+      s.held = [...(s.held ?? []), ...added.map((e) => e.seq)];
     });
+  }
+
+  // Seqs of the pending events hold() kept.
+  heldSeqs(): Set<number> {
+    return new Set(this.state.held ?? []);
   }
 
   private load(): State {

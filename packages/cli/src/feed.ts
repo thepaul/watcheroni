@@ -53,15 +53,24 @@ export class Feed {
     this.inbox.refresh();
     const items: Item[] = [];
     const left = new Set<string>();
-    for (const source of this.server ? [this.server, this.inbox] : [this.inbox]) {
-      const pending = source.pending();
-      if (source === this.server) {
+    // The server's events taken back from its reader and kept in the local
+    // inbox (Inbox.hold()) came before any the server has now, so come
+    // first; then the server's; then the local inbox's own.
+    const held = this.inbox.heldSeqs();
+    const local = this.inbox.pending();
+    const lists: [Source, WatchEvent[], boolean][] = [
+      [this.inbox, local.filter((e) => held.has(e.seq)), true],
+      ...(this.server ? [[this.server, this.server.pending(), true] as [Source, WatchEvent[], boolean]] : []),
+      [this.inbox, local.filter((e) => !held.has(e.seq)), false],
+    ];
+    for (const [source, pending, fromServer] of lists) {
+      if (fromServer) {
         for (const e of pending) {
           if (e.sub && e.kind.startsWith("watch.") && this.inbox.subscriptionEnded(e.sub, e.kind) === "repo") this.repoEnded = true;
         }
       }
       const want = (e: WatchEvent) => {
-        if (source === this.server && e.sub && this.inbox.wasUnwatched(e.sub)) return false;
+        if (fromServer && e.sub && this.inbox.wasUnwatched(e.sub)) return false;
         const key = prKey(e);
         return wants(kinds, e) && (!key || wants(this.inbox.kindsFor(key), e));
       };
@@ -84,7 +93,9 @@ export class Feed {
         passed = [];
       }
       if (first && passed.length) source.handled(passed);
-      // Unwanted events after the first wanted one are still pending.
+    }
+    // Unwanted events after the first wanted one are still pending.
+    for (const source of this.server ? [this.server, this.inbox] : [this.inbox]) {
       for (const e of source.pending()) left.add(prKey(e)?.toLowerCase() ?? "");
     }
     this.inbox.forgetEnded(left);
