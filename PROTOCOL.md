@@ -565,7 +565,8 @@ carry it.
 | `repo.unthrottled` | `dropped` (count) |
 | `inbox.gap` | `missed_after`, `resumed_at` |
 
-`watch.*` and `repo.*` are always delivered, whatever `kinds` says.
+`watch.*`, `repo.*` and `inbox.*` are always delivered, whatever `kinds`
+says.
 
 ## Errors
 

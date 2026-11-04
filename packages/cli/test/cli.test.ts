@@ -141,6 +141,15 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(2);
   });
 
+  it("prints repo.* whatever --kinds says", async () => {
+    fake.inject("box", "comment.created");
+    fake.inject("box", "repo.throttled", { until: "2026-10-26T18:00:00Z" }, "e2", null, null);
+    fake.inject("box", "repo.unthrottled", { dropped: 3 }, "e3", null, null);
+    const run = cli(["wait", "--settle", "0", "--kinds", "check.*", "--format", "json"]);
+    expect(await run.code).toBe(0);
+    expect((JSON.parse(run.stdout()) as { events: { kind: string }[] }).events.map((e) => e.kind)).toEqual(["repo.throttled", "repo.unthrottled"]);
+  });
+
   it("remembers --kinds given with a PR, until it's changed", async () => {
     fake.repos.set("octo/widgets", { private: false });
     fake.inject("box", "comment.created");

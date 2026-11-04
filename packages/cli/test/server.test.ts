@@ -282,6 +282,20 @@ describe("feed", () => {
     expect(feed.wanted(["pr.merged"]).map((i) => i.event.kind)).toEqual(["watch.expired"]);
     inbox.close();
   });
+
+  it("lets repo.* and inbox.* through any kinds", async () => {
+    const inbox = Inbox.open("feed8");
+    const r = reader("feed8");
+    await r.start();
+    fake.inject("feed8", "inbox.gap", { missed_after: 0, resumed_at: 2 }, "e1", null, null);
+    fake.inject("feed8", "comment.created", {}, "e2", "sub_9");
+    fake.inject("feed8", "repo.throttled", { until: "t" }, "e3", "sub_9", null);
+    fake.inject("feed8", "repo.unthrottled", { dropped: 1 }, "e4", "sub_9", null);
+    await until(() => r.pending().length === 4);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    expect(feed.wanted(["check.*"]).map((i) => i.event.kind)).toEqual(["inbox.gap", "repo.throttled", "repo.unthrottled"]);
+    inbox.close();
+  });
 });
 
 describe("subscribing on the server", () => {

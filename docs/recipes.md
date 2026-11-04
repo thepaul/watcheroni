@@ -17,8 +17,8 @@ event; `--settle 0` turns that off, so a batch is whatever one read of
 the inbox brought. `--on` (or `--kinds`) picks the kinds, e.g.
 `--on check.*,review.submitted`. Given with PRs, the inbox remembers it
 for those PRs. `watch.ended`, when a PR is merged or closed, comes
-through if `pr.merged` or `pr.closed` does; the other `watch.*` kinds
-always come through.
+through if `pr.merged` or `pr.closed` does; the other `watch.*` kinds,
+and `repo.*` and `inbox.*`, always come through.
 
 **When the command fails.** An event is acknowledged only when the command
 exits 0. Otherwise watcheroni logs
