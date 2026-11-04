@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ServerMessage } from "@watcheroni/protocol";
+import type { WatchEvent } from "@watcheroni/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
 import { LoginNeeded } from "../src/github.ts";
@@ -558,19 +558,44 @@ describe("a malformed event", () => {
 describe("a malformed message or page", () => {
   const warning = (what: string) => `${fake.url} sent a malformed ${what}: it isn't shaped as the protocol says; if this keeps happening, report it to the server's operator`;
 
-  it("is ignored over a WebSocket, with one warning", async () => {
+  const wrappers: [string, (events: WatchEvent[]) => unknown][] = [
+    ["events message", () => ({ type: "events", events: null })],
+    ["events message", (events) => ({ type: "events", events: { 0: events[0] } })],
+    ["message", (events) => events],
+    ["message", () => null],
+  ];
+  for (const [what, wrap] of wrappers) {
+    it(`closes a WebSocket that sent a malformed ${what}, and reads its events again: ${String(wrap)}`, async () => {
+      const r = reader();
+      await r.start();
+      const lost = fake.injectWrapped("box", wrap);
+      await until(() => r.pending().length === 1);
+      expect(r.pending()[0].id).toBe(lost.id);
+      expect(messages).toEqual([warning(what), `reconnected to ${fake.url}`]);
+      expect(fake.messages.filter((m) => m.includes("hello"))).toEqual([JSON.stringify({ type: "hello" }), JSON.stringify({ type: "hello", after: 0 })]);
+    });
+  }
+
+  it("says so each time a page goes bad mid-run, warning in full only once", async () => {
+    fake.refuseSockets = true;
     const r = reader();
-    await r.start();
-    for (const s of fake.sockets) {
-      s.send({ type: "events", events: null } as unknown as ServerMessage);
-      s.send({ type: "events", events: "x" } as unknown as ServerMessage);
-      s.send("null");
+    expect(await r.start()).toBe(true);
+    for (let round = 0; round < 2; round++) {
+      // The waiting poll answers soundly; the next one doesn't.
+      fake.malformedPage = { events: null, next: 0, acked: 0 };
+      fake.inject("box", "comment.created");
+      await until(() => messages.length === 2 + 2 * round);
+      fake.malformedPage = undefined;
+      await until(() => messages.length === 3 + 2 * round);
     }
-    const good = fake.inject("box", "comment.created");
-    await until(() => r.pending().length === 1);
-    expect(r.pending()[0].id).toBe(good.id);
-    expect(messages).toEqual([warning("events message"), warning("message")]);
-    expect(r.connected).toBe(true);
+    expect(messages).toEqual([
+      `couldn't open a WebSocket to ${fake.url}; long-polling instead`,
+      warning("page of events"),
+      `reconnected to ${fake.url}`,
+      `${fake.url} sent a malformed page of events; reconnecting`,
+      `reconnected to ${fake.url}`,
+    ]);
+    expect(r.pending()).toHaveLength(2);
   });
 
   it("closes a connection whose ready can't be read, and connects again", async () => {
@@ -585,7 +610,7 @@ describe("a malformed message or page", () => {
     expect(r.pending()[0].id).toBe(good.id);
   });
 
-  for (const page of [{ events: null, next: 0, acked: 0 }, { events: [], next: "x", acked: 0 }, { events: [], next: 1.5, acked: 0 }, { events: [], next: 0, acked: null }, []]) {
+  for (const page of [null, [], { events: null, next: 0, acked: 0 }, { events: [], next: "x", acked: 0 }, { events: [], next: 1.5, acked: 0 }, { events: [], next: 0, acked: null }]) {
     it(`is tried again long-polling, as after a 5xx: ${JSON.stringify(page)}`, async () => {
       fake.refuseSockets = true;
       fake.malformedPage = page;
@@ -593,7 +618,7 @@ describe("a malformed message or page", () => {
       expect(await r.start()).toBe(false);
       await until(() => fake.requests.filter((q) => q.startsWith("GET /v1/inboxes/box/events")).length >= 2);
       expect(messages).toEqual([`couldn't open a WebSocket to ${fake.url}; long-polling instead`, warning("page of events")]);
-      fake.malformedPage = null;
+      fake.malformedPage = undefined;
       await until(() => r.connected);
       const good = fake.inject("box", "comment.created");
       await until(() => r.pending().length === 1);

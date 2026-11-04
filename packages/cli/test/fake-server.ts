@@ -121,7 +121,7 @@ export class FakeServer {
   // Send `ready` with an acked that isn't a number, or answer every poll
   // with this page instead.
   malformedReady = false;
-  malformedPage: unknown = null;
+  malformedPage: unknown = undefined;
   private http: Server | null = null;
   private waiting = new Set<() => void>();
   private holding = false;
@@ -176,6 +176,24 @@ export class FakeServer {
       this.holding = false;
     }
     this.deliver(name);
+  }
+
+  // Sends a new event to the inbox's sockets inside a message `wrap` makes
+  // of it, counting it as sent, as a server would with a sound message.
+  injectWrapped(name: string, wrap: (events: WatchEvent[]) => unknown): WatchEvent {
+    this.holding = true;
+    let event: WatchEvent;
+    try {
+      event = this.inject(name, "comment.created");
+    } finally {
+      this.holding = false;
+    }
+    for (const s of this.sockets) {
+      if (s.inbox !== name || s.pos === null) continue;
+      s.send(JSON.stringify(wrap(this.inbox(name).events.filter((e) => e.seq > s.pos!))));
+      s.pos = event.seq;
+    }
+    return event;
   }
 
   // An `inbox.gap`, as the server sends to a reader behind what it keeps:
@@ -336,7 +354,7 @@ export class FakeServer {
       inbox.acked = Math.max(inbox.acked, Math.min(seq, inbox.head));
       return json(200, { name, head: inbox.head, acked: inbox.acked });
     }
-    if (route === "GET /events" && this.malformedPage !== null) return json(200, this.malformedPage);
+    if (route === "GET /events" && this.malformedPage !== undefined) return json(200, this.malformedPage);
     if (route === "GET /events") {
       const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : inbox.acked;
       const wait = Number(url.searchParams.get("wait") ?? 0);

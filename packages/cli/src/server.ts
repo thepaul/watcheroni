@@ -454,11 +454,9 @@ export class ServerReader {
             continue;
           }
           this.crowded = false;
-          // A page that can't be read is taken like a 5xx: tried again
-          // with backoff, the position unmoved.
+          // A page that can't be read is taken like a 5xx (see malformed()).
           if (!isObject(page) || !Array.isArray(page.events) || !isSeq(page.next) || (this.pos === null && !isSeq(page.acked))) {
             this.malformed("page of events");
-            this.outage = true;
             throw new Unreachable(`${this.client.url} sent a malformed page of events`);
           }
           this.markConnected();
@@ -513,12 +511,15 @@ export class ServerReader {
     this.settleFirst(true);
   }
 
-  // Warns, once for each `what`, of something from the server that isn't
-  // as the protocol has it.
+  // Something from the server that isn't as the protocol has it, taken
+  // like a lost connection: tried again with backoff, the position
+  // unmoved. Warned of once for each `what`; that warning stands for the
+  // outage's own, which is otherwise logged when the error is caught.
   private malformed(what: string): void {
     if (this.warned.has(what)) return;
     this.warned.add(what);
     this.o.log(`${this.client.url} sent a malformed ${what}: it isn't shaped as the protocol says; ${REPORT}`);
+    this.outage = true;
   }
 
   private settleFirst(connected: boolean): void {
@@ -561,23 +562,24 @@ export class ServerReader {
         } catch {
           return;
         }
-        // A message that isn't as the protocol has it is ignored, but for
-        // a `ready` that can't be read: the connection is closed, to be
-        // made again with the usual backoff.
+        // A message that isn't as the protocol has it may have carried
+        // events, which the server now counts as sent on this connection.
+        // So it's closed, and the next one's hello asks again from the
+        // last event read.
+        const broken = (what: string) => {
+          this.malformed(what);
+          ws.close(4000, `malformed ${what}`);
+        };
         if (!isObject(msg)) {
-          this.malformed("message");
+          broken("message");
         } else if (msg.type === "ready") {
-          if (!isSeq(msg.acked)) {
-            this.malformed("ready message");
-            ws.close(4000, "malformed ready");
-            return;
-          }
+          if (!isSeq(msg.acked)) return broken("ready message");
           this.ws = ws;
           if (this.pos === null) this.pos = msg.acked;
           this.markConnected();
         } else if (msg.type === "events") {
           if (Array.isArray(msg.events)) this.add(msg.events);
-          else this.malformed("events message");
+          else broken("events message");
         } else if (msg.type === "error") {
           // The server's own words, cleaned like the rest.
           this.o.log(`${this.client.url}: ${clean(msg.code)}${msg.detail ? `: ${clean(msg.detail, PROSE_LENGTH)}` : ""}`);
