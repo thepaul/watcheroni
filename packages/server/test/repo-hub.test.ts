@@ -659,7 +659,7 @@ describe("throttling", () => {
     const sub = await subscribe(repo, { account: acct, inbox: "i", pr: 1 });
     await subscribe(repo, { account: acct, inbox: "i", pr: 2 });
     await subscribe(repo, { account: fresh(), inbox: "other", pr: 2 });
-    // repo.* gets through any kinds filter.
+    // Throttling reaches every inbox, whatever its kinds.
     const checks = fresh();
     await subscribe(repo, { account: checks, inbox: "c", pr: 1, kinds: ["check.*"] });
 
