@@ -2,7 +2,9 @@ import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { WatchEvent } from "@watcheroni/protocol";
 import { Feed } from "../src/feed.ts";
+import { formatText } from "../src/format.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
@@ -78,6 +80,30 @@ describe("server reader", () => {
       "lost the connection to " + fake.url + " (1012 restarting); reconnecting",
       "reconnected to " + fake.url,
     ]);
+  });
+
+  it("moves back to an inbox.gap for a position ahead of the inbox's head", async () => {
+    const r = reader();
+    await r.start();
+    for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
+    await until(() => r.pending().length === 3);
+    r.ack(2);
+    // The server had no record of seq 3: it answers with a gap from it,
+    // and the events it keeps, all lower.
+    const event = (seq: number, kind: string, data: WatchEvent["data"] = {}): WatchEvent => ({
+      v: 1, seq, id: `again-${seq}`, sub: null, kind, at: "t", received_at: "t", repo: null, pr: null, actor: null, data, links: {},
+    });
+    const send = (...events: WatchEvent[]) => {
+      for (const s of fake.sockets) s.send({ type: "events", events });
+    };
+    send(event(0, "inbox.gap", { missed_after: 3, resumed_at: 1 }), event(1, "x"));
+    await until(() => r.pending().length === 2);
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[0, "inbox.gap"], [1, "x"]]);
+    expect(formatText(r.pending().slice(0, 1), [])).toContain("inbox.gap: the server didn't recognise the position read up to");
+    // From there it reads on as usual; a stale gap for an old position doesn't move it.
+    send(event(0, "inbox.gap", { missed_after: 3, resumed_at: 1 }), event(2, "y"));
+    await until(() => r.pending().length === 3);
+    expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
   });
 
   it("stops when the key is revoked", async () => {

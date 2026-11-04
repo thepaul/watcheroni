@@ -143,6 +143,11 @@ function describe(e: WatchEvent): [string, string | null] {
     case "watch.revoked":
       return ["watch.revoked: the watcheroni App lost access to this repo", null];
     case "inbox.gap": {
+      // A position ahead of the inbox's head: the server can't say what
+      // was missed.
+      if (typeof d.missed_after === "number" && typeof d.resumed_at === "number" && d.missed_after >= d.resumed_at) {
+        return ["inbox.gap: the server didn't recognise the position read up to, so events may have been missed; check the watched PRs on GitHub", null];
+      }
       // The server dropped them for age or number before they were read.
       const missed = typeof d.missed_after === "number" && typeof d.resumed_at === "number" ? d.resumed_at - d.missed_after - 1 : NaN;
       const what = missed === 1 ? "1 event was dropped before it was" : `${Number.isSafeInteger(missed) && missed > 0 ? `${missed} ` : ""}events were dropped before they were`;

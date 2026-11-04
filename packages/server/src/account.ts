@@ -190,6 +190,9 @@ export class Account extends DurableObject<Env> {
         verified_until INTEGER
       );
       CREATE INDEX IF NOT EXISTS subscriptions_inbox ON subscriptions (inbox);
+      -- Where each inbox deleted for being idle had got to, so one made
+      -- again under its name carries on from there.
+      CREATE TABLE IF NOT EXISTS deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER NOT NULL, acked INTEGER NOT NULL);
     `);
   }
 
@@ -298,9 +301,22 @@ export class Account extends DurableObject<Env> {
 
   // Creates the inbox if needed, whatever the cap. Only API calls and
   // client sockets are held to it; deliveries go to inboxes they made.
+  // An inbox made again after roomForInbox deleted it takes up its old
+  // `head` and `acked`, as if its events had all expired: seqs are never
+  // reused, so a reader still holding a position from before is behind
+  // (and gets `inbox.gap`), never silently ahead.
   private ensureInbox(name: string): InboxRow {
     this.open();
-    this.sql.exec("INSERT OR IGNORE INTO inboxes (name, created_at) VALUES (?, ?)", name, Date.now());
+    const existing = this.inbox(name);
+    if (existing) return existing;
+    const old = this.sql
+      .exec<{ head: number; acked: number }>("SELECT head, acked FROM deleted_inboxes WHERE name = ?", name)
+      .toArray()[0];
+    this.sql.exec(
+      "INSERT INTO inboxes (name, created_at, head, acked) VALUES (?, ?, ?, ?)",
+      name, Date.now(), old?.head ?? 0, old?.acked ?? 0,
+    );
+    if (old) this.sql.exec("DELETE FROM deleted_inboxes WHERE name = ?", name);
     return this.inbox(name)!;
   }
 
@@ -321,6 +337,7 @@ export class Account extends DurableObject<Env> {
     for (const { name: old } of idle) {
       if (this.ctx.getWebSockets(`inbox:${old}`).length) continue;
       this.sql.exec("DELETE FROM events WHERE inbox = ?", old);
+      this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ?", old);
       this.sql.exec("DELETE FROM inboxes WHERE name = ?", old);
     }
     if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
@@ -604,9 +621,10 @@ export class Account extends DurableObject<Env> {
       if (!events.length) return;
       send(ws, { type: "events", events });
       const last = events[events.length - 1].seq;
-      // Every page should move the position on; if one doesn't, stop
-      // rather than send it forever.
-      if (last <= attachment.pos) {
+      // Every page should move the position on, but for one starting with
+      // the `inbox.gap` that brings a position ahead of `head` back (see
+      // eventsAfter); if one doesn't, stop rather than send it forever.
+      if (last <= attachment.pos && events[0].kind !== "inbox.gap") {
         console.error(`inbox ${attachment.inbox}: a page from ${attachment.pos} ended at ${last}`);
         return;
       }
@@ -629,20 +647,29 @@ export class Account extends DurableObject<Env> {
   // last one dropped), so handling it moves the reader past the gap, and
   // asking again from there brings no second one. `head` saves looking up
   // the inbox when the caller has it.
+  //
+  // A position ahead of `head` was never this inbox's: seqs are never
+  // reused (see ensureInbox) and `ack` stops at `head`. Whatever it came
+  // from, the reader can't know what it missed, so it gets a gap too, and
+  // then everything kept; that gap's seq is below `after`, moving it back.
   private eventsAfter(name: string, after: number, limit: number, head?: number): WatchEvent[] {
     const now = Date.now();
     // Leaving out old events by `at` keeps what's left consecutive only
     // because `at` rises with `seq`.
-    const events = this.sql
-      .exec<{ body: string }>(
-        "SELECT body FROM events WHERE inbox = ? AND seq > ? AND at >= ? ORDER BY seq LIMIT ?",
-        name, after, now - INBOX_MAX_AGE_MS, limit,
-      )
-      .toArray()
-      .map((row) => JSON.parse(row.body) as WatchEvent);
+    const read = (from: number) =>
+      this.sql
+        .exec<{ body: string }>(
+          "SELECT body FROM events WHERE inbox = ? AND seq > ? AND at >= ? ORDER BY seq LIMIT ?",
+          name, from, now - INBOX_MAX_AGE_MS, limit,
+        )
+        .toArray()
+        .map((row) => JSON.parse(row.body) as WatchEvent);
+    let events = read(after);
     if (events.length && events[0].seq === after + 1) return events;
-    const resumedAt = events.length ? events[0].seq : (head ?? this.inbox(name)?.head ?? 0) + 1;
-    if (after + 1 >= resumedAt) return events;
+    const top = head ?? this.inbox(name)?.head ?? 0;
+    if (after > top) events = read(0);
+    const resumedAt = events.length ? events[0].seq : top + 1;
+    if (resumedAt === after + 1) return events;
     return [gapEvent(name, after, resumedAt, now), ...events.slice(0, limit - 1)];
   }
 }
