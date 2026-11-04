@@ -364,7 +364,21 @@ CREATE UNIQUE INDEX events_dedupe ON events (inbox, id);
 
 CREATE TABLE ticket_nonces (nonce TEXT PRIMARY KEY, exp INTEGER);
 CREATE TABLE buckets (name TEXT PRIMARY KEY, tokens REAL, updated_at INTEGER);
+
+-- Where each inbox deleted for being idle had got to; one made again
+-- under its name carries on from there, so seqs are never reused.
+CREATE TABLE deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER, acked INTEGER);
+-- When a subscription to each inbox was last asked for; keeps it from
+-- being deleted as idle while the Worker makes one.
+CREATE TABLE subscribing (inbox TEXT PRIMARY KEY, at INTEGER);
 ```
+
+`deleted_inboxes` keeps a deleted name until the name is used again,
+however long that is: forgetting one would let a recreated inbox start
+again at seq 1, and a client still holding a position from before would
+silently skip its first events. It grows only when an account at the
+inbox cap deletes inboxes nobody has read for 30 days, so by at most
+about 2 x the cap (1,000 rows) per 30 days, at about 50 bytes a row.
 
 RPC methods:
 
@@ -399,8 +413,8 @@ too, then everything kept: `ack` stops at `head`, and an inbox deleted
 for being idle leaves its `head` and `acked` in `deleted_inboxes` for one
 made again under its name to carry on from, so `seq`s are never reused
 and such a position can't be one the inbox gave out. If it doesn't
-recognise a subscription (the user deleted it, but RepoHub hadn't heard yet), it
-says so, and RepoHub deletes its copy. So the two copies of a
+recognise a subscription (the user deleted it, but RepoHub hadn't heard
+yet), it says so, and RepoHub deletes its copy. So the two copies of a
 subscription converge without a transaction across objects: Account
 writes its index row as pending, calls `RepoHub.subscribe`, and marks the
 row active only when that succeeds.

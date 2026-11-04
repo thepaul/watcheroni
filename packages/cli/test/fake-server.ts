@@ -93,6 +93,9 @@ export class FakeServer {
   tooManySockets = false;
   tooManyPolls = false;
   tooManyInboxes = false;
+  // Answer a long poll from a position ahead of head as the server does:
+  // an inbox.gap just before the first event kept, then all of them.
+  aheadGaps = false;
   // Repos the App is installed on, and whether each is private.
   readonly repos = new Map<string, { private: boolean }>();
   // Where an app_not_installed answer says to install it.
@@ -311,6 +314,15 @@ export class FakeServer {
       const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : inbox.acked;
       const wait = Number(url.searchParams.get("wait") ?? 0);
       const page = () => {
+        if (this.aheadGaps && after > inbox.head) {
+          const resumedAt = inbox.events[0]?.seq ?? inbox.head + 1;
+          const gap: WatchEvent = {
+            v: 1, seq: resumedAt - 1, id: `inbox:${name}.gap.${after}.${resumedAt}`, sub: null, kind: "inbox.gap", at: "t",
+            received_at: "t", repo: null, pr: null, actor: null, data: { missed_after: after, resumed_at: resumedAt }, links: {},
+          };
+          const events = [gap, ...inbox.events];
+          return { events, next: events[events.length - 1].seq, head: inbox.head, acked: inbox.acked };
+        }
         const events = inbox.events.filter((e) => e.seq > after);
         return { events, next: events.length ? events[events.length - 1].seq : after, head: inbox.head, acked: inbox.acked };
       };

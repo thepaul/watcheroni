@@ -106,6 +106,26 @@ describe("server reader", () => {
     expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
   });
 
+  it("moves back to an inbox.gap for a position ahead of head when long-polling too", async () => {
+    fake.refuseSockets = true;
+    fake.aheadGaps = true;
+    const r = reader();
+    await r.start();
+    for (const kind of ["a", "b", "c"]) fake.inject("box", kind);
+    await until(() => r.pending().length === 3);
+    // The inbox starts again from nothing, as one made again used to.
+    Object.assign(fake.inbox("box"), { head: 0, acked: 0, events: [] });
+    fake.inject("box", "x", {}, "new-x");
+    await until(() => r.pending().length === 2);
+    expect(r.pending().map((e) => [e.seq, e.kind])).toEqual([[0, "inbox.gap"], [1, "x"]]);
+    expect(r.pending()[0].data).toEqual({ missed_after: 3, resumed_at: 1 });
+    // The next poll is from there, and gets what follows.
+    fake.inject("box", "y", {}, "new-y");
+    await until(() => r.pending().length === 3);
+    expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
+    expect(fake.requests).toContain("GET /v1/inboxes/box/events?wait=300&after=1");
+  });
+
   it("stops when the key is revoked", async () => {
     const r = reader();
     await r.start();

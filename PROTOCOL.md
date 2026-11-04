@@ -28,7 +28,9 @@ The words MUST, SHOULD and MAY are used as in RFC 2119.
   own credentials.
 - **Sequence number (`seq`).** Each inbox numbers its events 1, 2, 3, ...
   with no reuse. A client's position in an inbox is the last `seq` it
-  has handled.
+  has handled. It normally only moves forward, but a position the
+  server never gave out is answered with an `inbox.gap` that moves the
+  client back (see "Gaps").
 - **Acknowledged position (`acked`).** The server stores one position per
   inbox, moved forward only by the client. A client with no local state
   (a new process, another machine) starts reading from there.
@@ -465,7 +467,8 @@ with a gap too, followed by every event it keeps:
 
 Here `missed_after` is greater than the gap's `seq`: the client should
 move its position *back* to the gap's `seq` (not ignore it as an event
-it has already seen), and carry on from there.
+it has already seen), and carry on from there. A gap's `seq` can be `0`,
+when the first event kept is `1`.
 
 ## Events
 

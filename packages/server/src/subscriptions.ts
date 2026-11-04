@@ -143,7 +143,12 @@ export async function createSubscription(
   const saved = await account.saveSubscription(info);
   if (!saved.ok) {
     // The inbox went meanwhile. checkSubscription makes that all but
-    // impossible; if it happens anyway, take back what RepoHub just made.
+    // impossible: its note in `subscribing` keeps roomForInbox from
+    // taking the inbox for idle for 30 days, far longer than this request
+    // runs. If it happens anyway, take back what RepoHub just made. That
+    // isn't atomic with the answer: should this request die first,
+    // RepoHub keeps a subscription Account doesn't know until it
+    // expires, and its deliveries could make the inbox again.
     if (result.created) await repoHubStub(env, repo.id).unsubscribe(sub.id);
     return problem(saved.status, saved.code, saved.detail);
   }

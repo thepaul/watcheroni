@@ -307,7 +307,10 @@ export class Account extends DurableObject<Env> {
   // An inbox made again after roomForInbox deleted it takes up its old
   // `head` and `acked`, as if its events had all expired: seqs are never
   // reused, so a reader still holding a position from before is behind
-  // (and gets `inbox.gap`), never silently ahead.
+  // (and gets `inbox.gap`), never silently ahead. PROTOCOL.md promises
+  // that, so any other way of deleting an inbox (such as the documented
+  // but not yet built DELETE /v1/inboxes/{name}) must write
+  // deleted_inboxes too.
   private ensureInbox(name: string): InboxRow {
     this.open();
     const existing = this.inbox(name);
@@ -342,6 +345,7 @@ export class Account extends DurableObject<Env> {
     for (const { name: old } of idle) {
       if (this.ctx.getWebSockets(`inbox:${old}`).length) continue;
       this.sql.exec("DELETE FROM events WHERE inbox = ?", old);
+      // Remembered so the name never reuses a seq (see ensureInbox).
       this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ?", old);
       this.sql.exec("DELETE FROM inboxes WHERE name = ?", old);
       this.sql.exec("DELETE FROM subscribing WHERE inbox = ?", old);
@@ -645,7 +649,8 @@ export class Account extends DurableObject<Env> {
       // Every page should move the position on, but for one starting with
       // the `inbox.gap` that brings a position ahead of `head` back (see
       // eventsAfter); if one doesn't, stop rather than send it forever.
-      if (last <= attachment.pos && events[0].kind !== "inbox.gap") {
+      const back = events[0].kind === "inbox.gap" && events[0].data.missed_after === attachment.pos;
+      if (last <= attachment.pos && !back) {
         console.error(`inbox ${attachment.inbox}: a page from ${attachment.pos} ended at ${last}`);
         return;
       }
