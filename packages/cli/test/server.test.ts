@@ -526,7 +526,7 @@ describe("what the server says", () => {
     const fetches = vi.spyOn(globalThis, "fetch");
     try {
       fake.redirectTo = `http://127.0.0.1:${fake.port}/elsewhere`;
-      const moved = `answered 307 redirecting to "http://127.0.0.1:${fake.port}/elsewhere", which watcheroni doesn't follow; check the server URL`;
+      const moved = `answered 307 redirecting to "http://127.0.0.1:${fake.port}/elsewhere", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json`;
       const err = (await client().ack("box", 1).catch((e: Error) => e)) as Error;
       expect(fetches.mock.calls[0][1]).toMatchObject({ method: "POST", redirect: "manual" });
       expect(err).toBeInstanceOf(ServerError);
@@ -545,7 +545,7 @@ describe("what the server says", () => {
       const refresh = (await githubTokenFor(fake.url).catch((e: Error) => e)) as Error;
       expect(fetches.mock.calls.at(-1)![1]).toMatchObject({ method: "POST", redirect: "manual" });
       expect(refresh).toBeInstanceOf(Unreachable);
-      expect(refresh.message).toBe(`${fake.url}/v1/github/refresh answered 307 redirecting to "http://evil.test/ 2J", which watcheroni doesn't follow; check the server URL`);
+      expect(refresh.message).toBe(`${fake.url}/v1/github/refresh answered 307 redirecting to "http://evil.test/ 2J", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json`);
       expect(fake.refreshed).toEqual([]);
     } finally {
       fetches.mockRestore();

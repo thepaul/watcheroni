@@ -409,11 +409,24 @@ describe("what the server says", () => {
     const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
     const modes = answering(deps, `${SERVER}/v1/login`, async () => new Response(null, { status: 307, headers: { Location: "http://watcheroni.test/v1/login" } }));
     await expect(login(SERVER, deps)).rejects.toThrow(
-      `${SERVER}/v1/login answered 307 redirecting to "http://watcheroni.test/v1/login", which watcheroni doesn't follow; check the server URL`,
+      `${SERVER}/v1/login answered 307 redirecting to "http://watcheroni.test/v1/login", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json`,
     );
     // Every request refuses redirects, GitHub's too.
     expect(calls.map((c) => c.url)).toEqual([`${SERVER}/v1/meta`, `${GITHUB}/login/device/code`, `${GITHUB}/login/oauth/access_token`]);
     expect(modes).toEqual(["manual", "manual", "manual", "manual"]);
+    expect(readCredentials().servers).toEqual({});
+  });
+
+  it("can't redirect a sign-in tried again after a 429", async () => {
+    const { deps } = fake([{ access_token: "ghu_tok" }]);
+    const answers = [
+      Response.json({ code: "rate_limited" }, { status: 429, headers: { "Retry-After": "1" } }),
+      new Response(null, { status: 307, headers: { Location: "http://watcheroni.test/v1/login" } }),
+    ];
+    const modes = answering(deps, `${SERVER}/v1/login`, async () => answers.shift()!);
+    await expect(login(SERVER, deps)).rejects.toThrow(`${SERVER}/v1/login answered 307 redirecting to "http://watcheroni.test/v1/login", which watcheroni doesn't follow`);
+    expect(answers).toEqual([]);
+    expect(modes.slice(-2)).toEqual(["manual", "manual"]);
     expect(readCredentials().servers).toEqual({});
   });
 

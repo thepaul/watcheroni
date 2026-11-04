@@ -661,11 +661,47 @@ describe("what the server says", () => {
     expect(garbled.stderr()).not.toMatch(CONTROLS);
   });
 
+  it("never reaches stdout raw from an event, as text or JSON", async () => {
+    const pr = "7\x1b]0;pwned\x07\u202e" as unknown as number;
+    const hostile = `${NASTY}\u200b\u2028\ufeff`;
+    // Anything but line breaks, as CONTROLS, and formatting characters too.
+    const RAW = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+    fake.inject("box", hostile, { state: hostile, path: hostile, name: hostile }, hostile, null, pr);
+    const text = cli(["wait", "--settle", "0"]);
+    expect(await text.code).toBe(0);
+    expect(text.stdout()).toMatch(/^octo\/widgets#\?: 1 new event\n/);
+    expect(text.stdout()).not.toMatch(RAW);
+
+    for (const args of [["wait", "--settle", "0", "--json"], ["wait", "--settle", "0", "--format", "json"]]) {
+      fake.inject("box", hostile, { state: hostile }, `${hostile}${args.length}`, null, pr);
+      const json = cli(args);
+      expect(await json.code).toBe(0);
+      expect(json.stdout()).not.toMatch(RAW);
+      // Escaped, not lost.
+      expect(json.stdout()).toContain(String.raw`\u001b]0;pwned\u0007\u202e`);
+      expect(json.stdout()).toContain(String.raw`\u200b\u2028\ufeff`);
+      const first = JSON.parse(json.stdout().split("\n")[0]) as { kind?: string; events?: { kind: string; pr: unknown }[] };
+      expect(first.kind ?? first.events![0].kind).toBe(hostile);
+    }
+  });
+
+  it("gives exec's command clean variables, and logs its failure cleanly", async () => {
+    const log = join(cwd, "ran");
+    fake.inject("box", "a\x1b[31m  b", {}, "e\x00vil");
+    const script = `printf '%s|%s\\n' "$WATCHERONI_EVENT_ID" "$WATCHERONI_KIND" >> ${log}; exit 1`;
+    const run = cli(["exec", "--", "sh", "-c", script]);
+    await until(() => run.stderr().includes("command exited 1"));
+    run.kill();
+    await run.code;
+    expect(readFileSync(log, "utf8").split("\n")[0]).toBe("e vil|a [31m b");
+    expect(run.stderr()).toContain("watcheroni: command exited 1 for a [31m b (e vil); it will be offered again\n");
+  });
+
   it("can't redirect the CLI elsewhere", async () => {
     fake.redirectTo = "http://evil.test/";
     const run = cli(["wait", "--settle", "0"]);
     expect(await run.code).toBe(1);
-    expect(run.stderr()).toBe(`watcheroni: ${fake.url}: PUT /v1/inboxes/box: answered 307 redirecting to "http://evil.test/", which watcheroni doesn't follow; check the server URL\n`);
+    expect(run.stderr()).toBe(`watcheroni: ${fake.url}: PUT /v1/inboxes/box: answered 307 redirecting to "http://evil.test/", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json\n`);
   });
 });
 

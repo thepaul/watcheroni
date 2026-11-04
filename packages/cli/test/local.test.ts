@@ -2,10 +2,10 @@ import { mkdtempSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UnsequencedEvent, WatchEvent } from "@watcheroni/protocol";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
-import { formatText } from "../src/format.ts";
-import { GitHubError } from "../src/github.ts";
+import { formatText, toJson } from "../src/format.ts";
+import { GitHubError, graphql } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
@@ -434,5 +434,57 @@ describe("text output", () => {
       "",
       "octo/widgets#7 is still open. Run `watcheroni wait` again to keep watching.",
     ].join("\n"));
+  });
+
+  it("carries no control or formatting character from any field", () => {
+    const NASTY = "x\x1b]0;pwned\x07\u202e\u009b2J\u200b\u2028\r\n";
+    const kinds = [
+      "review.submitted", "review.dismissed", "review_comment.created", "comment.created", "thread.resolved", "check.completed",
+      "check.failed", "workflow.completed", "pr.pushed", "pr.base_changed", "pr.review_requested", "pr.merged", "watch.ended",
+      "watch.expired", "watch.unverified", "watch.revoked", "inbox.gap", NASTY,
+    ];
+    const data = Object.fromEntries([
+      "review_id", "state", "path", "line", "in_reply_to", "comment_id", "name", "conclusion", "head_sha", "workflow_run_id",
+      "check_run_id", "workflow", "run_id", "before", "after", "from", "to", "reviewer", "merge_sha", "reason", "missed_after", "resumed_at",
+    ].map((k) => [k, NASTY]));
+    const events = kinds.map((kind, i) => ({
+      v: 1, seq: i + 1, id: NASTY, sub: NASTY, kind, at: NASTY, received_at: NASTY,
+      repo: { id: 1, full_name: NASTY }, pr: NASTY, actor: { id: 1, login: NASTY, bot: false }, data,
+      links: { html: `https://evil.test/${NASTY}`, api: `https://api.github.com/${NASTY}` },
+    })) as unknown as WatchEvent[];
+    // And a kind that isn't even a string, about no repo.
+    events.push({ ...events[0], kind: { toString: () => NASTY }, repo: null } as unknown as WatchEvent);
+    const text = formatText(events, ["octo/widgets#7"]);
+    expect(text).toMatch(/^"x \]0;pwned 2J"#\?: 18 new events/);
+    expect(text.replace(/\n/g, "")).not.toMatch(/[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/);
+  });
+});
+
+describe("GitHub's errors", () => {
+  it("are cleaned, and not cut short", async () => {
+    process.env.GH_TOKEN ??= "ghp_test";
+    const NASTY = `\x1b[31mred\x1b]8;;https://evil.test\x07link\r\x00 ${"because ".repeat(20)}end`;
+    const fetches = vi.spyOn(globalThis, "fetch");
+    try {
+      fetches.mockResolvedValueOnce(new Response(NASTY, { status: 502 }));
+      const down = (await graphql("{}", {}).catch((e: Error) => e)) as GitHubError;
+      expect(down.message).toMatch(/^GitHub GraphQL: 502 \[31mred \]8;;https:\/\/evil\.test link because .* end$/);
+      fetches.mockResolvedValueOnce(Response.json({ errors: [{ type: "NOT_FOUND", message: NASTY }, { message: NASTY }] }));
+      const missing = (await graphql("{}", {}).catch((e: Error) => e)) as GitHubError;
+      expect(missing.status).toBe(404);
+      expect(missing.message).toMatch(/^\[31mred .* end; \[31mred .* end$/);
+      for (const m of [down.message, missing.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    } finally {
+      fetches.mockRestore();
+    }
+  });
+});
+
+describe("JSON output", () => {
+  it("escapes what a terminal would act on, and parses to the same value", () => {
+    const value = { s: "a\x1b[31m\x7f\u009b\u200b\u202e\u2028\u2066\ufeffz", n: 1, list: ["é", "日本"] };
+    const json = toJson(value);
+    expect(json).toBe(String.raw`{"s":"a\u001b[31m\u007f\u009b\u200b\u202e\u2028\u2066\ufeffz","n":1,"list":["é","日本"]}`);
+    expect(JSON.parse(json)).toEqual(value);
   });
 });

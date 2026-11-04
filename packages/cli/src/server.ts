@@ -48,11 +48,18 @@ export function refusal(problem: { detail?: unknown; title?: unknown }, code: st
 // 401s that are about the GitHub token sent with a request, not the API key.
 const GITHUB_TOKEN_CODES = new Set(["github_token_required", "github_token_invalid"]);
 
-// Redirects are never followed, for the server or GitHub: fetch would
-// send the body again wherever one points, even to plain http, and
-// bodies carry GitHub tokens. Every fetch passes this, and answers a
-// redirect with an error saying so (see redirect()).
+// Redirects are never followed on requests to the server, nor on the
+// device flow's to github.com: fetch would send the body again wherever
+// one points, even to plain http, and those bodies carry GitHub tokens
+// and the device code. Each of them passes this, and answers a redirect
+// with an error saying so (see redirect()). Local mode's GraphQL requests
+// to GitHub follow them: their body is only the query, and fetch drops
+// the Authorization header on a redirect to another origin, https to http
+// included.
 export const NO_REDIRECTS = { redirect: "manual" } as const;
+
+// What to do about a server that redirects (see config.ts).
+export const CHECK_SERVER_URL = "check the server URL in $WATCHERONI_SERVER or ~/.config/watcheroni/config.json";
 
 // What to say about an answer that is a redirect, or null if it isn't.
 export function redirect(res: Response): string | null {
@@ -101,7 +108,7 @@ export class ServerClient {
     // Not worth retrying: the server URL, or the server, needs fixing.
     const moved = redirect(res);
     if (moved) {
-      const detail = `${moved}; check the server URL`;
+      const detail = `${moved}; ${CHECK_SERVER_URL}`;
       throw new ServerError(`${this.url}: ${method} ${path}: ${detail}`, res.status, "redirect", { detail });
     }
     if (res.status === 204) return undefined as T;
@@ -222,8 +229,9 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
   }
   const due = subs.filter((s) => s.repo.private && s.verified_until && Date.parse(s.verified_until) - now < RENEW_BEFORE_MS);
   if (!due.length) return;
-  // The repos' names are as the server gave them.
-  const name = (s: SubscriptionInfo) => clean(s.repo.full_name);
+  // The repos' names are as the server gave them. GitHub's are at most
+  // 140 characters.
+  const name = (s: SubscriptionInfo) => clean(s.repo.full_name, 140);
   let token: string | null | undefined;
   try {
     token = await o.githubToken?.();
