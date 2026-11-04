@@ -41,11 +41,12 @@ export class Feed {
     this.hadTargets = inbox.watched().length + inbox.repoWatches().length > 0;
   }
 
-  // Pending events that match, acknowledging the rest so they don't wait
-  // for ever.
+  // Pending events that match both `kinds` and their PR's own kinds,
+  // acknowledging the rest so they don't wait for ever.
   wanted(kinds: string[]): Item[] {
     this.check();
     const items: Item[] = [];
+    const left = new Set<string>();
     for (const source of this.server ? [this.server, this.inbox] : [this.inbox]) {
       const pending = source.pending();
       if (source === this.server) {
@@ -53,15 +54,22 @@ export class Feed {
           if (e.sub && e.kind.startsWith("watch.") && this.inbox.subscriptionEnded(e.sub, e.kind) === "repo") this.repoEnded = true;
         }
       }
-      const keep = pending.filter((e) => matchesKind(kinds, e.kind));
-      const skip = pending.filter((e) => !matchesKind(kinds, e.kind));
+      const want = (e: WatchEvent) => {
+        const key = prKey(e);
+        return wants(kinds, e) && (!key || wants(this.inbox.kindsFor(key), e));
+      };
+      const keep = pending.filter(want);
+      const skip = pending.filter((e) => !want(e));
       // Acknowledge up to the first wanted event only, so the order holds.
       const firstKept = keep[0]?.seq ?? Infinity;
       const skippable = skip.filter((e) => e.seq < firstKept).map((e) => e.seq);
       if (skippable.length) source.ack(Math.max(...skippable));
       if (!keep.length && skip.length) source.ack(Math.max(...skip.map((e) => e.seq)));
       items.push(...keep.map((event) => ({ event, source })));
+      // Skipped events after the first kept one are still pending.
+      for (const e of source.pending()) left.add(prKey(e)?.toLowerCase() ?? "");
     }
+    this.inbox.forgetEnded(left);
     return items;
   }
 
@@ -118,3 +126,14 @@ export class Feed {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const prKey = (e: WatchEvent) => (e.repo && e.pr !== null ? `${e.repo.full_name}#${e.pr}` : null);
+
+// Whether `kinds` wants the event. A PR's `watch.ended` comes with its
+// `pr.merged` or `pr.closed`, so kinds that leave those out aren't woken
+// by the PR ending; the other `watch.*` kinds always get through.
+export function wants(kinds: string[], e: WatchEvent): boolean {
+  const reason = e.data.reason;
+  if (e.kind === "watch.ended" && kinds.length && (reason === "merged" || reason === "closed")) return matchesKind(kinds, `pr.${reason}`);
+  return matchesKind(kinds, e.kind);
+}

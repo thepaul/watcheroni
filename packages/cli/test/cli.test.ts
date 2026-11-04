@@ -141,6 +141,49 @@ describe("wait against a server", () => {
     expect(fake.inbox("box").acked).toBe(2);
   });
 
+  it("remembers --kinds given with a PR, until it's changed", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    fake.inject("box", "comment.created");
+    fake.inject("box", "check.failed");
+    const run = cli(["wait", "octo/widgets#7", "--settle", "0", "--kinds", "check.*", "--format", "json"]);
+    expect(await run.code, run.stderr()).toBe(0);
+    expect(run.stderr()).toBe("watcheroni: watching octo/widgets#7 in inbox box for check.*\n");
+    expect((JSON.parse(run.stdout()) as { events: { kind: string }[] }).events.map((e) => e.kind)).toEqual(["check.failed"]);
+    const kindsNow = async () => {
+      const ls = cli(["ls", "--json"]);
+      expect(await ls.code).toBe(0);
+      return (JSON.parse(ls.stdout()) as { prs: { kinds?: string[] }[] }).prs[0]!.kinds;
+    };
+    expect(await kindsNow()).toEqual(["check.*"]);
+    const ls = cli(["ls"]);
+    expect(await ls.code).toBe(0);
+    expect(ls.stdout()).toMatch(/^octo\/widgets#7 \(check\.\*\)  since /);
+
+    // Naming the PR again without --kinds keeps them.
+    fake.inject("box", "comment.created");
+    const again = cli(["wait", "octo/widgets#7", "--settle", "0", "--timeout", "1s", "--format", "json"]);
+    expect(await again.code, again.stderr()).toBe(2);
+    expect(await kindsNow()).toEqual(["check.*"]);
+
+    // --kinds with no PR named narrows that run, on top of the PR's own,
+    // and isn't saved.
+    fake.inject("box", "check.failed");
+    const narrowed = cli(["wait", "--settle", "0", "--timeout", "1s", "--kinds", "comment.created", "--format", "json"]);
+    expect(await narrowed.code, narrowed.stderr()).toBe(2);
+    expect(await kindsNow()).toEqual(["check.*"]);
+
+    const reset = cli(["watch", "octo/widgets#7", "--kinds", "*"]);
+    expect(await reset.code, reset.stderr()).toBe(0);
+    expect(reset.stderr()).toBe("watcheroni: watching octo/widgets#7 for every kind\n");
+    expect(await kindsNow()).toBeUndefined();
+
+    // Unwatching forgets them.
+    expect(await cli(["watch", "octo/widgets#7", "--kinds", "check.*"]).code).toBe(0);
+    expect(await cli(["unwatch", "octo/widgets#7"]).code).toBe(0);
+    expect(await cli(["watch", "octo/widgets#7"]).code).toBe(0);
+    expect(await kindsNow()).toBeUndefined();
+  });
+
   it("shows a reply and the review GitHub makes for it", async () => {
     fake.inject("box", "review.submitted", { review_id: 5, state: "commented", has_body: false });
     fake.inject("box", "review_comment.created", { comment_id: 6, review_id: 5, path: "a.ts", line: 3, in_reply_to: 4 });
@@ -280,7 +323,7 @@ describe("watching a whole repository", () => {
 
     // Next time it's known, so not subscribed again; with nothing new, a timeout.
     const again = cli(["wait", "octo/widgets", "--kinds", "pr.opened", "--base", "main", "--timeout", "1s"]);
-    expect(await again.code).toBe(2);
+    expect(await again.code, again.stderr()).toBe(2);
     expect(fake.subscriptions).toHaveLength(1);
     const ls = cli(["ls"]);
     expect(await ls.code).toBe(0);
@@ -376,6 +419,21 @@ describe("stream against a server", () => {
 });
 
 describe("exec against a server", () => {
+  it("remembers --on given with a PR as its kinds", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    const log = join(cwd, "ran");
+    fake.inject("box", "comment.created");
+    fake.inject("box", "check.failed");
+    const run = cli(["exec", "octo/widgets#7", "--on", "check.failed", "--", "sh", "-c", `echo "$WATCHERONI_KIND" >> ${log}`]);
+    await until(() => fake.inbox("box").acked === 2);
+    run.kill();
+    await run.code;
+    expect(readFileSync(log, "utf8")).toBe("check.failed\n");
+    const ls = cli(["ls", "--json"]);
+    expect(await ls.code).toBe(0);
+    expect((JSON.parse(ls.stdout()) as { prs: { kinds?: string[] }[] }).prs.map((p) => p.kinds)).toEqual([["check.failed"]]);
+  });
+
   it("acknowledges an event only when the command succeeds", async () => {
     const log = join(cwd, "ran");
     fake.inject("box", "comment.created");

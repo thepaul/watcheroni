@@ -15,8 +15,10 @@ of events on stdin and their number in `WATCHERONI_COUNT`. A batch is
 everything that arrived within `--settle` (5 s by default) of its first
 event; `--settle 0` turns that off, so a batch is whatever one read of
 the inbox brought. `--on` (or `--kinds`) picks the kinds, e.g.
-`--on check.*,review.submitted`; `watch.*` kinds, such as `watch.ended`
-when a PR is merged or closed, always come through.
+`--on check.*,review.submitted`. Given with PRs, the inbox remembers it
+for those PRs. `watch.ended`, when a PR is merged or closed, comes
+through if `pr.merged` or `pr.closed` does; the other `watch.*` kinds
+always come through.
 
 **When the command fails.** An event is acknowledged only when the command
 exits 0. Otherwise watcheroni logs

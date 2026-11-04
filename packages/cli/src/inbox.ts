@@ -20,6 +20,9 @@ export interface Watched {
   sub?: string;
   // When the server last declined to watch it.
   subTriedAt?: string;
+  // The kinds `wait`, `stream` and `exec` report for it; every kind if
+  // missing.
+  kinds?: string[];
 }
 
 // A whole repository, watched by a server subscription only.
@@ -39,6 +42,9 @@ interface State {
   watched: Record<string, Watched>;
   // Added after version 1's first release; missing in older files.
   repos?: Record<string, RepoWatched>;
+  // The kinds of PRs that ended while watched for only some kinds, by
+  // lowercased key, kept until their last events have been read.
+  ended?: Record<string, string[]>;
 }
 
 const SEEN_KEPT = 2000;
@@ -156,11 +162,20 @@ export class Inbox {
     return gone.map(([, r]) => r);
   }
 
-  watch(key: string, target: Target, sub: string | null = null): boolean {
+  watch(key: string, target: Target, sub: string | null = null, kinds: string[] = []): boolean {
     if (this.state.watched[key]) return false;
-    this.state.watched[key] = { target, addedAt: new Date().toISOString(), snapshot: null, ...(sub ? { sub } : {}) };
+    this.state.watched[key] = { target, addedAt: new Date().toISOString(), snapshot: null, ...(sub ? { sub } : {}), ...(kinds.length ? { kinds } : {}) };
     this.save();
     return true;
+  }
+
+  // Sets the kinds reported for a watched PR; none means every kind.
+  setKinds(key: string, kinds: string[]): void {
+    const w = this.state.watched[key];
+    if (!w) return;
+    if (kinds.length) w.kinds = kinds;
+    else delete w.kinds;
+    this.save();
   }
 
   unwatch(key: string): boolean {
@@ -168,6 +183,31 @@ export class Inbox {
     delete this.state.watched[key];
     this.save();
     return true;
+  }
+
+  // Stops watching a PR that has ended, keeping its kinds for the events
+  // about its end that haven't been read yet.
+  end(key: string): void {
+    const kinds = this.state.watched[key]?.kinds;
+    if (kinds) (this.state.ended ??= {})[key.toLowerCase()] = kinds;
+    this.unwatch(key);
+  }
+
+  // The kinds reported for the PR `owner/repo#123`, watched or just
+  // ended; every kind if none were given.
+  kindsFor(key: string): string[] {
+    const k = key.toLowerCase();
+    const w = this.watched().find((w) => `${w.target.owner}/${w.target.name}#${w.target.number}`.toLowerCase() === k);
+    return w ? w.kinds ?? [] : this.state.ended?.[k] ?? [];
+  }
+
+  // Forgets the kinds of ended PRs with no events left to read.
+  forgetEnded(pending: Set<string>): void {
+    const ended = this.state.ended;
+    if (!ended) return;
+    const gone = Object.keys(ended).filter((k) => !pending.has(k));
+    for (const k of gone) delete ended[k];
+    if (gone.length) this.save();
   }
 
   // Records the server's subscription, or that it declined (null).
@@ -198,9 +238,12 @@ export class Inbox {
     const entry = Object.entries(this.state.watched).find(([, w]) => w.sub === sub);
     if (!entry) return null;
     const [key, w] = entry;
-    if (kind === "watch.revoked" || kind === "watch.unverified" || kind === "watch.expired") delete w.sub;
-    else delete this.state.watched[key];
-    this.save();
+    if (kind === "watch.revoked" || kind === "watch.unverified" || kind === "watch.expired") {
+      delete w.sub;
+      this.save();
+    } else {
+      this.end(key);
+    }
     return "pr";
   }
 

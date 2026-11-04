@@ -34,7 +34,54 @@ process" error names. Never `pkill` or `killall` it by name: other
 sessions on this machine run `watcheroni wait` too, and a pattern like
 `pkill -f "watcheroni.*wait"` kills theirs as well.
 
-Other commands:
+## Watching only what you need
+
+One `wait` reports on every PR in the inbox, and wakes for any event on
+any of them. To be woken only for what you're waiting on, give each PR
+the kinds you want with `--kinds`. The inbox remembers them for that PR,
+so later runs of a plain `watcheroni wait` use them too:
+
+```
+# A comment or review on #123, or #123 merging or closing
+watcheroni watch octo/widgets#123 --kinds comment.created,review.*,review_comment.created,pr.merged,pr.closed
+
+# Only a failing check on #45
+watcheroni watch octo/gadgets#45 --kinds check.failed
+
+# Only #67 merging or closing
+watcheroni watch octo/gadgets#67 --kinds pr.merged,pr.closed
+
+# Then one wait for all three
+watcheroni wait
+```
+
+`--kinds` is a comma-separated list, and `review.*` matches every
+`review.` kind. `wait octo/widgets#123 --kinds ...` sets them too.
+Running it again with other kinds replaces them, and `--kinds '*'` goes
+back to every kind. Naming the PR without `--kinds` keeps what it has,
+and `watcheroni ls` shows each PR's kinds. `watch` needs the inbox, like
+`wait`, so stop a running `wait` before you run it.
+
+A PR ending (`pr.merged` or `pr.closed`, then `watch.ended`) wakes you
+only if its kinds include `pr.merged` or `pr.closed`. Otherwise it just
+stops being watched. In the example above, #45 merging doesn't wake you.
+
+Events of the kinds you left out are dropped, not kept for later. If you
+need them after all, ask GitHub (`gh pr view`, `gh pr checks`).
+
+`--kinds` with no PR named (`watcheroni wait --kinds check.*`) narrows
+that one run, on every PR, and isn't saved.
+
+**Done with a PR?** Unwatch it: `watcheroni unwatch octo/widgets#123`.
+If you're about to merge or close it yourself, unwatch it first, since
+you already know what's going to happen.
+
+**Events you don't need to act on.** If an event needs nothing from you,
+such as your own push, a check passing, or a PR you've finished with
+merging, you don't need to report or announce it. Just run the same
+`wait` again for the next event. With `stream`, keep waiting.
+
+## Other commands
 
 - `watcheroni ls`: what this session's inbox watches.
 - `watcheroni unwatch owner/repo#123`: stop watching a PR.

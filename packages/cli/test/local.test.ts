@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UnsequencedEvent, WatchEvent } from "@watcheroni/protocol";
 import { beforeEach, describe, expect, it } from "vitest";
+import { Feed } from "../src/feed.ts";
 import { formatText } from "../src/format.ts";
 import { GitHubError } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
@@ -169,6 +170,69 @@ describe("polling", () => {
     await pollOnce(inbox, (m) => messages.push(m), async () => { throw new Error("502 from GitHub"); });
     expect(messages).toEqual(["octo/widgets#7: 502 from GitHub; trying again next time"]);
     expect(inbox.watched()).toHaveLength(1);
+    inbox.close();
+  });
+});
+
+describe("kinds per PR", () => {
+  const seven = { owner: "octo", name: "widgets", number: 7 };
+  const eight = { owner: "octo", name: "widgets", number: 8 };
+  const pr8 = (over: Partial<Snapshot> = {}) => snap({ number: 8, url: "https://github.com/octo/widgets/pull/8", ...over });
+  const comment = { id: 1, at: "t", url: "u", author: alice };
+  const failed = check("lint", { conclusion: "failure" });
+
+  it("reports each PR's own kinds, and a PR ending only to kinds that want it", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(seven), seven, null, ["review.*", "comment.created", "pr.merged", "pr.closed"]);
+    inbox.watch(targetKey(eight), eight, null, ["check.failed"]);
+    const snapshots: Record<number, Snapshot[]> = {
+      7: [snap(), snap({ checks: [failed] }), snap({ checks: [failed], comments: [comment] }), snap({ state: "MERGED", checks: [failed], comments: [comment] })],
+      8: [pr8(), pr8({ comments: [comment] }), pr8({ comments: [comment], checks: [failed] }), pr8({ state: "MERGED", comments: [comment], checks: [failed] })],
+    };
+    const feed = new Feed(inbox, null, { interval: 60_000, log: () => {}, fetch: async (t) => snapshots[t.number]!.shift()! });
+    const next = async () => {
+      await feed.poll();
+      const items = feed.wanted([]);
+      feed.ack(items);
+      return items.map((i) => `#${i.event.pr} ${i.event.kind}`);
+    };
+    expect(await next()).toEqual([]);
+    // #7's failed check and #8's comment aren't wanted.
+    expect(await next()).toEqual([]);
+    expect(await next()).toEqual(["#7 comment.created", "#8 check.failed"]);
+    // Both merge: only #7 wants to hear it, and #8's kinds are let go.
+    expect(await next()).toEqual(["#7 pr.merged", "#7 watch.ended"]);
+    expect(inbox.watched()).toEqual([]);
+    // #8's end came after #7's, so it waits for the next read to be let go.
+    expect(inbox.kindsFor("octo/widgets#8")).toEqual(["check.failed"]);
+    expect(feed.wanted([])).toEqual([]);
+    expect(inbox.kindsFor("octo/widgets#8")).toEqual([]);
+    expect(feed.ended()).toBe(true);
+    inbox.close();
+  });
+
+  it("matches a PR named in another case, and applies a run's kinds on top", async () => {
+    const inbox = open();
+    const shouty = { owner: "Octo", name: "Widgets", number: 7 };
+    inbox.watch(targetKey(shouty), shouty, null, ["comment.created", "check.failed"]);
+    const snapshots = [snap(), snap({ comments: [comment], checks: [failed], reviews: [] })];
+    const feed = new Feed(inbox, null, { interval: 60_000, log: () => {}, fetch: async () => snapshots.shift()! });
+    await feed.poll();
+    await feed.poll();
+    // The events say octo/widgets; the PR's kinds still apply.
+    expect(feed.wanted(["check.*"]).map((i) => i.event.kind)).toEqual(["check.failed"]);
+    inbox.close();
+  });
+
+  it("keeps an ended PR's kinds until its last events are read, and matches keys in any case", () => {
+    const inbox = open();
+    inbox.watch(targetKey(eight), eight, null, ["check.failed"]);
+    inbox.end("octo/widgets#8");
+    expect(inbox.kindsFor("Octo/Widgets#8")).toEqual(["check.failed"]);
+    inbox.forgetEnded(new Set(["octo/widgets#8"]));
+    expect(inbox.kindsFor("octo/widgets#8")).toEqual(["check.failed"]);
+    inbox.forgetEnded(new Set());
+    expect(inbox.kindsFor("octo/widgets#8")).toEqual([]);
     inbox.close();
   });
 });

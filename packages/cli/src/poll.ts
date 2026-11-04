@@ -47,7 +47,7 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
           data: { reason },
           links: { html: next.url },
         }]));
-        inbox.unwatch(key);
+        inbox.end(key);
       } else {
         inbox.save();
       }
@@ -56,7 +56,7 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
     const events = diff(w.snapshot, next);
     inbox.update(key, next);
     added.push(...inbox.append(events));
-    if (events.some((e) => e.kind === "watch.ended")) inbox.unwatch(key);
+    if (events.some((e) => e.kind === "watch.ended")) inbox.end(key);
   }
   return added;
 }

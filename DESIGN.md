@@ -1011,6 +1011,12 @@ watcheroni config [get | set] <key> [value]
   `--kinds`, may narrow with `--base` and `--author`; server mode only,
   and `wait` never exits 3 while one is watched), or nothing, meaning the current branch's PR (found through
   the git remote and the GitHub API).
+- **`--kinds` with PR targets is remembered** for those PRs in the inbox,
+  so one `wait` can report reviews on one PR and failed checks on
+  another; `--kinds '*'` goes back to everything. The CLI does the
+  filtering, so a server subscription on a PR still carries every kind.
+  Without targets, `--kinds` narrows that one run. A PR's `watch.ended`
+  gets through a filter only when `pr.merged` or `pr.closed` would.
 - **`wait`, `stream` and `exec` subscribe as needed**: they make sure the
   targets are watched in the current inbox, then read it. Most users never
   run `watch`.

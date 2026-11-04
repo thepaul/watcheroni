@@ -220,6 +220,53 @@ describe("feed", () => {
     await until(() => fake.inbox("feed3").acked === 1);
     inbox.close();
   });
+
+  it("filters a server-watched PR by its own kinds, and lets its end go when they leave it out", async () => {
+    const inbox = Inbox.open("feed4");
+    inbox.watch(targetKey(target), target, "sub_9", ["check.failed"]);
+    const r = reader("feed4");
+    await r.start();
+    fake.inject("feed4", "comment.created", {}, "e1", "sub_9");
+    fake.inject("feed4", "check.failed", {}, "e2", "sub_9");
+    fake.inject("feed4", "pr.merged", {}, "e3", "sub_9");
+    fake.inject("feed4", "watch.ended", { reason: "merged" }, "e4", "sub_9");
+    await until(() => r.pending().length === 4);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    const items = feed.wanted([]);
+    expect(items.map((i) => i.event.kind)).toEqual(["check.failed"]);
+    expect(inbox.watched()).toEqual([]);
+    feed.ack(items);
+    expect(feed.wanted([])).toEqual([]);
+    expect(inbox.kindsFor(targetKey(target))).toEqual([]);
+    expect(feed.ended()).toBe(true);
+    inbox.close();
+  });
+
+  it("keeps a PR's kinds when the server lets its watch expire, polling it from here instead", async () => {
+    const inbox = Inbox.open("feed6");
+    inbox.watch(targetKey(target), target, "sub_9", ["check.failed"]);
+    const r = reader("feed6");
+    await r.start();
+    fake.inject("feed6", "watch.expired", { reason: "unread" }, "e1", "sub_9");
+    await until(() => r.pending().length === 1);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    expect(feed.wanted([]).map((i) => i.event.kind)).toEqual(["watch.expired"]);
+    expect(inbox.watched().map((w) => [w.sub, w.kinds])).toEqual([[undefined, ["check.failed"]]]);
+    inbox.close();
+  });
+
+  it("lets a PR's end through a run's kinds only with pr.merged or pr.closed", async () => {
+    const inbox = Inbox.open("feed5");
+    const r = reader("feed5");
+    await r.start();
+    fake.inject("feed5", "watch.ended", { reason: "merged" });
+    fake.inject("feed5", "watch.expired", { reason: "unread" });
+    await until(() => r.pending().length === 2);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    expect(feed.wanted(["check.*"]).map((i) => i.event.kind)).toEqual(["watch.expired"]);
+    expect(feed.wanted(["pr.merged"]).map((i) => i.event.kind)).toEqual(["watch.expired"]);
+    inbox.close();
+  });
 });
 
 describe("subscribing on the server", () => {

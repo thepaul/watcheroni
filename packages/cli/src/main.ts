@@ -35,7 +35,12 @@ the server only, and needs --kinds.
 Options:
   --inbox NAME      which inbox to use (default: $WATCHERONI_INBOX, or
                     cc-$CLAUDE_CODE_SESSION_ID in Claude Code, or "default")
-  --kinds LIST      only these kinds, e.g. check.*,review.submitted
+  --kinds LIST      only these kinds, e.g. check.*,review.submitted. With
+                    PR targets, the inbox remembers it for those PRs, so
+                    one wait can report different kinds on different
+                    PRs (--kinds '*' goes back to every kind). Without
+                    targets, it narrows this run only. A PR ending wakes
+                    a filter only if it has pr.merged or pr.closed
   --base BRANCH     owner/repo targets: only PRs against this branch
   --author LOGIN    owner/repo targets: only PRs opened by this GitHub user
   --interval TIME   how often to poll GitHub (default 2m, at least 10s)
@@ -61,6 +66,8 @@ server.
 
 const log = (msg: string) => process.stderr.write(`watcheroni: ${msg}\n`);
 
+const describeKinds = (kinds: string[]) => (kinds.length ? kinds.join(",") : "every kind");
+
 export function parseDuration(s: string): number {
   const m = s.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)?$/);
   if (!m) throw new UsageError(`${s}: expected a duration like 30s, 2m or 1h`);
@@ -73,7 +80,7 @@ function describeInbox(name: string, nothing: string): string[] {
   const { watched, repos, pending } = Inbox.peek(name);
   return [
     ...(!watched.length && !repos.length ? [nothing] : []),
-    ...watched.map((w) => `${targetKey(w.target)}  since ${w.addedAt}`),
+    ...watched.map((w) => `${targetKey(w.target)}${w.kinds ? ` (${w.kinds.join(",")})` : ""}  since ${w.addedAt}`),
     ...repos.map((r) => `${repoKey(r.target)}  since ${r.addedAt}`),
     ...(pending ? [`${pending} event(s) not yet read.`] : []),
   ];
@@ -84,7 +91,7 @@ function inboxJson(name: string): object {
   const { watched, repos, pending } = Inbox.peek(name);
   return {
     inbox: name,
-    prs: watched.map((w) => ({ pr: targetKey(w.target), since: w.addedAt })),
+    prs: watched.map((w) => ({ pr: targetKey(w.target), ...(w.kinds ? { kinds: w.kinds } : {}), since: w.addedAt })),
     repos: repos.map(({ target: t, addedAt }) => ({
       repo: `${t.owner}/${t.name}`,
       kinds: t.kinds,
@@ -184,6 +191,11 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const kinds = (opts.on ?? opts.kinds)?.split(",").map((k) => k.trim()).filter(Boolean) ?? [];
+  // With targets, --kinds is theirs: a whole repository's filter, or what
+  // a PR is watched for from now on (`*`: everything again). Without, it
+  // narrows this one run.
+  const prKinds = (opts.on ?? opts.kinds) === undefined ? undefined : kinds.includes("*") ? [] : kinds;
+  const runKinds = args.length ? [] : kinds;
   const interval = Math.max(parseDuration(opts.interval), 10_000);
   if (verb === "exec" && !command.length) throw new UsageError("exec needs a command after --");
   if (opts.format !== undefined && opts.format !== "text" && opts.format !== "json") throw new UsageError("--format is text or json");
@@ -283,15 +295,20 @@ async function main(argv: string[]): Promise<number> {
     // command line, and at most hourly when it's the current branch's.
     const tried = known?.subTriedAt ? Date.parse(known.subTriedAt) : 0;
     const throttled = !args.length && Date.now() - tried < RESUBSCRIBE_MS;
+    if (known && args.length && prKinds && prKinds.join(",") !== (known.kinds ?? []).join(",")) {
+      inbox.setKinds(key, prKinds);
+      log(`watching ${key} for ${describeKinds(prKinds)}`);
+    }
     if (known && (known.sub || !reachable || throttled)) continue;
     const sub = client && reachable ? await subscribe(client, inboxName, t, { log, githubToken: () => githubTokenFor(client.url) }) : null;
     if (known) {
       inbox.setSubscription(key, sub);
       continue;
     }
-    inbox.watch(key, t, sub);
+    const watchKinds = args.length ? prKinds ?? [] : [];
+    inbox.watch(key, t, sub, watchKinds);
     if (client && reachable && !sub) inbox.setSubscription(key, null);
-    log(`watching ${key} in inbox ${inboxName}${client && !sub ? ", polling GitHub from this machine" : ""}`);
+    log(`watching ${key} in inbox ${inboxName}${watchKinds.length ? ` for ${describeKinds(watchKinds)}` : ""}${client && !sub ? ", polling GitHub from this machine" : ""}`);
   }
 
   // Private repos' subscriptions need a fresh token now and then; long
@@ -322,11 +339,11 @@ async function main(argv: string[]): Promise<number> {
   try {
     switch (verb) {
       case "wait":
-        return await waitCommand(feed, { kinds, interval, timeout: parseDuration(opts.timeout), settle: parseDuration(opts.settle), output: opts.json ? "lines" : opts.format === "json" ? "object" : "text", inbox: inboxName });
+        return await waitCommand(feed, { kinds: runKinds, interval, timeout: parseDuration(opts.timeout), settle: parseDuration(opts.settle), output: opts.json ? "lines" : opts.format === "json" ? "object" : "text", inbox: inboxName });
       case "stream":
-        return await streamCommand(feed, { kinds, interval, json: opts.json });
+        return await streamCommand(feed, { kinds: runKinds, interval, json: opts.json });
       case "exec":
-        return await execCommand(feed, { kinds, interval, batch: opts.batch, settle: parseDuration(opts.settle), command });
+        return await execCommand(feed, { kinds: runKinds, interval, batch: opts.batch, settle: parseDuration(opts.settle), command });
     }
   } finally {
     clearInterval(renewTimer ?? undefined);
