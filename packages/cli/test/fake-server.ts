@@ -29,7 +29,9 @@ class FakeSocket {
     socket.on("error", () => {});
   }
 
-  send(msg: ServerMessage | string): void {
+  // A Buffer goes as a binary frame.
+  send(msg: ServerMessage | string | Buffer): void {
+    if (Buffer.isBuffer(msg)) return this.frame(0x2, msg);
     this.frame(0x1, Buffer.from(typeof msg === "string" ? msg : JSON.stringify(msg)));
   }
 
@@ -117,6 +119,17 @@ export class FakeServer {
   refreshAnswer: Record<string, unknown> = { error: "bad_refresh_token" };
   refreshLimited = false;
   readonly refreshed: string[] = [];
+  // Answer every HTTP request with this problem document (or text) instead,
+  // or with a 307 to this address.
+  problem: { status: number; body: Record<string, unknown> | string } | null = null;
+  redirectTo: string | null = null;
+  // Send `ready` with an acked that isn't a number, or follow every sound
+  // `ready` with a frame that isn't JSON, or answer every poll with this
+  // page instead (a string as it is, not JSON). Each hello's time is kept.
+  malformedReady = false;
+  garbageAfterReady = false;
+  readonly helloTimes: number[] = [];
+  malformedPage: unknown = undefined;
   private http: Server | null = null;
   private waiting = new Set<() => void>();
   private holding = false;
@@ -161,6 +174,38 @@ export class FakeServer {
     return event;
   }
 
+  // An event as a broken server might send it: a sound one with `fields`
+  // put over it.
+  injectMalformed(name: string, fields: Record<string, unknown>): void {
+    this.holding = true;
+    try {
+      Object.assign(this.inject(name), fields);
+    } finally {
+      this.holding = false;
+    }
+    this.deliver(name);
+  }
+
+  // Sends a new event to the inbox's sockets inside a message `wrap` makes
+  // of it, counting it as sent, as a server would with a sound message.
+  // What `wrap` returns goes as JSON, but a string or Buffer as it is.
+  injectWrapped(name: string, wrap: (events: WatchEvent[]) => unknown): WatchEvent {
+    this.holding = true;
+    let event: WatchEvent;
+    try {
+      event = this.inject(name, "comment.created");
+    } finally {
+      this.holding = false;
+    }
+    for (const s of this.sockets) {
+      if (s.inbox !== name || s.pos === null) continue;
+      const msg = wrap(this.inbox(name).events.filter((e) => e.seq > s.pos!));
+      s.send(typeof msg === "string" || Buffer.isBuffer(msg) ? msg : JSON.stringify(msg));
+      s.pos = event.seq;
+    }
+    return event;
+  }
+
   // An `inbox.gap`, as the server sends to a reader behind what it keeps:
   // about no repo, with the seq just before `resumedAt`.
   gap(name: string, missedAfter: number, resumedAt: number): void {
@@ -199,8 +244,10 @@ export class FakeServer {
     const msg = JSON.parse(text) as ClientMessage;
     const inbox = this.inbox(s.inbox);
     if (msg.type === "hello") {
+      this.helloTimes.push(Date.now());
       s.pos = msg.after ?? inbox.acked;
-      s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: inbox.acked });
+      s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
+      if (this.garbageAfterReady) s.send("{not json");
       this.sendFrom(s);
     } else if (msg.type === "ack") {
       inbox.acked = Math.max(inbox.acked, Math.min(msg.seq, inbox.head));
@@ -256,6 +303,15 @@ export class FakeServer {
       for await (const c of req) chunks.push(c as Buffer);
       return JSON.parse(Buffer.concat(chunks).toString()) as T;
     };
+    if (this.redirectTo) {
+      res.writeHead(307, { Location: this.redirectTo }).end();
+      return;
+    }
+    if (typeof this.problem?.body === "string") {
+      res.writeHead(this.problem.status, { "content-type": "application/json" }).end(this.problem.body);
+      return;
+    }
+    if (this.problem) return json(this.problem.status, this.problem.body);
     if (req.method === "POST" && url.pathname === "/v1/github/refresh") {
       this.refreshed.push((await readBody<{ refresh_token: string }>()).refresh_token);
       if (this.refreshLimited) res.setHeader("Retry-After", "60");
@@ -310,6 +366,11 @@ export class FakeServer {
       inbox.acked = Math.max(inbox.acked, Math.min(seq, inbox.head));
       return json(200, { name, head: inbox.head, acked: inbox.acked });
     }
+    if (route === "GET /events" && typeof this.malformedPage === "string") {
+      res.writeHead(200, { "content-type": "text/html" }).end(this.malformedPage);
+      return;
+    }
+    if (route === "GET /events" && this.malformedPage !== undefined) return json(200, this.malformedPage);
     if (route === "GET /events") {
       const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : inbox.acked;
       const wait = Number(url.searchParams.get("wait") ?? 0);

@@ -19,8 +19,9 @@ const BODY = "--jq .body";
 export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string, repoEnded = false): string {
   const groups = new Map<string, WatchEvent[]>();
   for (const e of events) {
-    const repo = e.repo ? word(e.repo.full_name) : e.kind.startsWith("inbox.") ? "inbox" : "other";
-    const key = e.repo && e.pr !== null ? `${repo}#${e.pr}` : repo;
+    // Every field is the server's to fill, sound or not.
+    const repo = e.repo ? word(e.repo.full_name) : typeof e.kind === "string" && e.kind.startsWith("inbox.") ? "inbox" : "other";
+    const key = e.repo && e.pr !== null ? `${repo}#${id(e.pr) ?? "?"}` : repo;
     groups.set(key, [...(groups.get(key) ?? []), e]);
   }
   const lines: string[] = [];
@@ -182,10 +183,29 @@ const MAX_LENGTH = 100;
 // bidirectional formatting characters.
 const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
 
-// A value made printable on one line, and cut to a sane length.
-export function clean(v: unknown): string {
+// A value made printable on one line, and cut to a sane length: `max`,
+// or PROSE_LENGTH for a sentence or two, such as why a server refused.
+export function clean(v: unknown, max = MAX_LENGTH): string {
   const s = String(v ?? "").replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim();
-  return s.length > MAX_LENGTH ? `${s.slice(0, MAX_LENGTH - 1)}…` : s;
+  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+}
+
+export const PROSE_LENGTH = 1000;
+
+// Text made safe to print as it is, line breaks and all: the last guard
+// on what the CLI logs, such as a stack trace whose message quotes an
+// answer it couldn't parse.
+export function printable(s: string): string {
+  return s.split("\n").map((line) => line.replace(UNPRINTABLE, " ")).join("\n");
+}
+
+// JSON for output, as JSON.stringify writes it but with the characters it
+// leaves raw that a terminal acts on (DEL, C1 controls, zero-width and
+// bidirectional formatting, line and paragraph separators) written as
+// \uXXXX. It parses to the same value. They can only be inside strings,
+// where an escape means the same.
+export function toJson(v: unknown): string {
+  return JSON.stringify(v).replace(/[\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 // A value that should be one word (a login, path, branch, state): bare

@@ -1,6 +1,8 @@
+import { join } from "node:path";
 import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
-import { type ServerConfig, checkServerUrl } from "./config.ts";
+import { type ServerConfig, checkServerUrl, configDir } from "./config.ts";
+import { clean, PROSE_LENGTH } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { githubUrl } from "./login.ts";
 import { anyKey, isPr, type RepoTarget, type Target } from "./targets.ts";
@@ -39,8 +41,35 @@ export class ServerError extends Error {
   }
 }
 
+// Why the server refused, from its problem document, made fit to print.
+export function refusal(problem: { detail?: unknown; title?: unknown }, code: string): string {
+  return clean(problem.detail ?? problem.title ?? code, PROSE_LENGTH);
+}
+
 // 401s that are about the GitHub token sent with a request, not the API key.
 const GITHUB_TOKEN_CODES = new Set(["github_token_required", "github_token_invalid"]);
+
+// Redirects are never followed on requests to the server, nor on the
+// device flow's to github.com: fetch would send the body again wherever
+// one points, even to plain http, and those bodies carry GitHub tokens
+// and the device code. Each of them passes this, and answers a redirect
+// with an error saying so (see redirect()). Local mode's GraphQL requests
+// to GitHub follow them: their body is only the query, and fetch drops
+// the Authorization header on a redirect to another origin, https to http
+// included.
+export const NO_REDIRECTS = { redirect: "manual" } as const;
+
+// What to do about a server that redirects: where its URL is set.
+export function checkServerUrlHint(): string {
+  return `check the server URL in $WATCHERONI_SERVER or ${join(configDir(), "config.json")}`;
+}
+
+// What to say about an answer that is a redirect, or null if it isn't.
+export function redirect(res: Response): string | null {
+  if (res.type !== "opaqueredirect" && (res.status < 300 || res.status > 399)) return null;
+  const to = res.headers.get("Location");
+  return `answered ${res.status} redirecting${to ? ` to ${JSON.stringify(clean(to, 200))}` : ""}, which watcheroni doesn't follow`;
+}
 
 const SUBPROTOCOL = "watcheroni.v1";
 const WAIT_SECONDS = 300;
@@ -72,27 +101,36 @@ export class ServerClient {
         },
         body: o.body === undefined ? undefined : JSON.stringify(o.body),
         signal: o.signal ? AbortSignal.any([o.signal, timeout]) : timeout,
+        ...NO_REDIRECTS,
       });
     } catch (e) {
       if (o.signal?.aborted) throw e;
       const cause = (e as Error & { cause?: Error }).cause;
       throw new Unreachable(`can't reach ${this.url}: ${cause?.message ?? (e as Error).message}`);
     }
+    // Not worth retrying: the server URL, or the server, needs fixing.
+    const moved = redirect(res);
+    if (moved) {
+      const detail = `${moved}; ${checkServerUrlHint()}`;
+      throw new ServerError(`${this.url}: ${method} ${path}: ${detail}`, res.status, "redirect", { detail });
+    }
     if (res.status === 204) return undefined as T;
     if (res.ok) return (await res.json()) as T;
     const problem = (await res.json().catch(() => ({}))) as { code?: string; title?: string; detail?: string };
     const code = problem.code ?? String(res.status);
+    // The problem's fields are the server's to choose, so they are cleaned
+    // before they get near a terminal.
     if (res.status === 401 && !GITHUB_TOKEN_CODES.has(code)) {
-      throw new LoginNeeded(`${this.url} rejected the API key (${code}); check WATCHERONI_API_KEY`);
+      throw new LoginNeeded(`${this.url} rejected the API key (${clean(code)}); check WATCHERONI_API_KEY`);
     }
     if (res.status >= 500 || res.status === 429) {
       const retryAfter = Number(res.headers.get("Retry-After"));
-      throw new Unreachable(`${this.url} answered ${res.status} (${code}${problem.title ? `: ${problem.title}` : ""})`, {
+      throw new Unreachable(`${this.url} answered ${res.status} (${clean(code)}${problem.title ? `: ${clean(problem.title, PROSE_LENGTH)}` : ""})`, {
         code,
         retryAfter: retryAfter > 0 ? retryAfter : null,
       });
     }
-    throw new ServerError(`${this.url}: ${method} ${path}: ${res.status} ${problem.detail ?? problem.title ?? code}`, res.status, code, problem);
+    throw new ServerError(`${this.url}: ${method} ${clean(path, PROSE_LENGTH)}: ${res.status} ${refusal(problem, code)}`, res.status, code, problem);
   }
 
   ensureInbox(name: string): Promise<{ head: number; acked: number }> {
@@ -163,7 +201,7 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
       } else if (e.code === "github_token_invalid") {
         o.log(`${client.url} didn't accept this machine's GitHub token for ${repo}; run \`watcheroni login\` again`);
       } else {
-        o.log(`${client.url} won't watch ${anyKey(target)}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
+        o.log(`${client.url} won't watch ${anyKey(target)}: ${refusal(e.problem, e.code)}`);
       }
       return null;
     }
@@ -194,26 +232,29 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
   }
   const due = subs.filter((s) => s.repo.private && s.verified_until && Date.parse(s.verified_until) - now < RENEW_BEFORE_MS);
   if (!due.length) return;
+  // The repos' names are as the server gave them. GitHub's are at most
+  // 140 characters.
+  const name = (s: SubscriptionInfo) => clean(s.repo.full_name, 140);
   let token: string | null | undefined;
   try {
     token = await o.githubToken?.();
   } catch (e) {
     if (!(e instanceof Unreachable)) throw e;
-    o.log(`couldn't renew the server's watch on ${due.map((s) => s.repo.full_name).join(", ")}: ${e.message}`);
+    o.log(`couldn't renew the server's watch on ${due.map(name).join(", ")}: ${e.message}`);
     return;
   }
   if (!token) {
-    o.log(`the server needs a fresh GitHub token to keep watching ${due.map((s) => s.repo.full_name).join(", ")}; run \`watcheroni login\``);
+    o.log(`the server needs a fresh GitHub token to keep watching ${due.map(name).join(", ")}; run \`watcheroni login\``);
     return;
   }
   for (const s of due) {
     try {
-      await client.request("POST", `/v1/inboxes/${inbox}/subscriptions/${s.id}/verify`, { headers: { "X-GitHub-Token": token } });
+      await client.request("POST", `/v1/inboxes/${inbox}/subscriptions/${encodeURIComponent(s.id)}/verify`, { headers: { "X-GitHub-Token": token } });
     } catch (e) {
       if (e instanceof ServerError) {
         o.log(e.code === "repo_access_denied"
-          ? `you can no longer read ${s.repo.full_name}, so the server has stopped watching it`
-          : `couldn't renew the server's watch on ${s.repo.full_name}: ${e.problem.detail ?? e.problem.title ?? e.code}`);
+          ? `you can no longer read ${name(s)}, so the server has stopped watching it`
+          : `couldn't renew the server's watch on ${name(s)}: ${refusal(e.problem, e.code)}`);
         continue;
       }
       if (e instanceof Unreachable || e instanceof LoginNeeded) return;
@@ -221,6 +262,42 @@ export async function renewSubscriptions(client: ServerClient, inbox: string, o:
     }
   }
 }
+
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const isSeq = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+
+// Whether an event from the server has the shape the CLI reads: fields
+// it reads as text or numbers are text or numbers, and what it looks
+// inside is an object. The fields that may be null may also be missing.
+// New kinds and new fields always pass.
+function wellFormed(e: unknown): e is WatchEvent {
+  if (!isObject(e)) return false;
+  const { id, kind, seq, sub, data, links, repo, pr, actor } = e;
+  return typeof id === "string" && typeof kind === "string" && isSeq(seq)
+    && (sub == null || typeof sub === "string")
+    && isObject(data) && isObject(links)
+    && (repo == null || (isObject(repo) && typeof repo.full_name === "string"))
+    && (pr == null || typeof pr === "number")
+    && (actor == null || isObject(actor));
+}
+
+// What can be told of a malformed event, cleaned: its kind, repo, PR,
+// seq and ID, where they're the right type.
+function describeMalformed(e: unknown): string {
+  const f = isObject(e) ? e : {};
+  const repo = isObject(f.repo) && typeof f.repo.full_name === "string" ? clean(f.repo.full_name, 140) : null;
+  const pr = typeof f.pr === "number" && Number.isSafeInteger(f.pr) ? f.pr : null;
+  return [
+    typeof f.kind === "string" ? `kind ${JSON.stringify(clean(f.kind))}` : null,
+    repo && (pr === null ? repo : `${repo}#${pr}`),
+    isSeq(f.seq) ? `seq ${f.seq}` : null,
+    typeof f.id === "string" ? `id ${JSON.stringify(clean(f.id))}` : null,
+  ].filter(Boolean).join(", ");
+}
+
+// What to do about something from the server that isn't as the protocol
+// has it.
+const REPORT = "if this keeps happening, report it to the server's operator";
 
 export interface ReaderOptions {
   log: (msg: string) => void;
@@ -245,6 +322,8 @@ export class ServerReader {
 
   private pos: number | null = null;
   private queue: WatchEvent[] = [];
+  // Malformed events not yet acknowledged, by seq (see add()).
+  private skipped: number[] = [];
   private seen = new Set<string>();
   private fresh = false;
   private waiters = new Set<() => void>();
@@ -297,9 +376,13 @@ export class ServerReader {
   }
 
   // Moves the server's acknowledged position, over the socket if there is
-  // one, else over HTTP.
+  // one, else over HTTP, past any skipped events (see add()) that nothing
+  // unread is now before.
   ack(seq: number): void {
     this.queue = this.queue.filter((e) => e.seq > seq);
+    const first = Math.min(...this.queue.map((e) => e.seq));
+    seq = Math.max(seq, ...this.skipped.filter((s) => s < first));
+    this.skipped = this.skipped.filter((s) => s > seq);
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "ack", seq }));
       return;
@@ -345,6 +428,17 @@ export class ServerReader {
             this.mode = "longpoll";
             continue;
           }
+          // Closed for a malformed message: reconnected with backoff that
+          // grows as for a server that's down, even after a sound ready,
+          // so a server that sends nothing else isn't asked every second.
+          // One that also sent events soundly starts the backoff again.
+          if (this.brokenBy) {
+            const what = this.brokenBy;
+            this.brokenBy = null;
+            if (this.readSince) delay = this.o.backoff[0];
+            this.readSince = false;
+            throw new Unreachable(`${this.client.url} sent a malformed ${what}`);
+          }
           if (code === 4001) throw new LoginNeeded(`${this.client.url} rejected the API key (${reason || "4001"}); check WATCHERONI_API_KEY`);
           if (code === 4004) throw new ServerError(`inbox ${this.name} was deleted on ${this.client.url}`, 404, "not_found");
           if (code === 4029) {
@@ -363,6 +457,12 @@ export class ServerReader {
           } catch (e) {
             // Too many long polls already waiting on this account: still
             // connected, but ask again later rather than at once.
+            // An answer that isn't JSON at all (a captive portal's page,
+            // say) is a malformed page, tried again.
+            if (e instanceof SyntaxError) {
+              this.malformed("page of events");
+              throw new Unreachable(`${this.client.url} sent a malformed page of events`);
+            }
             if (!(e instanceof Unreachable && e.code === "too_many_connections")) throw e;
             const seconds = e.retryAfter ?? CROWDED_RETRY_SECONDS;
             if (!this.crowded) this.o.log(`${this.client.url} has too many long polls waiting for this account; asking every ${seconds} s instead`);
@@ -371,6 +471,11 @@ export class ServerReader {
             continue;
           }
           this.crowded = false;
+          // A page that can't be read is taken like a 5xx (see malformed()).
+          if (!isObject(page) || !Array.isArray(page.events) || !isSeq(page.next) || (this.pos === null && !isSeq(page.acked))) {
+            this.malformed("page of events");
+            throw new Unreachable(`${this.client.url} sent a malformed page of events`);
+          }
           this.markConnected();
           if (this.pos === null) this.pos = page.acked;
           this.add(page.events);
@@ -399,6 +504,11 @@ export class ServerReader {
 
   private wasConnected = false;
   private outage = false;
+  private readonly warned = new Set<string>();
+  // What the last WebSocket was closed for, if it was malformed, and
+  // whether it brought a sound events message since its ready.
+  private brokenBy: string | null = null;
+  private readSince = false;
   private crowded = false;
 
   // Sleeps for `ms`, or until close().
@@ -420,6 +530,17 @@ export class ServerReader {
     this.connected = true;
     this.wasConnected = true;
     this.settleFirst(true);
+  }
+
+  // Something from the server that isn't as the protocol has it, taken
+  // like a lost connection: tried again with backoff, the position
+  // unmoved. Warned of once for each `what`; that warning stands for the
+  // outage's own, which is otherwise logged when the error is caught.
+  private malformed(what: string): void {
+    if (this.warned.has(what)) return;
+    this.warned.add(what);
+    this.o.log(`${this.client.url} sent a malformed ${what}: it isn't shaped as the protocol says; ${REPORT}`);
+    this.outage = true;
   }
 
   private settleFirst(connected: boolean): void {
@@ -455,21 +576,40 @@ export class ServerReader {
       });
       ws.addEventListener("message", (m) => {
         heard = Date.now();
-        if (m.data === "pong" || typeof m.data !== "string") return;
+        if (m.data === "pong") return;
+        // A message that isn't as the protocol has it, binary or not even
+        // JSON included, may have carried events, which the server now
+        // counts as sent on this connection. So it's closed, and the next
+        // one's hello asks again from the last event read (see run()).
+        // One of a type this version doesn't know is ignored; one with no
+        // type at all is malformed.
+        const broken = (what: string) => {
+          this.malformed(what);
+          this.brokenBy = what;
+          ws.close(4000, `malformed ${what}`);
+        };
+        if (typeof m.data !== "string") return broken("binary message");
         let msg: ServerMessage;
         try {
           msg = JSON.parse(m.data) as ServerMessage;
         } catch {
-          return;
+          return broken("message");
         }
-        if (msg.type === "ready") {
+        if (!isObject(msg) || typeof msg.type !== "string") {
+          broken("message");
+        } else if (msg.type === "ready") {
+          if (!isSeq(msg.acked)) return broken("ready message");
           this.ws = ws;
+          this.readSince = false;
           if (this.pos === null) this.pos = msg.acked;
           this.markConnected();
         } else if (msg.type === "events") {
+          if (!Array.isArray(msg.events)) return broken("events message");
           this.add(msg.events);
+          this.readSince = true;
         } else if (msg.type === "error") {
-          this.o.log(`${this.client.url}: ${msg.code}${msg.detail ? `: ${msg.detail}` : ""}`);
+          // The server's own words, cleaned like the rest.
+          this.o.log(`${this.client.url}: ${clean(msg.code)}${msg.detail ? `: ${clean(msg.detail, PROSE_LENGTH)}` : ""}`);
         }
       });
       const onAbort = () => {
@@ -480,7 +620,8 @@ export class ServerReader {
         clearInterval(pinger);
         this.abort.signal.removeEventListener("abort", onAbort);
         if (this.ws === ws) this.ws = null;
-        resolve({ opened, code, reason });
+        // The reason is the server's to choose, like the text it sends.
+        resolve({ opened, code, reason: clean(reason) });
       };
       ws.addEventListener("close", (ev) => finish(ev.code, ev.reason));
       // An error is followed by close, except on Node 22, whose WebSocket
@@ -494,21 +635,49 @@ export class ServerReader {
   }
 
   // Keeps new events, dropping ones already seen (delivery is at least once).
+  // An event that isn't the shape PROTOCOL.md gives can throw where it's
+  // read (a kind that isn't text, data that isn't an object), and, never
+  // acknowledged, would come back on every run. It's dropped with a
+  // warning instead, and acknowledged once nothing before it is waiting.
+  // One without a sound seq can't be placed or acknowledged;
+  // acknowledging a later event moves past it. A missing nullable field
+  // is kept as null.
   private add(events: WatchEvent[]): void {
     let added = false;
-    for (const e of events) {
+    for (const e of events as unknown[]) {
+      const sound = wellFormed(e);
       // An `inbox.gap` for a position ahead of the inbox's `head` takes it
-      // back (PROTOCOL.md, "Gaps"); what's queued past it is from before.
-      const back = e.kind === "inbox.gap" && this.pos !== null && e.seq < this.pos && e.data.missed_after === this.pos;
-      if (back) this.queue = this.queue.filter((q) => q.seq < e.seq);
-      else if (this.pos !== null && e.seq <= this.pos) continue;
+      // back (PROTOCOL.md, "Gaps"); what's queued or skipped past it is
+      // from before. This comes before anything at or below the position
+      // is passed over, since the gap itself is below it.
+      const back = sound && e.kind === "inbox.gap" && this.pos !== null && e.seq < this.pos && e.data.missed_after === this.pos;
+      if (back) {
+        this.queue = this.queue.filter((q) => q.seq < e.seq);
+        this.skipped = this.skipped.filter((s) => s < e.seq);
+      }
+      if (!sound) {
+        const seq = isObject(e) ? e.seq : undefined;
+        if (isSeq(seq)) {
+          if (this.pos !== null && seq <= this.pos) continue;
+          this.pos = seq;
+          this.skipped.push(seq);
+        }
+        const what = describeMalformed(e);
+        this.o.log(`dropped a malformed event from ${this.client.url}${what ? ` (${what})` : ""}: it isn't shaped as the protocol says${isSeq(seq) ? ", so it's acknowledged unshown" : ""}; ${REPORT}`);
+        continue;
+      }
+      if (!back && this.pos !== null && e.seq <= this.pos) continue;
       this.pos = e.seq;
       if (this.seen.has(e.id)) continue;
       this.seen.add(e.id);
-      this.queue.push(e);
+      this.queue.push({ ...e, sub: e.sub ?? null, actor: e.actor ?? null, repo: e.repo ?? null, pr: e.pr ?? null });
       added = true;
     }
     if (this.seen.size > 2000) this.seen = new Set([...this.seen].slice(-1000));
+    // Skipped ones with nothing unread before them are acknowledged now.
+    const first = Math.min(...this.queue.map((e) => e.seq));
+    const due = this.skipped.filter((seq) => seq < first);
+    if (due.length) this.ack(Math.max(...due));
     if (added) {
       this.fresh = true;
       this.wake();

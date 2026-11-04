@@ -643,6 +643,128 @@ describe("ls --all", () => {
   });
 });
 
+describe("what the server says", () => {
+  const NASTY = "\x1b[31mred\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\rover\u009b2J\x00end";
+  // Anything but the line breaks between lines.
+  const CONTROLS = /[\x00-\x09\x0b-\x1f\x7f-\x9f]/;
+
+  it("never reaches the terminal raw", async () => {
+    fake.problem = { status: 422, body: { status: 422, code: "nope", title: NASTY, detail: NASTY } };
+    const refused = cli(["wait", "--settle", "0"]);
+    expect(await refused.code).toBe(1);
+    expect(refused.stderr()).toMatch(/: 422 \[31mred .* end\n$/);
+    expect(refused.stderr()).not.toMatch(CONTROLS);
+
+    // Not even when it's only quoted, by an error the CLI didn't expect.
+    fake.problem = { status: 200, body: `${NASTY}{` };
+    const garbled = cli(["wait", "--settle", "0"]);
+    expect(await garbled.code).toBe(1);
+    expect(garbled.stderr()).toMatch(/JSON/);
+    expect(garbled.stderr()).not.toMatch(CONTROLS);
+  });
+
+  // Anything but line breaks, as CONTROLS, and formatting characters too.
+  const RAW = /[\x00-\x09\x0b-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+  const hostile = `${NASTY}\u200b\u2028\u202e\ufeff`;
+  // JSON output carries `hostile` escaped, not lost.
+  const escaped = (out: string) => {
+    expect(out).not.toMatch(RAW);
+    expect(out).toContain(String.raw`\u001b[31mred`);
+    expect(out).toContain(String.raw`\u009b2J\u0000end\u200b\u2028\u202e\ufeff`);
+  };
+  const injectHostile = (id: string, pr = 7) => fake.inject("box", hostile, { state: hostile, path: hostile, name: hostile }, id, null, pr);
+
+  it("never reaches stdout raw from an event, as text or JSON", async () => {
+    // A PR number that isn't a whole number is shown as "?".
+    injectHostile(hostile, 7.5);
+    const text = cli(["wait", "--settle", "0"]);
+    expect(await text.code).toBe(0);
+    expect(text.stdout()).toMatch(/^octo\/widgets#\?: 1 new event\n/);
+    expect(text.stdout()).not.toMatch(RAW);
+
+    for (const args of [["wait", "--settle", "0", "--json"], ["wait", "--settle", "0", "--format", "json"]]) {
+      injectHostile(`${hostile}${args.length}`);
+      const json = cli(args);
+      expect(await json.code).toBe(0);
+      escaped(json.stdout());
+      const first = JSON.parse(json.stdout().split("\n")[0]) as { kind?: string; events?: { kind: string }[] };
+      expect(first.kind ?? first.events![0].kind).toBe(hostile);
+    }
+  });
+
+  it("can't break wait with a malformed event", async () => {
+    fake.injectMalformed("box", { kind: 42, data: null });
+    fake.inject("box", "comment.created", { comment_id: 9 });
+    const run = cli(["wait", "--settle", "0", "--kinds", "comment.created"]);
+    expect(await run.code).toBe(0);
+    expect(run.stdout()).toMatch(/^octo\/widgets#7: 1 new event\n- comment.created\n/);
+    expect(run.stderr()).toMatch(
+      /^watcheroni: dropped a malformed event from \S+ \(octo\/widgets#7, seq 1, id "fake:[^"]*"\): it isn't shaped as the protocol says, so it's acknowledged unshown; if this keeps happening, report it to the server's operator\n$/,
+    );
+    expect(fake.inbox("box").acked).toBe(2);
+  });
+
+  it("never reaches stdout raw from stream --json", async () => {
+    injectHostile("e1");
+    const run = cli(["stream", "--json"]);
+    await until(() => fake.inbox("box").acked === 1);
+    run.kill();
+    await run.code;
+    escaped(run.stdout());
+    expect((JSON.parse(run.stdout()) as { data: { state: string } }).data.state).toBe(hostile);
+  });
+
+  it("never reaches exec's command raw on its stdin, one by one or in a batch", async () => {
+    for (const batch of [false, true]) {
+      const got = join(cwd, `stdin-${batch}`);
+      injectHostile(`e-${batch}`);
+      const run = cli(["exec", ...(batch ? ["--batch", "--settle", "0"] : []), "--", "sh", "-c", `cat > ${got}`]);
+      await until(() => fake.inbox("box").acked === (batch ? 2 : 1));
+      run.kill();
+      await run.code;
+      const stdin = readFileSync(got, "utf8");
+      escaped(stdin);
+      const parsed = JSON.parse(stdin) as { kind: string } | { kind: string }[];
+      expect((Array.isArray(parsed) ? parsed[0] : parsed).kind).toBe(hostile);
+    }
+  });
+
+  it("never reaches stdout raw from ls --json, even from an inbox file", async () => {
+    const dir = join(env.WATCHERONI_STATE_DIR, "inboxes");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "box.json"), JSON.stringify({
+      version: 1, seq: 0, acked: 0, events: [], seen: [],
+      watched: { "octo/widgets#7": { target: { owner: "octo", name: "widgets", number: 7 }, addedAt: hostile, snapshot: null } },
+    }));
+    for (const args of [["ls", "--json"], ["ls", "--all", "--json"]]) {
+      const run = cli(args, { WATCHERONI_SERVER: "" });
+      expect(await run.code).toBe(0);
+      escaped(run.stdout());
+      const out = JSON.parse(run.stdout()) as { prs: { since: string }[] } | { prs: { since: string }[] }[];
+      expect((Array.isArray(out) ? out[0] : out).prs[0].since).toBe(hostile);
+    }
+  });
+
+  it("gives exec's command clean variables, and logs its failure cleanly", async () => {
+    const log = join(cwd, "ran");
+    fake.inject("box", "a\x1b[31m  b", {}, "e\x00vil");
+    const script = `printf '%s|%s\\n' "$WATCHERONI_EVENT_ID" "$WATCHERONI_KIND" >> ${log}; exit 1`;
+    const run = cli(["exec", "--", "sh", "-c", script]);
+    await until(() => run.stderr().includes("command exited 1"));
+    run.kill();
+    await run.code;
+    expect(readFileSync(log, "utf8").split("\n")[0]).toBe("e vil|a [31m b");
+    expect(run.stderr()).toContain("watcheroni: command exited 1 for a [31m b (e vil); it will be offered again\n");
+  });
+
+  it("can't redirect the CLI elsewhere", async () => {
+    fake.redirectTo = "http://evil.test/";
+    const run = cli(["wait", "--settle", "0"]);
+    expect(await run.code).toBe(1);
+    expect(run.stderr()).toBe(`watcheroni: ${fake.url}: PUT /v1/inboxes/box: answered 307 redirecting to "http://evil.test/", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or ${join(env.WATCHERONI_CONFIG_DIR, "config.json")}\n`);
+  });
+});
+
 describe("ls --json", () => {
   it("prints the inbox as one JSON object", async () => {
     const run = cli(["ls", "--json"], { WATCHERONI_SERVER: "" });

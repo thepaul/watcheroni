@@ -4,7 +4,7 @@ import type { WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { loadServer } from "./config.ts";
 import { Feed } from "./feed.ts";
-import { command, formatText, footer } from "./format.ts";
+import { clean, command, formatText, footer, PROSE_LENGTH, printable, toJson } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
 import { Inbox, InboxBusy } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
@@ -67,7 +67,11 @@ machine with your gh login (or GH_TOKEN). That token is never sent to the
 server.
 `;
 
-const log = (msg: string) => process.stderr.write(`watcheroni: ${msg}\n`);
+// Text from the server or GitHub is cleaned where a message is made; this
+// catches any that isn't, such as an error quoting an answer. Text output
+// goes through `say` for the same reason, and JSON through toJson.
+const log = (msg: string) => process.stderr.write(`watcheroni: ${printable(msg)}\n`);
+const say = (text: string) => process.stdout.write(printable(text));
 
 const describeKinds = (kinds: string[]) => (kinds.length ? kinds.join(",") : "every kind");
 
@@ -154,7 +158,7 @@ async function main(argv: string[]): Promise<number> {
   if (verb === "ls") {
     if (opts.json) {
       if (!opts.all) {
-        process.stdout.write(`${JSON.stringify(inboxJson(inboxName))}\n`);
+        process.stdout.write(`${toJson(inboxJson(inboxName))}\n`);
         return 0;
       }
       let unreadable = 0;
@@ -166,11 +170,11 @@ async function main(argv: string[]): Promise<number> {
           return { inbox: name, error: e instanceof Error ? e.message : String(e) };
         }
       });
-      process.stdout.write(`${JSON.stringify(all)}\n`);
+      process.stdout.write(`${toJson(all)}\n`);
       return unreadable ? EXIT.error : 0;
     }
     if (!opts.all) {
-      process.stdout.write(describeInbox(inboxName, `Inbox ${inboxName} is watching nothing.`).map((l) => `${l}\n`).join(""));
+      say(describeInbox(inboxName, `Inbox ${inboxName} is watching nothing.`).map((l) => `${l}\n`).join(""));
       return 0;
     }
     const names = Inbox.names();
@@ -183,9 +187,9 @@ async function main(argv: string[]): Promise<number> {
         lines = describeInbox(name, "watching nothing.");
       } catch (e) {
         unreadable++;
-        lines = [`can't be read: ${e instanceof Error ? e.message : String(e)}`];
+        lines = [`can't be read: ${clean(e instanceof Error ? e.message : String(e), PROSE_LENGTH)}`];
       }
-      process.stdout.write(`${name}:\n${lines.map((l) => `  ${l}\n`).join("")}`);
+      say(`${name}:\n${lines.map((l) => `  ${l}\n`).join("")}`);
     }
     return unreadable ? EXIT.error : 0;
   }
@@ -378,7 +382,7 @@ async function waitCommand(
   const deadline = Date.now() + o.timeout;
   // --json: a line per event, then one saying how the wait ended.
   const lines = (events: WatchEvent[], result: "events" | "timeout" | "ended", watching: string[]) =>
-    [...events.map(withCommand), { result, watching }].map((v) => `${JSON.stringify(v)}\n`).join("");
+    [...events.map(withCommand), { result, watching }].map((v) => `${toJson(v)}\n`).join("");
   // A server inbox still being read with no PR known to be watched.
   const reading = () => (feed.ended() ? undefined : o.inbox);
   // Events left from before (a killed wait, say) come out first.
@@ -396,23 +400,23 @@ async function waitCommand(
       const still = feed.watching();
       const ended = feed.ended();
       process.stdout.write(o.output === "lines" ? lines(events, ended ? "ended" : "events", still)
-        : o.output === "object" ? `${JSON.stringify({ events, watching: still })}\n`
-        : `${formatText(events, still, reading(), feed.repoEnded)}\n`);
+        : o.output === "object" ? `${toJson({ events, watching: still })}\n`
+        : printable(`${formatText(events, still, reading(), feed.repoEnded)}\n`));
       feed.ack(items);
       return ended ? EXIT.ended : EXIT.events;
     }
     if (feed.ended()) {
       process.stdout.write(o.output === "lines" ? lines([], "ended", [])
-        : o.output === "object" ? `${JSON.stringify({ events: [], watching: [] })}\n`
-        : `${footer([], undefined, feed.repoEnded)}\n`);
+        : o.output === "object" ? `${toJson({ events: [], watching: [] })}\n`
+        : printable(`${footer([], undefined, feed.repoEnded)}\n`));
       return EXIT.ended;
     }
     const left = deadline - Date.now();
     if (left <= 0) {
       const still = feed.watching();
       process.stdout.write(o.output === "lines" ? lines([], "timeout", still)
-        : o.output === "object" ? `${JSON.stringify({ events: [], watching: still, timeout: true })}\n`
-        : `No new events. ${footer(still, reading())}\n`);
+        : o.output === "object" ? `${toJson({ events: [], watching: still, timeout: true })}\n`
+        : printable(`No new events. ${footer(still, reading())}\n`));
       return EXIT.timeout;
     }
     await feed.more(Math.min(o.interval, left));
@@ -426,7 +430,7 @@ const withCommand = (e: WatchEvent) => ({ ...e, command: command(e) });
 async function streamCommand(feed: Feed, o: { kinds: string[]; interval: number; json: boolean }): Promise<number> {
   for (;;) {
     for (const item of feed.wanted(o.kinds)) {
-      process.stdout.write(`${JSON.stringify(o.json ? withCommand(item.event) : item.event)}\n`);
+      process.stdout.write(`${toJson(o.json ? withCommand(item.event) : item.event)}\n`);
       feed.ack([item]);
     }
     if (feed.ended()) return EXIT.ended;
@@ -444,23 +448,26 @@ async function execCommand(
     if (items.length && o.batch) {
       if (o.settle > 0) await feed.settle(o.settle);
       const batch = feed.wanted(o.kinds);
-      const code = await run(o.command, JSON.stringify(batch.map((i) => i.event)), { WATCHERONI_COUNT: String(batch.length) });
+      const code = await run(o.command, toJson(batch.map((i) => i.event)), { WATCHERONI_COUNT: String(batch.length) });
       if (code === 0) feed.ack(batch);
       else log(`command exited ${code}; the ${batch.length} event(s) will be offered again`);
     } else {
       for (const item of items) {
         const e = item.event;
-        const code = await run(o.command, JSON.stringify(e), {
-          WATCHERONI_KIND: e.kind,
-          WATCHERONI_REPO: e.repo?.full_name ?? "",
-          WATCHERONI_PR: e.pr === null ? "" : String(e.pr),
-          WATCHERONI_URL: e.links.html ?? "",
-          WATCHERONI_EVENT_ID: e.id,
+        // The server fills these. A NUL would make spawn throw, every time
+        // the event is offered, and no sound value holds a control.
+        const env = (v: unknown) => clean(v, Infinity);
+        const code = await run(o.command, toJson(e), {
+          WATCHERONI_KIND: env(e.kind),
+          WATCHERONI_REPO: env(e.repo?.full_name),
+          WATCHERONI_PR: e.pr === null ? "" : env(e.pr),
+          WATCHERONI_URL: env(e.links.html),
+          WATCHERONI_EVENT_ID: env(e.id),
         });
         if (code !== 0) {
           // Stop here so events stay in order; this one is offered again
           // after the next poll.
-          log(`command exited ${code} for ${e.kind} (${e.id}); it will be offered again`);
+          log(`command exited ${code} for ${clean(e.kind)} (${clean(e.id)}); it will be offered again`);
           break;
         }
         feed.ack([item]);

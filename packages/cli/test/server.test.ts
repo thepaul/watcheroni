@@ -1,8 +1,8 @@
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { WatchEvent } from "@watcheroni/protocol";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
 import { formatText } from "../src/format.ts";
 import { LoginNeeded } from "../src/github.ts";
@@ -104,6 +104,27 @@ describe("server reader", () => {
     send(event(0, "inbox.gap", { missed_after: 3, resumed_at: 1 }), event(2, "y"));
     await until(() => r.pending().length === 3);
     expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
+  });
+
+  it("forgets malformed events skipped past an inbox.gap that moves it back", async () => {
+    const r = reader();
+    await r.start();
+    fake.inject("box", "a");
+    fake.injectMalformed("box", { kind: 42 });
+    await until(() => r.pending().length === 1 && messages.length === 1);
+    // The skipped seq 2 was from the inbox's earlier life: acknowledging
+    // what comes after the gap mustn't acknowledge it.
+    const gap: WatchEvent = {
+      v: 1, seq: 0, id: "gap", sub: null, kind: "inbox.gap", at: "t", received_at: "t", repo: null, pr: null, actor: null,
+      data: { missed_after: 2, resumed_at: 1 }, links: {},
+    };
+    for (const s of fake.sockets) s.send({ type: "events", events: [gap, { ...gap, seq: 1, id: "new-x", kind: "x", data: {} }] });
+    await until(() => r.pending().length === 2);
+    expect(r.pending().map((e) => e.seq)).toEqual([0, 1]);
+    r.ack(1);
+    await until(() => fake.inbox("box").acked === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.inbox("box").acked).toBe(1);
   });
 
   it("moves back to an inbox.gap for a position ahead of head when long-polling too", async () => {
@@ -511,5 +532,299 @@ describe("subscribing on the server", () => {
     feed.wanted([]);
     expect(inbox.watched().map((w) => targetKey(w.target))).toEqual(["octo/secret#3"]);
     inbox.close();
+  });
+});
+
+describe("a malformed event", () => {
+  const shapes: Record<string, unknown>[] = [
+    { kind: 42 }, { kind: null }, { id: null }, { id: 7 }, { data: null }, { data: [] }, { data: "x" },
+    { repo: "octo/widgets" }, { repo: { id: 1, full_name: 1 } }, { pr: "7" }, { links: null }, { sub: 5 }, { actor: "x" },
+  ];
+
+  for (const longPoll of [false, true]) {
+    it(`is skipped with a warning and acknowledged, and later ones still come, ${longPoll ? "long-polling" : "over a WebSocket"}`, async () => {
+      fake.refuseSockets = longPoll;
+      const r = reader();
+      await r.start();
+      messages.length = 0;
+      for (const [i, shape] of shapes.entries()) {
+        // A fresh seq, so a bad one in `shape` replaces a sound one.
+        const seq = fake.inbox("box").head + 1;
+        fake.injectMalformed("box", { id: "\x1b[31mbad", kind: "check.failed", ...shape });
+        await until(() => fake.inbox("box").acked === seq);
+        // What's sound of it is named.
+        const parts = [
+          "kind" in shape ? null : `kind "check.failed"`,
+          "repo" in shape ? null : "pr" in shape ? "octo/widgets" : "octo/widgets#7",
+          `seq ${seq}`,
+          "id" in shape ? null : `id "[31mbad"`,
+        ].filter(Boolean).join(", ");
+        expect(messages[i]).toBe(
+          `dropped a malformed event from ${fake.url} (${parts}): it isn't shaped as the protocol says, so it's acknowledged unshown; if this keeps happening, report it to the server's operator`,
+        );
+        const good = fake.inject("box", "comment.created");
+        await until(() => r.pending().length === 1);
+        expect(r.pending()[0].id).toBe(good.id);
+        r.ack(good.seq);
+        await until(() => fake.inbox("box").acked === good.seq);
+      }
+      expect(messages).toHaveLength(shapes.length);
+    });
+  }
+
+  it("waits for what comes before it to be read, and can't be placed without a sound seq", async () => {
+    const r = reader();
+    await r.start();
+    const first = fake.inject("box", "comment.created");
+    fake.injectMalformed("box", { kind: 42 });
+    await until(() => messages.length === 1 && r.pending().length === 1);
+    expect(fake.inbox("box").acked).toBe(0);
+    // Reading the first acknowledges the skipped one too.
+    r.ack(first.seq);
+    await until(() => fake.inbox("box").acked === 2);
+
+    fake.injectMalformed("box", { seq: 2.5 });
+    await until(() => messages.length === 2);
+    expect(messages[1]).toMatch(/ \(kind "debug\.ping", octo\/widgets#7, id "fake:[^"]*"\): it isn't shaped as the protocol says; if this keeps/);
+    const next = fake.inject("box", "comment.created");
+    await until(() => r.pending().length === 1);
+    r.ack(next.seq);
+    await until(() => fake.inbox("box").acked === next.seq);
+  });
+
+  it("is acknowledged only with the last event before it", async () => {
+    fake.inbox("box").head = fake.inbox("box").acked = 4;
+    const r = reader();
+    await r.start();
+    fake.inject("box", "comment.created");
+    fake.inject("box", "comment.created");
+    fake.injectMalformed("box", { kind: 42 });
+    await until(() => r.pending().length === 2 && messages.length === 1);
+    r.ack(5);
+    await until(() => fake.inbox("box").acked === 5);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.inbox("box").acked).toBe(5);
+    r.ack(6);
+    await until(() => fake.inbox("box").acked === 7);
+  });
+
+  it("isn't one for a missing nullable field, or a seq of 0", async () => {
+    const r = reader();
+    await r.start();
+    // Before anything this reader reads, so it's passed over quietly as
+    // already acknowledged, not warned of.
+    fake.injectMalformed("box", { seq: 0 });
+    fake.injectMalformed("box", { sub: undefined, actor: undefined, repo: undefined, pr: undefined });
+    await until(() => r.pending().length === 1);
+    expect(r.pending()[0]).toMatchObject({ seq: 2, sub: null, actor: null, repo: null, pr: null });
+    expect(messages).toEqual([]);
+  });
+});
+
+describe("a malformed message or page", () => {
+  const warning = (what: string) => `${fake.url} sent a malformed ${what}: it isn't shaped as the protocol says; if this keeps happening, report it to the server's operator`;
+
+  const wrappers: [label: string, what: string, wrap: (events: WatchEvent[]) => unknown][] = [
+    ["null events", "events message", () => ({ type: "events", events: null })],
+    ["events in an object", "events message", (events) => ({ type: "events", events: { 0: events[0] } })],
+    ["a bare list", "message", (events) => events],
+    ["null", "message", () => null],
+    ["text that isn't JSON", "message", (events) => `{"type":"events","events":${JSON.stringify(events)}`],
+    // Sound events as JSON, but in a binary frame, which isn't read.
+    ["a binary frame", "binary message", (events) => Buffer.from(JSON.stringify({ type: "events", events }))],
+    ["no type", "message", (events) => ({ events })],
+    ["a type that isn't text", "message", (events) => ({ type: 1, events })],
+  ];
+  for (const [label, what, wrap] of wrappers) {
+    it(`closes a WebSocket that sent a malformed ${what} (${label}), and reads its events again`, async () => {
+      const r = reader();
+      await r.start();
+      const lost = fake.injectWrapped("box", wrap);
+      await until(() => r.pending().length === 1);
+      expect(r.pending()[0].id).toBe(lost.id);
+      expect(messages).toEqual([warning(what), `reconnected to ${fake.url}`]);
+      expect(fake.messages.filter((m) => m.includes("hello"))).toEqual([JSON.stringify({ type: "hello" }), JSON.stringify({ type: "hello", after: 0 })]);
+    });
+  }
+
+  it("ignores a message of a type it doesn't know", async () => {
+    const r = reader();
+    await r.start();
+    for (const s of fake.sockets) s.send(JSON.stringify({ type: "news", events: null }));
+    const good = fake.inject("box", "comment.created");
+    await until(() => r.pending().length === 1);
+    expect(r.pending()[0].id).toBe(good.id);
+    expect(messages).toEqual([]);
+    expect(fake.helloTimes).toHaveLength(1);
+  });
+
+  it("starts the backoff again after a malformed message from a server that also sends events soundly", async () => {
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 2000] });
+    readers.push(r);
+    await r.start();
+    for (let i = 1; i <= 4; i++) {
+      const sent = Date.now();
+      fake.injectWrapped("box", (events) => `{${JSON.stringify(events)}`);
+      await until(() => fake.helloTimes.length === i + 1 && r.pending().length === 2 * i - 1);
+      // 10-20 ms each time; doubling, the fourth would be 80-160 ms.
+      expect(fake.helloTimes[i] - sent).toBeLessThan(60);
+      fake.inject("box", "comment.created");
+      await until(() => r.pending().length === 2 * i);
+    }
+  });
+
+  it("backs off further each time a server keeps sending malformed messages", async () => {
+    fake.garbageAfterReady = true;
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 400] });
+    readers.push(r);
+    await r.start();
+    await until(() => fake.helloTimes.length >= 5);
+    const gaps = fake.helloTimes.slice(1).map((t, i) => t - fake.helloTimes[i]);
+    // 10-20 ms at first, then doubling: the fourth wait is 80-160 ms.
+    expect(gaps[0]).toBeLessThan(60);
+    expect(gaps[3]).toBeGreaterThanOrEqual(80);
+    expect(messages[0]).toBe(warning("message"));
+    for (const m of messages.slice(1)) expect([`reconnected to ${fake.url}`, `${fake.url} sent a malformed message; reconnecting`]).toContain(m);
+    expect(messages).toContain(`${fake.url} sent a malformed message; reconnecting`);
+  });
+
+  it("says so each time a page goes bad mid-run, warning in full only once", async () => {
+    fake.refuseSockets = true;
+    const r = reader();
+    expect(await r.start()).toBe(true);
+    for (let round = 0; round < 2; round++) {
+      // The waiting poll answers soundly; the next one doesn't.
+      fake.malformedPage = { events: null, next: 0, acked: 0 };
+      fake.inject("box", "comment.created");
+      await until(() => messages.length === 2 + 2 * round);
+      fake.malformedPage = undefined;
+      await until(() => messages.length === 3 + 2 * round);
+    }
+    expect(messages).toEqual([
+      `couldn't open a WebSocket to ${fake.url}; long-polling instead`,
+      warning("page of events"),
+      `reconnected to ${fake.url}`,
+      `${fake.url} sent a malformed page of events; reconnecting`,
+      `reconnected to ${fake.url}`,
+    ]);
+    expect(r.pending()).toHaveLength(2);
+  });
+
+  it("closes a connection whose ready can't be read, and connects again", async () => {
+    fake.malformedReady = true;
+    const r = reader();
+    expect(await r.start()).toBe(false);
+    expect(messages).toEqual([warning("ready message")]);
+    fake.malformedReady = false;
+    await until(() => r.connected);
+    const good = fake.inject("box", "comment.created");
+    await until(() => r.pending().length === 1);
+    expect(r.pending()[0].id).toBe(good.id);
+  });
+
+  for (const page of ["<html>Sign in to the Wi-Fi</html>", null, [], { events: null, next: 0, acked: 0 }, { events: [], next: "x", acked: 0 }, { events: [], next: 1.5, acked: 0 }, { events: [], next: 0, acked: null }]) {
+    it(`is tried again long-polling, as after a 5xx: ${JSON.stringify(page)}`, async () => {
+      fake.refuseSockets = true;
+      fake.malformedPage = page;
+      const r = reader();
+      expect(await r.start()).toBe(false);
+      await until(() => fake.requests.filter((q) => q.startsWith("GET /v1/inboxes/box/events")).length >= 2);
+      expect(messages).toEqual([`couldn't open a WebSocket to ${fake.url}; long-polling instead`, warning("page of events")]);
+      fake.malformedPage = undefined;
+      await until(() => r.connected);
+      const good = fake.inject("box", "comment.created");
+      await until(() => r.pending().length === 1);
+      expect(r.pending()[0].id).toBe(good.id);
+      expect(fake.requests.filter((q) => q.includes("NaN") || q.includes("after=x"))).toEqual([]);
+    });
+  }
+});
+
+describe("what the server says", () => {
+  // Colour, an OSC 8 link, a carriage return, a C1 CSI and a NUL.
+  const NASTY = "\x1b[31mred\x1b]8;;https://evil.test\x07link\x1b]8;;\x07\rover\u009b2J\x00end";
+  const CONTROLS = /[\x00-\x1f\x7f-\x9f]/;
+  const client = () => new ServerClient({ url: fake.url, apiKey: fake.token });
+  const log = (m: string) => void messages.push(m);
+
+  it("is cleaned in errors, without cutting a long explanation short", async () => {
+    const detail = `${NASTY} ${"because ".repeat(40)}the end`;
+    fake.problem = { status: 422, body: { status: 422, code: "nope", title: NASTY, detail } };
+    const refused = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(refused).toBeInstanceOf(ServerError);
+    expect(refused.message).not.toMatch(CONTROLS);
+    expect(refused.message).toMatch(/: 422 \[31mred \]8;;https:\/\/evil\.test link \]8;; over 2J end because .* the end$/);
+
+    fake.problem = { status: 503, body: { status: 503, code: NASTY, title: NASTY } };
+    const down = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(down).toBeInstanceOf(Unreachable);
+    expect(down.message).not.toMatch(CONTROLS);
+    expect(down.message).toMatch(/end: \[31mred/);
+
+    fake.problem = { status: 401, body: { status: 401, code: NASTY } };
+    const key = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(key).toBeInstanceOf(LoginNeeded);
+    expect(key.message).not.toMatch(CONTROLS);
+  });
+
+  it("is cleaned when it won't watch a PR, or renew a watch", async () => {
+    fake.problem = { status: 422, body: { status: 422, code: "nope", detail: NASTY } };
+    expect(await subscribe(client(), "box", { owner: "octo", name: "widgets", number: 7 }, { log })).toBeNull();
+    fake.problem = null;
+    fake.repos.set(NASTY, { private: true });
+    fake.subscriptions.push({ id: "sub_1", inbox: "box", repo: NASTY, pr: 7, githubToken: null });
+    fake.verifiedUntil.set("sub_1", new Date(Date.now() + 3600_000).toISOString());
+    await renewSubscriptions(client(), "box", { log });
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toMatch(/won't watch octo\/widgets#7: \[31mred/);
+    expect(messages[1]).toMatch(/keep watching \[31mred .* end; run/);
+    for (const m of messages) expect(m).not.toMatch(CONTROLS);
+  });
+
+  it("is cleaned when it comes over the WebSocket", async () => {
+    const r = reader();
+    await r.start();
+    for (const s of fake.sockets) s.send({ type: "error", code: NASTY, detail: NASTY });
+    await until(() => messages.length === 1);
+    expect(messages[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+: \[31mred .* end: \[31mred .* end$/);
+    fake.closeSockets(4001, NASTY);
+    expect(await r.changed(1000)).toBe(true);
+    expect(r.failure).toBeInstanceOf(LoginNeeded);
+    expect(r.failure!.message).toMatch(/rejected the API key \(\[31mred/);
+    for (const m of [...messages, r.failure!.message]) expect(m).not.toMatch(CONTROLS);
+  });
+
+  it("can't redirect a request, which fails saying why", async () => {
+    const fetches = vi.spyOn(globalThis, "fetch");
+    // The hint names the config file where it really is.
+    vi.stubEnv("WATCHERONI_CONFIG_DIR", "/etc/watcheroni-test");
+    try {
+      fake.redirectTo = `http://127.0.0.1:${fake.port}/elsewhere`;
+      const moved = `answered 307 redirecting to "http://127.0.0.1:${fake.port}/elsewhere", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or /etc/watcheroni-test/config.json`;
+      const err = (await client().ack("box", 1).catch((e: Error) => e)) as Error;
+      expect(fetches.mock.calls[0][1]).toMatchObject({ method: "POST", redirect: "manual" });
+      expect(err).toBeInstanceOf(ServerError);
+      expect(err.message).toBe(`${fake.url}: POST /v1/inboxes/box/ack: ${moved}`);
+      expect(fake.requests).toEqual(["POST /v1/inboxes/box/ack"]);
+      expect(await subscribe(client(), "box", { owner: "octo", name: "widgets", number: 7 }, { log })).toBeNull();
+      expect(messages).toEqual([`${fake.url} won't watch octo/widgets#7: ${moved}`]);
+
+      // Nor a refresh, whose body is the refresh token. Where it points
+      // is cleaned too.
+      const path = join(mkdtempSync(join(tmpdir(), "watcheroni-cred-")), "credentials.json");
+      process.env.WATCHERONI_CREDENTIALS = path;
+      const github = { access_token: "ghu_old", refresh_token: "ghr_old", expires_at: new Date(Date.now() - 1000).toISOString(), refresh_token_expires_at: null };
+      writeFileSync(path, JSON.stringify({ servers: { [fake.url]: { api_key: fake.token, key_id: "key_1", account: { id: 7, login: "octocat" }, github } } }));
+      fake.redirectTo = "http://evil.test/\u009b2J";
+      const refresh = (await githubTokenFor(fake.url).catch((e: Error) => e)) as Error;
+      expect(fetches.mock.calls.at(-1)![1]).toMatchObject({ method: "POST", redirect: "manual" });
+      expect(refresh).toBeInstanceOf(Unreachable);
+      expect(refresh.message).toBe(`${fake.url}/v1/github/refresh answered 307 redirecting to "http://evil.test/ 2J", which watcheroni doesn't follow; check the server URL in $WATCHERONI_SERVER or /etc/watcheroni-test/config.json`);
+      expect(fake.refreshed).toEqual([]);
+    } finally {
+      fetches.mockRestore();
+      vi.unstubAllEnvs();
+      delete process.env.WATCHERONI_CREDENTIALS;
+    }
   });
 });

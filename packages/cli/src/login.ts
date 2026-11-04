@@ -8,8 +8,8 @@ import { hostname } from "node:os";
 import { dirname, join, win32 } from "node:path";
 import type { LoginResponse, Meta } from "@watcheroni/protocol";
 import { checkServerUrl, configDir, serverSetting } from "./config.ts";
-import { clean } from "./format.ts";
-import { Unreachable } from "./server.ts";
+import { clean, PROSE_LENGTH } from "./format.ts";
+import { checkServerUrlHint, NO_REDIRECTS, redirect, Unreachable } from "./server.ts";
 
 export const DEFAULT_SERVER = "https://watcheroni.dev";
 
@@ -135,7 +135,8 @@ export class LoginFailed extends Error {}
 export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps): Promise<ServerCredentials> {
   server = checkServerUrl(server);
   const { fetch, print } = deps;
-  const metaRes = await fetch(`${server}/v1/meta`);
+  const metaRes = await fetch(`${server}/v1/meta`, NO_REDIRECTS);
+  refuseRedirect(metaRes, `${server}/v1/meta`);
   if (!metaRes.ok) throw new LoginFailed(`${server}/v1/meta answered ${metaRes.status}`);
   const meta = (await metaRes.json()) as Meta;
   if (!meta.github?.client_id) throw new LoginFailed(`${server} doesn't offer sign-in yet`);
@@ -148,8 +149,10 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ github_token: token.access_token, label: `watcheroni CLI on ${hostname()}` }),
+      ...NO_REDIRECTS,
     });
   let res = await send();
+  refuseRedirect(res, `${server}/v1/login`);
   // Too many sign-ins from this address. The GitHub token is still good,
   // so rather than send the user through the device flow again, wait once
   // if it isn't long.
@@ -159,6 +162,7 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
     print(`${server} is limiting sign-ins from this address; trying again in ${wait} seconds.`);
     await deps.sleep(wait * 1000);
     res = await send();
+    refuseRedirect(res, `${server}/v1/login`);
     if (res.status === 429) throw new LoginFailed(signInsLimited(server, retryAfter(res)));
   }
   if (!res.ok) {
@@ -167,7 +171,7 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
     const hint = problem.code === "quota_exceeded"
       ? "; run `watcheroni logout` on a machine you no longer use, or revoke the App's authorization in GitHub's settings to revoke every key"
       : "";
-    throw new LoginFailed(`the server refused the login (${res.status}${problem.title ? `: ${problem.title}` : ""})${hint}`);
+    throw new LoginFailed(`the server refused the login (${res.status}${problem.title ? `: ${clean(problem.title, PROSE_LENGTH)}` : ""})${hint}`);
   }
   const body = (await res.json()) as LoginResponse;
   const now = deps.now();
@@ -189,7 +193,7 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
   creds.servers[server] = entry;
   // Saved first, so a revoke that goes wrong can't lose the new key.
   writeCredentials(creds);
-  print(`Signed in to ${server} as ${body.account.login}.`);
+  print(`Signed in to ${server} as ${clean(body.account.login)}.`);
   // The key this one replaces would otherwise stay live, counting against
   // the account's keys. Failing only warns: the login has worked.
   if (replaced?.api_key && replaced.api_key !== entry.api_key) {
@@ -206,13 +210,23 @@ async function revokeKey(server: string, apiKey: string, what: string, outcome: 
     const res = await deps.fetch(`${server}/v1/keys/current`, {
       method: "DELETE",
       headers: { Authorization: `Bearer ${apiKey}` },
+      ...NO_REDIRECTS,
     });
-    if (!res.ok && res.status !== 401) deps.print(`The server didn't revoke ${what} (${res.status}); ${outcome}.`);
+    const moved = redirect(res);
+    if (moved) deps.print(`The server didn't revoke ${what}: it ${moved}; ${outcome}.`);
+    else if (!res.ok && res.status !== 401) deps.print(`The server didn't revoke ${what} (${res.status}); ${outcome}.`);
     return res.ok;
   } catch (e) {
-    deps.print(`Couldn't reach ${server} to revoke ${what} (${(e as Error).message}); ${outcome}.`);
+    deps.print(`Couldn't reach ${server} to revoke ${what} (${clean((e as Error).message, PROSE_LENGTH)}); ${outcome}.`);
     return false;
   }
+}
+
+// Throws if `res` is a redirect, which is never followed (see
+// NO_REDIRECTS): `url` needs fixing, not trying again.
+function refuseRedirect(res: Response, url: string): void {
+  const moved = redirect(res);
+  if (moved) throw new LoginFailed(`${url} ${moved}; ${checkServerUrlHint()}`);
 }
 
 // The longest a login waits out a 429 before giving up.
@@ -266,11 +280,16 @@ export async function githubTokenFor(server: string, deps: Pick<LoginDeps, "fetc
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ refresh_token: github.refresh_token }),
+      ...NO_REDIRECTS,
     });
   } catch (e) {
     const cause = (e as Error & { cause?: Error }).cause;
     throw new Unreachable(`can't reach ${server} to refresh the GitHub token: ${cause?.message ?? (e as Error).message}`);
   }
+  // Thrown rather than answered with null, which would send the user to
+  // `watcheroni login`, where the same server would redirect again.
+  const moved = redirect(res);
+  if (moved) throw new Unreachable(`${server}/v1/github/refresh ${moved}; ${checkServerUrlHint()}`);
   if (res.status === 429) {
     throw new Unreachable(`${server} is limiting GitHub token refreshes from this address; try again in ${retryAfter(res)} seconds`);
   }
@@ -316,7 +335,12 @@ async function deviceFlow(webUrl: string, clientId: string, deps: LoginDeps): Pr
       method: "POST",
       headers: { Accept: "application/json", "content-type": "application/json" },
       body: JSON.stringify(body),
+      // These endpoints don't redirect; one that did could send the
+      // device code anywhere.
+      ...NO_REDIRECTS,
     });
+    const moved = redirect(res);
+    if (moved) throw new LoginFailed(`${webUrl}${path} ${moved}`);
     if (!res.ok) throw new LoginFailed(`GitHub answered ${res.status} to ${path}`);
     return res.json() as Promise<Record<string, unknown>>;
   };
