@@ -1023,7 +1023,13 @@ watcheroni config [get | set] <key> [value]
 - **The inbox** is `--inbox`, or `$WATCHERONI_INBOX`, or
   `cc-<CLAUDE_CODE_SESSION_ID>` inside Claude Code, or `default`. `wait`
   reads the *whole* inbox, not just the targets named, so use one inbox per
-  consumer.
+  consumer. Only one `wait`, `stream` or `exec` reads an inbox at a time,
+  but `watch` and `unwatch` can change it meanwhile: each change to the
+  inbox file is made under a lock held only while making it, to the file
+  as it is then, and the reader reads the file again before each poll and
+  each look at its events. `unwatch` ends the PR's server subscription,
+  drops its events not yet read, and remembers the subscription so the
+  events the server still had queued for it are dropped as they arrive.
 - **`wait`** connects over WebSocket, waits for at least one event, then
   keeps collecting for a short settle time (default 5 s, `--settle`) so a
   review with ten comments arrives as one wake-up, not ten; `--settle 0`

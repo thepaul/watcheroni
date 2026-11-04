@@ -255,6 +255,21 @@ describe("feed", () => {
     inbox.close();
   });
 
+  it("drops events a PR's subscription queued before the PR was unwatched", async () => {
+    const inbox = Inbox.open("feed7");
+    inbox.watch(targetKey(target), target, "sub_9");
+    inbox.unwatch(targetKey(target));
+    const r = reader("feed7");
+    await r.start();
+    fake.inject("feed7", "comment.created", {}, "e1", "sub_9");
+    fake.inject("feed7", "comment.created", {}, "e2", "sub_other");
+    await until(() => r.pending().length === 2);
+    const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
+    expect(feed.wanted([]).map((i) => i.event.id)).toEqual(["e2"]);
+    await until(() => fake.inbox("feed7").acked === 1);
+    inbox.close();
+  });
+
   it("lets a PR's end through a run's kinds only with pr.merged or pr.closed", async () => {
     const inbox = Inbox.open("feed5");
     const r = reader("feed5");

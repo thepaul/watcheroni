@@ -25,8 +25,10 @@ A PR named once stays watched in that inbox, and `wait` reports on
 everything in it, so later runs need no target. Events wait in the inbox
 until a `wait` prints them, so nothing is lost between runs.
 
-Only one `wait` can read an inbox at a time. To add a PR while one is
-running, stop it and start `watcheroni wait owner/repo#456`.
+Only one `wait` can read an inbox at a time. To change what it watches
+while one is running, don't stop it: `watcheroni watch owner/repo#456`
+adds a PR and `watcheroni unwatch owner/repo#123` drops one, and the
+running `wait` picks up the change.
 
 Stop only this session's own `wait`: with the background task's ID
 (TaskStop in Claude Code), or `kill` the process ID that the "in use by
@@ -59,8 +61,9 @@ watcheroni wait
 `review.` kind. `wait octo/widgets#123 --kinds ...` sets them too.
 Running it again with other kinds replaces them, and `--kinds '*'` goes
 back to every kind. Naming the PR without `--kinds` keeps what it has,
-and `watcheroni ls` shows each PR's kinds. `watch` needs the inbox, like
-`wait`, so stop a running `wait` before you run it.
+and `watcheroni ls` shows each PR's kinds. `watch` and `unwatch` work
+while a `wait` is running, and it uses the new kinds from its next
+event on.
 
 A PR ending (`pr.merged` or `pr.closed`, then `watch.ended`) wakes you
 only if its kinds include `pr.merged` or `pr.closed`. Otherwise it just
@@ -74,7 +77,8 @@ that one run, on every PR, and isn't saved.
 
 **Done with a PR?** Unwatch it: `watcheroni unwatch octo/widgets#123`.
 If you're about to merge or close it yourself, unwatch it first, since
-you already know what's going to happen.
+you already know what's going to happen. Its events not yet read are
+dropped too.
 
 **Events you don't need to act on.** If an event needs nothing from you,
 such as your own push, a check passing, or a PR you've finished with

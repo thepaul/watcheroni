@@ -184,6 +184,25 @@ describe("wait against a server", () => {
     expect(await kindsNow()).toBeUndefined();
   });
 
+  it("lets watch and unwatch change the inbox while it waits", async () => {
+    fake.repos.set("octo/widgets", { private: false });
+    const run = cli(["wait", "octo/widgets#7", "--settle", "0", "--timeout", "20s", "--json"]);
+    await until(() => run.stderr().includes("watching octo/widgets#7"));
+    const watch = cli(["watch", "octo/widgets#8"]);
+    expect(await watch.code, watch.stderr()).toBe(0);
+    expect(watch.stderr()).toBe("watcheroni: watching octo/widgets#8 in inbox box\n");
+    const unwatch = cli(["unwatch", "octo/widgets#7"]);
+    expect(await unwatch.code, unwatch.stderr()).toBe(0);
+    expect(fake.deleted).toEqual(["sub_1"]);
+    // #7's subscription had this queued; #8's is reported.
+    fake.inject("box", "comment.created", {}, "e1", "sub_1", 7);
+    fake.inject("box", "comment.created", {}, "e2", "sub_2", 8);
+    expect(await run.code, run.stderr()).toBe(0);
+    const lines = run.stdout().trimEnd().split("\n").map((l) => JSON.parse(l) as Record<string, unknown>);
+    expect(lines.map((l) => l.id ?? l.result)).toEqual(["e2", "events"]);
+    expect(lines.at(-1)).toEqual({ result: "events", watching: ["octo/widgets#8"] });
+  });
+
   it("shows a reply and the review GitHub makes for it", async () => {
     fake.inject("box", "review.submitted", { review_id: 5, state: "commented", has_body: false });
     fake.inject("box", "review_comment.created", { comment_id: 6, review_id: 5, path: "a.ts", line: 3, in_reply_to: 4 });

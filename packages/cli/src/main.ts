@@ -32,6 +32,9 @@ Targets are owner/repo#123 or a pull request URL. With none, the open PR
 for the current git branch. owner/repo watches the whole repository, with
 the server only, and needs --kinds.
 
+One wait, stream or exec reads an inbox at a time. watch and unwatch
+change what it watches, also while one is reading it.
+
 Options:
   --inbox NAME      which inbox to use (default: $WATCHERONI_INBOX, or
                     cc-$CLAUDE_CODE_SESSION_ID in Claude Code, or "default")
@@ -220,13 +223,24 @@ async function main(argv: string[]): Promise<number> {
       if (!kinds.length) throw new UsageError(`${repo}: watching a whole repository needs --kinds, e.g. --kinds pr.opened`);
     }
   }
-  const inbox = Inbox.open(inboxName);
+  // watch and unwatch only change what the inbox watches, so they may run
+  // while a wait reads it, which picks up the change.
+  const inbox = verb === "watch" || verb === "unwatch" ? Inbox.edit(inboxName) : Inbox.open(inboxName);
   const client = config && new ServerClient(config);
 
   if (verb === "unwatch") {
     if (!parsed.length) throw new UsageError("unwatch needs a target");
     for (const t of targets) {
-      if (!inbox.unwatch(targetKey(t))) log(`${targetKey(t)} wasn't being watched in inbox ${inboxName}`);
+      const gone = inbox.unwatch(targetKey(t));
+      if (!gone) log(`${targetKey(t)} wasn't being watched in inbox ${inboxName}`);
+      if (!gone?.sub) continue;
+      if (!client) {
+        log(`stopped watching ${targetKey(t)} here, but with no server configured its subscription there wasn't ended; it ends when the PR does, or after a week nobody reads inbox ${inboxName}`);
+        continue;
+      }
+      await client.request("DELETE", `/v1/inboxes/${inboxName}/subscriptions/${gone.sub}`).catch((e: unknown) => {
+        if (!(e instanceof ServerError && e.status === 404)) log(`couldn't end the server's watch on ${targetKey(t)}: ${(e as Error).message}`);
+      });
     }
     // A repository-wide watch is only on the server, so it's ended there.
     for (const t of repoTargets) {
@@ -287,6 +301,7 @@ async function main(argv: string[]): Promise<number> {
       }
     }
   }
+  const added = new Set<string>();
   for (const t of targets) {
     const key = targetKey(t);
     const known = inbox.watched().find((w) => targetKey(w.target) === key);
@@ -307,6 +322,7 @@ async function main(argv: string[]): Promise<number> {
     }
     const watchKinds = args.length ? prKinds ?? [] : [];
     inbox.watch(key, t, sub, watchKinds);
+    added.add(key);
     if (client && reachable && !sub) inbox.setSubscription(key, null);
     log(`watching ${key} in inbox ${inboxName}${watchKinds.length ? ` for ${describeKinds(watchKinds)}` : ""}${client && !sub ? ", polling GitHub from this machine" : ""}`);
   }
@@ -320,8 +336,9 @@ async function main(argv: string[]): Promise<number> {
 
   if (verb === "watch") {
     clearInterval(renewTimer ?? undefined);
-    // Set the starting point now, so events from here on are kept.
-    await pollOnce(inbox, log, undefined, !reachable);
+    // Set the starting point of the PRs added now, so events from here on
+    // are kept. Any others are a running wait's to poll.
+    await pollOnce(inbox, log, undefined, !reachable, added);
     return 0;
   }
 

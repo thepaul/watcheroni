@@ -6,15 +6,18 @@ import { fetchSnapshot, type Snapshot } from "./snapshot.ts";
 
 export type Fetch = typeof fetchSnapshot;
 
-// Polls every PR watched in the inbox once, saving any new events. A PR
-// seen for the first time sets the starting point and reports nothing,
-// unless it has already ended. Ended PRs stop being watched. PRs a server
-// subscription watches are left to the server, unless `all`.
-export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: Fetch = fetchSnapshot, all = true): Promise<WatchEvent[]> {
+// Polls every PR watched in the inbox once, or those in `only`, saving any
+// new events. A PR seen for the first time sets the starting point and
+// reports nothing, unless it has already ended. Ended PRs stop being
+// watched. PRs a server subscription watches are left to the server,
+// unless `all`.
+export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: Fetch = fetchSnapshot, all = true, only?: Set<string>): Promise<WatchEvent[]> {
   const added: WatchEvent[] = [];
+  inbox.refresh();
   for (const w of inbox.watched()) {
     if (w.sub && !all) continue;
     const key = `${w.target.owner}/${w.target.name}#${w.target.number}`;
+    if (only && !only.has(key)) continue;
     let next: Snapshot;
     try {
       next = await fetch(w.target);
@@ -31,10 +34,9 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       continue;
     }
     if (!w.snapshot) {
-      inbox.update(key, next);
       if (next.state !== "OPEN") {
         const reason = next.state === "MERGED" ? "merged" : "closed";
-        added.push(...inbox.append([{
+        added.push(...inbox.record(key, next, [{
           v: 1,
           id: `local:${key}:watch.ended:${reason}`,
           sub: null,
@@ -49,13 +51,12 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
         }]));
         inbox.end(key);
       } else {
-        inbox.save();
+        inbox.record(key, next, []);
       }
       continue;
     }
     const events = diff(w.snapshot, next);
-    inbox.update(key, next);
-    added.push(...inbox.append(events));
+    added.push(...inbox.record(key, next, events));
     if (events.some((e) => e.kind === "watch.ended")) inbox.end(key);
   }
   return added;

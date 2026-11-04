@@ -96,11 +96,11 @@ describe("inbox", () => {
     const [old, dead, recent, busy, current] = [`t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`];
     for (const name of [old, dead, recent, current]) {
       const i = Inbox.open(name);
-      i.save();
+      i.ack(0);
       i.close();
     }
     const held = Inbox.open(busy);
-    held.save();
+    held.ack(0);
     // One left locked by a process that has gone.
     writeFileSync(at(`${dead}.lock`), "999999");
     // Opened, never saved: by a process that has gone, and by one still running.
@@ -233,6 +233,74 @@ describe("kinds per PR", () => {
     expect(inbox.kindsFor("octo/widgets#8")).toEqual(["check.failed"]);
     inbox.forgetEnded(new Set());
     expect(inbox.kindsFor("octo/widgets#8")).toEqual([]);
+    inbox.close();
+  });
+});
+
+describe("changing an inbox a wait holds", () => {
+  const seven = { owner: "octo", name: "widgets", number: 7 };
+  const eight = { owner: "octo", name: "widgets", number: 8 };
+  const pr8 = (over: Partial<Snapshot> = {}) => snap({ number: 8, url: "https://github.com/octo/widgets/pull/8", ...over });
+  const comment = { id: 1, at: "t", url: "u", author: alice };
+
+  it("lets watch and unwatch change it alongside the reader, neither undoing the other", () => {
+    const name = `t${n++}`;
+    const reader = Inbox.open(name);
+    expect(() => Inbox.open(name)).toThrow(InboxBusy);
+    reader.append([event("a")]);
+    const editor = Inbox.edit(name);
+    expect(editor.watch(targetKey(seven), seven)).toBe(true);
+    // The reader's own change keeps the watch it hadn't seen.
+    reader.ack(1);
+    expect(reader.watched().map((w) => targetKey(w.target))).toEqual(["octo/widgets#7"]);
+    expect(Inbox.peek(name)).toMatchObject({ pending: 0 });
+    reader.close();
+  });
+
+  it("drops an unwatched PR's events, from here and those its subscription has queued", () => {
+    const inbox = open();
+    inbox.watch(targetKey(seven), seven, "sub_7");
+    inbox.watch(targetKey(eight), eight);
+    inbox.append([event("a"), { ...event("b"), pr: 8 }]);
+    expect(inbox.unwatch("Octo/Widgets#7")).toBeNull();
+    expect(inbox.unwatch(targetKey(seven))).toMatchObject({ sub: "sub_7" });
+    expect(inbox.pending().map((e) => e.id)).toEqual(["b"]);
+    expect(inbox.wasUnwatched("sub_7")).toBe(true);
+    expect(inbox.wasUnwatched("sub_8")).toBe(false);
+    inbox.close();
+  });
+
+  it("polls a PR another process starts watching, and saves nothing for one it stops watching mid-poll", async () => {
+    const name = `t${n++}`;
+    const reader = Inbox.open(name);
+    reader.watch(targetKey(seven), seven);
+    const editor = Inbox.edit(name);
+    const snapshots: Record<number, Snapshot[]> = {
+      7: [snap(), snap({ comments: [comment] })],
+      8: [pr8(), pr8({ comments: [comment] })],
+    };
+    const fetch = async (t: Target) => {
+      // #7 is unwatched while its second poll is under way.
+      if (t.number === 7 && snapshots[7]!.length === 1) editor.unwatch(targetKey(seven));
+      return snapshots[t.number]!.shift()!;
+    };
+    const feed = new Feed(reader, null, { interval: 60_000, log: () => {}, fetch });
+    await feed.poll();
+    editor.watch(targetKey(eight), eight);
+    await feed.poll();
+    expect(feed.wanted([])).toEqual([]);
+    await feed.poll();
+    expect(feed.wanted([]).map((i) => `#${i.event.pr} ${i.event.kind}`)).toEqual(["#8 comment.created"]);
+    expect(feed.watching()).toEqual(["octo/widgets#8"]);
+    reader.close();
+  });
+
+  it("takes over a change left unfinished by a process that has gone", () => {
+    const name = `t${n++}`;
+    const inbox = Inbox.open(name);
+    writeFileSync(join(process.env.WATCHERONI_STATE_DIR!, "inboxes", `${name}.writing`), "999999");
+    expect(inbox.watch(targetKey(seven), seven)).toBe(true);
+    expect(readdirSync(join(process.env.WATCHERONI_STATE_DIR!, "inboxes")).filter((f) => f.endsWith(".writing"))).toEqual([]);
     inbox.close();
   });
 });

@@ -1,5 +1,5 @@
 import { matchesKind, type WatchEvent } from "@watcheroni/protocol";
-import type { Inbox } from "./inbox.ts";
+import { prKey, type Inbox } from "./inbox.ts";
 import { pollOnce, type Fetch } from "./poll.ts";
 import type { ServerReader } from "./server.ts";
 import { repoKey, targetKey } from "./targets.ts";
@@ -45,6 +45,8 @@ export class Feed {
   // acknowledging the rest so they don't wait for ever.
   wanted(kinds: string[]): Item[] {
     this.check();
+    // For what `watch` and `unwatch` have changed meanwhile.
+    this.inbox.refresh();
     const items: Item[] = [];
     const left = new Set<string>();
     for (const source of this.server ? [this.server, this.inbox] : [this.inbox]) {
@@ -55,6 +57,7 @@ export class Feed {
         }
       }
       const want = (e: WatchEvent) => {
+        if (source === this.server && e.sub && this.inbox.wasUnwatched(e.sub)) return false;
         const key = prKey(e);
         return wants(kinds, e) && (!key || wants(this.inbox.kindsFor(key), e));
       };
@@ -126,8 +129,6 @@ export class Feed {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-const prKey = (e: WatchEvent) => (e.repo && e.pr !== null ? `${e.repo.full_name}#${e.pr}` : null);
 
 // Whether `kinds` wants the event. A PR's `watch.ended` comes with its
 // `pr.merged` or `pr.closed`, so kinds that leave those out aren't woken

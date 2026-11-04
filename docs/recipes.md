@@ -148,9 +148,9 @@ Then say which PRs the inbox watches, before starting the service:
 watcheroni watch --inbox notify octo/widgets#123 octo/widgets#130
 ```
 
-Only one process at a time can use an inbox, so to add PRs later, stop
-the service, run `watcheroni watch --inbox notify ...` again, and start it
-again. The service stops by itself once every PR it watches has been
+To add PRs later, run `watcheroni watch --inbox notify ...` again, and
+`watcheroni unwatch --inbox notify ...` to drop them; the running service
+picks up the change. The service stops by itself once every PR it watches has been
 merged or closed (exit 3), and the service managers below are told not to
 restart it then. Nor do they after exit 1, which covers every error but a
 missing GitHub login: an inbox with nothing to watch or in use by another
