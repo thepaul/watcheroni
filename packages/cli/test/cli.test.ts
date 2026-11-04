@@ -655,11 +655,13 @@ describe("what the server says", () => {
     expect(refused.stderr()).toMatch(/: 422 \[31mred .* end\n$/);
     expect(refused.stderr()).not.toMatch(CONTROLS);
 
-    // Not even when it's only quoted, by an error the CLI didn't expect.
+    // An answer that isn't JSON is taken as no answer, and not quoted.
     fake.problem = { status: 200, body: `${NASTY}{` };
     const garbled = cli(["wait", "--settle", "0"]);
-    expect(await garbled.code).toBe(1);
-    expect(garbled.stderr()).toMatch(/JSON/);
+    await until(() => /isn't JSON/.test(garbled.stderr()));
+    garbled.kill();
+    await garbled.code;
+    expect(garbled.stderr()).toMatch(/^watcheroni: \S+ sent an answer to PUT \/v1\/inboxes\/box that isn't JSON; polling GitHub from this machine instead\n/);
     expect(garbled.stderr()).not.toMatch(CONTROLS);
   });
 

@@ -8,7 +8,7 @@ import { formatText } from "../src/format.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
-import { ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
+import { MalformedAnswer, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -104,6 +104,25 @@ describe("server reader", () => {
     send(event(0, "inbox.gap", { missed_after: 3, resumed_at: 1 }), event(2, "y"));
     await until(() => r.pending().length === 3);
     expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
+  });
+
+  it("keeps an event whose seq goes back, in order, warning of it, but drops a repeated one quietly", async () => {
+    const r = reader();
+    await r.start();
+    const event = (seq: number, id: string): WatchEvent => ({
+      v: 1, seq, id, sub: null, kind: "x", at: "t", received_at: "t", repo: null, pr: null, actor: null, data: {}, links: {},
+    });
+    for (const s of fake.sockets) s.send({ type: "events", events: [event(7, "a"), event(6, "b")] });
+    await until(() => r.pending().length === 2);
+    expect(r.pending().map((e) => [e.seq, e.id])).toEqual([[6, "b"], [7, "a"]]);
+    expect(messages).toEqual([
+      `${fake.url} sent an event out of order (seq 6 after 7, id "b"); it's shown anyway; if this keeps happening, report it to the server's operator`,
+    ]);
+    // One already seen, again under a lower seq, as a redelivery can be.
+    for (const s of fake.sockets) s.send({ type: "events", events: [event(5, "a"), event(8, "c")] });
+    await until(() => r.pending().length === 3);
+    expect(r.pending().map((e) => e.id)).toEqual(["b", "a", "c"]);
+    expect(messages).toHaveLength(1);
   });
 
   it("forgets malformed events skipped past an inbox.gap that moves it back", async () => {
@@ -608,6 +627,24 @@ describe("a malformed event", () => {
     await until(() => fake.inbox("box").acked === 7);
   });
 
+  it("is warned of at or below the position too, though not acknowledged", async () => {
+    const r = reader();
+    await r.start();
+    fake.inject("box", "a");
+    fake.inject("box", "b");
+    await until(() => r.pending().length === 2);
+    const bad = { v: 1, seq: 1, id: "bad", sub: null, kind: 42, at: "t", received_at: "t", repo: null, pr: null, actor: null, data: {}, links: {} };
+    for (const s of fake.sockets) s.send(JSON.stringify({ type: "events", events: [bad] }));
+    await until(() => messages.length === 1);
+    expect(messages[0]).toBe(
+      `dropped a malformed event from ${fake.url} (seq 1, id "bad"): it isn't shaped as the protocol says; if this keeps happening, report it to the server's operator`,
+    );
+    r.ack(1);
+    await until(() => fake.inbox("box").acked === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.inbox("box").acked).toBe(1);
+  });
+
   it("isn't one for a missing nullable field, or a seq of 0", async () => {
     const r = reader();
     await r.start();
@@ -688,6 +725,37 @@ describe("a malformed message or page", () => {
     expect(messages).toContain(`${fake.url} sent a malformed message; reconnecting`);
   });
 
+  it("backs off further when a server sends only empty events messages between malformed ones", async () => {
+    fake.emptyBeforeGarbage = true;
+    fake.garbageAfterReady = true;
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [20, 400] });
+    readers.push(r);
+    await r.start();
+    await until(() => fake.helloTimes.length >= 5);
+    const gaps = fake.helloTimes.slice(1).map((t, i) => t - fake.helloTimes[i]);
+    expect(gaps[3]).toBeGreaterThanOrEqual(80);
+  });
+
+  it("doesn't count what an earlier connection read when a later one breaks before its ready", async () => {
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", { log: (m) => messages.push(m), backoff: [100, 2000] });
+    readers.push(r);
+    await r.start();
+    fake.inject("box", "comment.created");
+    await until(() => r.pending().length === 1);
+    // No jitter: each wait is the whole delay.
+    const random = vi.spyOn(Math, "random").mockReturnValue(1);
+    try {
+      fake.malformedReady = true;
+      fake.closeSockets(1012, "restarting");
+      await until(() => fake.helloTimes.length >= 3);
+    } finally {
+      random.mockRestore();
+    }
+    // Lost once (100 ms), then broken: the wait doubles (200 ms) rather
+    // than starting again.
+    expect(fake.helloTimes[2] - fake.helloTimes[1]).toBeGreaterThanOrEqual(150);
+  });
+
   it("says so each time a page goes bad mid-run, warning in full only once", async () => {
     fake.refuseSockets = true;
     const r = reader();
@@ -738,6 +806,53 @@ describe("a malformed message or page", () => {
       expect(fake.requests.filter((q) => q.includes("NaN") || q.includes("after=x"))).toEqual([]);
     });
   }
+});
+
+describe("an answer whose body can't be read", () => {
+  const client = () => new ServerClient({ url: fake.url, apiKey: fake.token });
+
+  it("is taken as no answer, to be tried again: cut off, timed out, or not JSON", async () => {
+    fake.cutBodies = 1;
+    const cut = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(cut).toBeInstanceOf(Unreachable);
+    expect(cut).not.toBeInstanceOf(MalformedAnswer);
+    expect(cut.message).toMatch(new RegExp(`^lost the answer from ${fake.url}: `));
+
+    fake.cutBodies = 1;
+    fake.stallCutBodies = true;
+    const slow = (await client().request("PUT", "/v1/inboxes/box", { timeoutMs: 100 }).catch((e: Error) => e)) as Error;
+    expect(slow).toBeInstanceOf(Unreachable);
+    expect(slow.message).toMatch(new RegExp(`^lost the answer from ${fake.url}: `));
+
+    fake.problem = { status: 200, body: "<html>Sign in to the Wi-Fi</html>" };
+    const html = (await client().ensureInbox("box").catch((e: Error) => e)) as Error;
+    expect(html).toBeInstanceOf(MalformedAnswer);
+    expect(html.message).toBe(`${fake.url} sent an answer to PUT /v1/inboxes/box that isn't JSON`);
+  });
+
+  it("is passed on as it is when the caller gave up", async () => {
+    fake.cutBodies = 1;
+    fake.stallCutBodies = true;
+    const abort = new AbortController();
+    setTimeout(() => abort.abort(), 50);
+    const err = (await client().request("PUT", "/v1/inboxes/box", { signal: abort.signal }).catch((e: Error) => e)) as Error;
+    expect(err).not.toBeInstanceOf(Unreachable);
+    expect(err.name).toBe("AbortError");
+  });
+
+  it("is read again long-polling, with nothing lost", async () => {
+    fake.refuseSockets = true;
+    const r = reader();
+    expect(await r.start()).toBe(true);
+    messages.length = 0;
+    fake.cutBodies = 1;
+    const e = fake.inject("box", "comment.created");
+    await until(() => r.pending().length === 1);
+    expect(r.pending()[0].id).toBe(e.id);
+    expect(r.failure).toBeNull();
+    expect(messages[0]).toMatch(new RegExp(`^lost the answer from ${fake.url}: .*; reconnecting$`));
+    expect(messages.at(-1)).toBe(`reconnected to ${fake.url}`);
+  });
 });
 
 describe("what the server says", () => {

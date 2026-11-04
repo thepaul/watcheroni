@@ -128,6 +128,12 @@ export class FakeServer {
   // page instead (a string as it is, not JSON). Each hello's time is kept.
   malformedReady = false;
   garbageAfterReady = false;
+  // Send an empty events message after ready, before any garbage.
+  emptyBeforeGarbage = false;
+  // How many more 2xx answers to cut off halfway through their body.
+  cutBodies = 0;
+  // Whether those wait half a second before dropping, to be timed out.
+  stallCutBodies = false;
   readonly helloTimes: number[] = [];
   malformedPage: unknown = undefined;
   private http: Server | null = null;
@@ -247,6 +253,7 @@ export class FakeServer {
       this.helloTimes.push(Date.now());
       s.pos = msg.after ?? inbox.acked;
       s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
+      if (this.emptyBeforeGarbage) s.send({ type: "events", events: [] });
       if (this.garbageAfterReady) s.send("{not json");
       this.sendFrom(s);
     } else if (msg.type === "ack") {
@@ -295,8 +302,17 @@ export class FakeServer {
     const url = new URL(req.url!, this.url);
     this.requests.push(`${req.method} ${url.pathname}${url.search}`);
     const json = (status: number, body: unknown) => {
+      const text = JSON.stringify(body);
+      if (status < 400 && this.cutBodies > 0) {
+        // Half the body, then the connection drops.
+        this.cutBodies--;
+        res.writeHead(status, { "content-type": "application/json", "content-length": String(Buffer.byteLength(text)) });
+        res.write(text.slice(0, text.length >> 1));
+        setTimeout(() => res.socket?.destroy(), this.stallCutBodies ? 500 : 10);
+        return;
+      }
       res.writeHead(status, { "content-type": status < 400 ? "application/json" : "application/problem+json" });
-      res.end(JSON.stringify(body));
+      res.end(text);
     };
     const readBody = async <T>() => {
       const chunks: Buffer[] = [];

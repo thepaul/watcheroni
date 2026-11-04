@@ -23,6 +23,10 @@ export class Unreachable extends Error {
   }
 }
 
+// A 2xx answer whose body isn't JSON. Tried again like any Unreachable;
+// a long poll also warns of it as a malformed page.
+export class MalformedAnswer extends Unreachable {}
+
 // A long poll refused because too many are already waiting on the account
 // is asked again this often, unless the server says otherwise.
 const CROWDED_RETRY_SECONDS = 30;
@@ -115,7 +119,19 @@ export class ServerClient {
       throw new ServerError(`${this.url}: ${method} ${path}: ${detail}`, res.status, "redirect", { detail });
     }
     if (res.status === 204) return undefined as T;
-    if (res.ok) return (await res.json()) as T;
+    if (res.ok) {
+      // The body can still fail after the headers came: cut off, timed
+      // out, or not JSON (a captive portal's page, say). Each is worth
+      // trying again, like a connection that failed.
+      try {
+        return (await res.json()) as T;
+      } catch (e) {
+        if (o.signal?.aborted) throw e;
+        if (e instanceof SyntaxError) throw new MalformedAnswer(`${this.url} sent an answer to ${method} ${clean(path, PROSE_LENGTH)} that isn't JSON`);
+        const cause = (e as Error & { cause?: Error }).cause;
+        throw new Unreachable(`lost the answer from ${this.url}: ${clean(cause?.message ?? (e as Error).message, PROSE_LENGTH)}`);
+      }
+    }
     const problem = (await res.json().catch(() => ({}))) as { code?: string; title?: string; detail?: string };
     const code = problem.code ?? String(res.status);
     // The problem's fields are the server's to choose, so they are cleaned
@@ -380,8 +396,8 @@ export class ServerReader {
   // unread is now before.
   ack(seq: number): void {
     this.queue = this.queue.filter((e) => e.seq > seq);
-    const first = Math.min(...this.queue.map((e) => e.seq));
-    seq = Math.max(seq, ...this.skipped.filter((s) => s < first));
+    const first = this.firstQueued();
+    for (const s of this.skipped) if (s < first && s > seq) seq = s;
     this.skipped = this.skipped.filter((s) => s > seq);
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ type: "ack", seq }));
@@ -455,14 +471,14 @@ export class ServerReader {
           try {
             page = await this.client.events(this.name, this.pos, this.connected ? WAIT_SECONDS : 0, this.abort.signal);
           } catch (e) {
-            // Too many long polls already waiting on this account: still
-            // connected, but ask again later rather than at once.
             // An answer that isn't JSON at all (a captive portal's page,
             // say) is a malformed page, tried again.
-            if (e instanceof SyntaxError) {
+            if (e instanceof MalformedAnswer) {
               this.malformed("page of events");
               throw new Unreachable(`${this.client.url} sent a malformed page of events`);
             }
+            // Too many long polls already waiting on this account: still
+            // connected, but ask again later rather than at once.
             if (!(e instanceof Unreachable && e.code === "too_many_connections")) throw e;
             const seconds = e.retryAfter ?? CROWDED_RETRY_SECONDS;
             if (!this.crowded) this.o.log(`${this.client.url} has too many long polls waiting for this account; asking every ${seconds} s instead`);
@@ -557,6 +573,9 @@ export class ServerReader {
 
   // One WebSocket connection, from opening to closing.
   private async openSocket(): Promise<{ opened: boolean; code: number; reason: string }> {
+    // Whether events were read soundly is per connection: one closed
+    // before its ready mustn't count what the last one read.
+    this.readSince = false;
     const { url, headers } = await this.client.socket(this.name);
     return new Promise((resolve) => {
       const ws = new WebSocket(url, { protocols: [SUBPROTOCOL], headers });
@@ -605,8 +624,10 @@ export class ServerReader {
           this.markConnected();
         } else if (msg.type === "events") {
           if (!Array.isArray(msg.events)) return broken("events message");
-          this.add(msg.events);
-          this.readSince = true;
+          // Only a batch whose sound events moved the position counts as
+          // read soundly: an empty one, or one of duplicates, says nothing
+          // of the server.
+          if (this.add(msg.events)) this.readSince = true;
         } else if (msg.type === "error") {
           // The server's own words, cleaned like the rest.
           this.o.log(`${this.client.url}: ${clean(msg.code)}${msg.detail ? `: ${clean(msg.detail, PROSE_LENGTH)}` : ""}`);
@@ -641,9 +662,10 @@ export class ServerReader {
   // warning instead, and acknowledged once nothing before it is waiting.
   // One without a sound seq can't be placed or acknowledged;
   // acknowledging a later event moves past it. A missing nullable field
-  // is kept as null.
-  private add(events: WatchEvent[]): void {
+  // is kept as null. Says whether a sound event moved the position.
+  private add(events: WatchEvent[]): boolean {
     let added = false;
+    let advanced = false;
     for (const e of events as unknown[]) {
       const sound = wellFormed(e);
       // An `inbox.gap` for a position ahead of the inbox's `head` takes it
@@ -657,31 +679,57 @@ export class ServerReader {
       }
       if (!sound) {
         const seq = isObject(e) ? e.seq : undefined;
-        if (isSeq(seq)) {
-          if (this.pos !== null && seq <= this.pos) continue;
+        // Only one past the position is placed, to be acknowledged; one
+        // at or below it is still warned of, never dropped unsaid.
+        const placed = isSeq(seq) && (this.pos === null || seq > this.pos);
+        if (placed) {
           this.pos = seq;
           this.skipped.push(seq);
         }
         const what = describeMalformed(e);
-        this.o.log(`dropped a malformed event from ${this.client.url}${what ? ` (${what})` : ""}: it isn't shaped as the protocol says${isSeq(seq) ? ", so it's acknowledged unshown" : ""}; ${REPORT}`);
+        this.o.log(`dropped a malformed event from ${this.client.url}${what ? ` (${what})` : ""}: it isn't shaped as the protocol says${placed ? ", so it's acknowledged unshown" : ""}; ${REPORT}`);
         continue;
       }
-      if (!back && this.pos !== null && e.seq <= this.pos) continue;
+      const event: WatchEvent = { ...e, sub: e.sub ?? null, actor: e.actor ?? null, repo: e.repo ?? null, pr: e.pr ?? null };
+      if (!back && this.pos !== null && e.seq <= this.pos) {
+        // At or below the position: a redelivery of one already seen is
+        // dropped quietly. Any other is the server's seqs going back,
+        // which a sound server never does; it's kept, in seq order, so
+        // nothing is lost, and warned of.
+        if (this.seen.has(e.id)) continue;
+        this.seen.add(e.id);
+        this.o.log(`${this.client.url} sent an event out of order (seq ${e.seq} after ${this.pos}, id ${JSON.stringify(clean(e.id))}); it's shown anyway; ${REPORT}`);
+        let i = this.queue.length;
+        while (i > 0 && this.queue[i - 1].seq > e.seq) i--;
+        this.queue.splice(i, 0, event);
+        added = true;
+        continue;
+      }
       this.pos = e.seq;
+      advanced = true;
       if (this.seen.has(e.id)) continue;
       this.seen.add(e.id);
-      this.queue.push({ ...e, sub: e.sub ?? null, actor: e.actor ?? null, repo: e.repo ?? null, pr: e.pr ?? null });
+      this.queue.push(event);
       added = true;
     }
     if (this.seen.size > 2000) this.seen = new Set([...this.seen].slice(-1000));
     // Skipped ones with nothing unread before them are acknowledged now.
-    const first = Math.min(...this.queue.map((e) => e.seq));
-    const due = this.skipped.filter((seq) => seq < first);
-    if (due.length) this.ack(Math.max(...due));
+    const first = this.firstQueued();
+    let due = -1;
+    for (const seq of this.skipped) if (seq < first && seq > due) due = seq;
+    if (due >= 0) this.ack(due);
     if (added) {
       this.fresh = true;
       this.wake();
     }
+    return advanced;
+  }
+
+  // The lowest seq waiting to be read, or Infinity if none is.
+  private firstQueued(): number {
+    let first = Infinity;
+    for (const e of this.queue) if (e.seq < first) first = e.seq;
+    return first;
   }
 
   private wake(): void {
