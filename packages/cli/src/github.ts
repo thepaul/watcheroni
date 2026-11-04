@@ -48,3 +48,37 @@ export async function graphql<T>(query: string, variables: Record<string, unknow
   }
   return body.data as T;
 }
+
+// Responses to earlier GETs, by URL. Asking again with the ETag costs
+// nothing from the rate limit when GitHub answers 304 Not Modified.
+const etags = new Map<string, { etag: string; body: unknown }>();
+
+export async function rest<T>(path: string): Promise<T> {
+  const url = `https://api.github.com${path}`;
+  const cached = etags.get(url);
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${githubToken()}`,
+      accept: "application/vnd.github+json",
+      "user-agent": "watcheroni-cli",
+      ...(cached ? { "if-none-match": cached.etag } : {}),
+    },
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (res.status === 304 && cached) return cached.body as T;
+  if (res.status === 401) throw new LoginNeeded("GitHub rejected the token: run `gh auth login`, or check GH_TOKEN.");
+  if (!res.ok) {
+    // Out of requests is worth trying again, unlike a 403 for no access.
+    const limited = res.status === 429 || res.headers.get("x-ratelimit-remaining") === "0" || res.headers.has("retry-after");
+    throw new GitHubError(`GitHub ${path}: ${res.status} ${await res.text()}`, limited ? 429 : res.status);
+  }
+  const body = (await res.json()) as T;
+  const etag = res.headers.get("etag");
+  if (etag) {
+    etags.delete(url);
+    etags.set(url, { etag, body });
+    // Oldest first: a PR's earlier heads aren't asked about again.
+    for (const old of etags.keys()) if (etags.size > 100) etags.delete(old);
+  }
+  return body;
+}

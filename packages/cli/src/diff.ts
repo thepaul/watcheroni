@@ -126,12 +126,20 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
     emit("check.completed", discriminator, data, opts);
     if (isFailed(c)) emit("check.failed", discriminator, data, opts);
   }
-  for (const [runId, run] of workflowRuns(next.checks)) {
-    const before = workflowRuns([...prevChecks.values()]).get(runId);
-    if (!run.done || before?.done) continue;
-    emit("workflow.completed", String(runId), {
-      head_sha: next.head, run_id: runId, workflow: run.workflow, conclusion: run.conclusion,
-    }, { html: `https://github.com/${full}/actions/runs/${runId}`, api: `${api}/actions/runs/${runId}` });
+  // Workflow runs on the head commit, finished by GitHub's own account of
+  // the run (not its jobs: those waiting on others don't exist yet). A
+  // re-run is a new attempt of the same run, so its finishing counts too.
+  // Without both polls' runs there is nothing to compare.
+  const prevRuns = next.head === prev.head ? prev.workflowRuns ?? null : [];
+  if (prevRuns && next.workflowRuns) {
+    const before = new Map(prevRuns.map((r) => [r.id, r]));
+    for (const r of next.workflowRuns) {
+      const b = before.get(r.id);
+      if (!r.done || (b?.done && b.attempt === r.attempt)) continue;
+      emit("workflow.completed", `${r.id}:${r.attempt}`, {
+        head_sha: next.head, run_id: r.id, workflow: r.name, conclusion: r.conclusion,
+      }, { at: r.at, html: r.url, api: r.api });
+    }
   }
 
   // Last, so an agent reads what happened before being told it's over.
@@ -148,17 +156,4 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
 
 function isFailed(c: Check): boolean {
   return c.done && c.conclusion !== null && FAILED.has(c.conclusion);
-}
-
-function workflowRuns(checks: Check[]): Map<number, { workflow: string | null; done: boolean; conclusion: string }> {
-  const runs = new Map<number, { workflow: string | null; done: boolean; conclusion: string }>();
-  for (const c of checks) {
-    if (c.workflowRunId === null) continue;
-    const run = runs.get(c.workflowRunId) ?? { workflow: c.workflow, done: true, conclusion: "success" };
-    run.done &&= c.done;
-    if (isFailed(c)) run.conclusion = "failure";
-    else if (c.conclusion === "cancelled" && run.conclusion === "success") run.conclusion = "cancelled";
-    runs.set(c.workflowRunId, run);
-  }
-  return runs;
 }

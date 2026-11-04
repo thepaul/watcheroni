@@ -22,7 +22,9 @@ delivered.
 
 **Local mode** is the CLI polling GitHub itself, every 2 minutes by
 default (`--interval`), when there's no server or the server won't watch
-a PR. Each poll is one GraphQL query per PR (`packages/cli/src/snapshot.ts`);
+a PR. Each poll is one GraphQL query per PR, and one REST request for
+the head commit's workflow runs, which costs nothing when they haven't
+changed (`packages/cli/src/snapshot.ts`);
 `packages/cli/src/diff.ts` turns the difference from the last poll into
 events. The first poll is the starting point and reports nothing. Local
 mode watches single PRs only, never whole repositories. What it can
@@ -36,7 +38,8 @@ miss:
   run completed twice with different conclusions reports the last one;
 - anything beyond what one query reads: the last 100 reviews, review
   threads and PR comments, the last 100 comments in each thread, the
-  first 50 review requests and the first 100 checks on the head commit;
+  first 50 review requests, and the first 100 checks and workflow runs on
+  the head commit;
 - checks on a commit that is no longer the head by the next poll.
 
 Its events' `at` is the time GitHub gives for reviews, comments and
@@ -326,11 +329,15 @@ A GitHub Actions workflow run finished.
 **Server:** `workflow_run` / `completed`, one per PR the run lists (or
 matched by head commit, like a check run), with GitHub's conclusion.
 
-**Local mode:** every check run of one workflow run on the head commit is
-finished, and wasn't at the last poll. The conclusion is worked out from
-the jobs: `failure` if any failed, else `cancelled` if any was cancelled,
-else `success`. A job that GitHub hasn't created yet (one that waits on
-another) isn't counted, so a workflow can be reported finished early.
+**Local mode:** a workflow run on the head commit that GitHub's workflow
+runs API (`GET /repos/{owner}/{repo}/actions/runs?head_sha=...`) says is
+`completed` now and wasn't at the last poll, with GitHub's conclusion.
+That is the run's own status, the one its `workflow_run` webhook
+carries, not worked out from its jobs, so a job still waiting on another
+keeps the run unfinished. A re-run is the same run's next attempt, and
+is sent again when it finishes; attempts that start and finish within
+one poll interval are one event. Not sent if the GitHub login can't read
+the repo's Actions.
 
 ## The watch itself
 

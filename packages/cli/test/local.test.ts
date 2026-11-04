@@ -10,7 +10,7 @@ import { Inbox, InboxBusy } from "../src/inbox.ts";
 import { pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { UsageError, parseTarget, repoKey, targetKey, type Target } from "../src/targets.ts";
-import { alice, bob, check, snap } from "./fixtures.ts";
+import { alice, bob, check, run, snap } from "./fixtures.ts";
 
 let n = 0;
 beforeEach(() => {
@@ -310,9 +310,10 @@ describe("text output", () => {
     const inbox = open();
     const target = { owner: "octo", name: "widgets", number: 7 };
     inbox.watch(targetKey(target), target);
-    const before = snap({ checks: [check("lint", { done: false, conclusion: null })] });
+    const before = snap({ checks: [check("lint", { done: false, conclusion: null })], workflowRuns: [run({ done: false, conclusion: null })] });
     const after = snap({
       checks: [check("lint", { conclusion: "failure" })],
+      workflowRuns: [run({ conclusion: "failure" })],
       reviews: [{ id: 10, state: "CHANGES_REQUESTED", empty: false, at: "t", url: "u", author: alice }],
       reviewComments: [
         { id: 20, reviewId: 10, inReplyTo: null, path: "a.ts", line: 3, at: "t", url: "u", author: alice },

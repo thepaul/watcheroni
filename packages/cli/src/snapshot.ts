@@ -1,9 +1,10 @@
-import { graphql } from "./github.ts";
+import { GitHubError, graphql, rest } from "./github.ts";
 import type { Target } from "./targets.ts";
 
 // What local mode knows about a PR at one moment: one GraphQL query (1
-// point of GitHub's 5,000 an hour), reduced to IDs and states. diff.ts
-// turns two of these into events.
+// point of GitHub's 5,000 an hour) and one REST request for the head
+// commit's workflow runs (free when nothing changed: see rest()), reduced
+// to IDs and states. diff.ts turns two of these into events.
 
 export interface Actor { id: number; login: string; bot: boolean }
 
@@ -15,12 +16,26 @@ export interface Check {
   type: "check_run" | "status";
   checkRunId: number | null;
   workflowRunId: number | null;
-  workflow: string | null;
   done: boolean;
   // Lower case: success, failure, timed_out, cancelled, skipped, ...
   conclusion: string | null;
   url: string | null;
   at: string | null;
+}
+
+// A GitHub Actions workflow run, as GitHub reports it: the same object the
+// `workflow_run` webhook carries. Its status is the whole run's, not
+// worked out from its jobs. A re-run keeps the ID with a new attempt.
+export interface WorkflowRun {
+  id: number;
+  attempt: number;
+  name: string | null;
+  done: boolean;
+  // Lower case: success, failure, cancelled, ...
+  conclusion: string | null;
+  url: string;
+  api: string;
+  at: string;
 }
 
 export interface Snapshot {
@@ -55,6 +70,9 @@ export interface Snapshot {
   comments: { id: number; at: string; url: string; author: Actor | null }[];
   // Checks on the head commit only.
   checks: Check[];
+  // Workflow runs on the head commit; null when the token can't read them
+  // (or in a snapshot saved before they were read).
+  workflowRuns: WorkflowRun[] | null;
 }
 
 const QUERY = `
@@ -74,7 +92,7 @@ query($owner: String!, $name: String!, $number: Int!) {
       comments(last: 100) { nodes { databaseId createdAt url author { ...actor } } }
       commits(last: 1) { nodes { commit { oid statusCheckRollup { contexts(first: 100) { nodes {
         __typename
-        ... on CheckRun { databaseId name status conclusion detailsUrl completedAt checkSuite { workflowRun { databaseId workflow { name } } } }
+        ... on CheckRun { databaseId name status conclusion detailsUrl completedAt checkSuite { workflowRun { databaseId } } }
         ... on StatusContext { context state targetUrl createdAt }
       } } } } } }
     }
@@ -92,7 +110,7 @@ interface RawContext {
   conclusion?: string | null;
   detailsUrl?: string | null;
   completedAt?: string | null;
-  checkSuite?: { workflowRun: { databaseId: number; workflow: { name: string } } | null };
+  checkSuite?: { workflowRun: { databaseId: number } | null };
   context?: string;
   state?: string;
   targetUrl?: string | null;
@@ -132,15 +150,37 @@ interface RawPr {
 interface Raw {
   repository: { databaseId: number; nameWithOwner: string; pullRequest: RawPr | null } | null;
 }
+// From GET /repos/{owner}/{repo}/actions/runs.
+export interface RawRun {
+  id: number;
+  run_attempt?: number;
+  name: string | null;
+  status: string | null;
+  conclusion: string | null;
+  html_url: string;
+  url: string;
+  updated_at: string;
+}
 
 export async function fetchSnapshot(target: Target): Promise<Snapshot> {
   const data = await graphql<Raw>(QUERY, { owner: target.owner, name: target.name, number: target.number });
   const repo = data.repository;
   if (!repo?.pullRequest) throw new Error(`${target.owner}/${target.name}#${target.number}: no such pull request`);
-  return toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString());
+  let runs: RawRun[] | null;
+  try {
+    const sha = encodeURIComponent(repo.pullRequest.headRefOid);
+    runs = (await rest<{ workflow_runs: RawRun[] }>(
+      `/repos/${repo.nameWithOwner}/actions/runs?head_sha=${sha}&per_page=100&exclude_pull_requests=true`,
+    )).workflow_runs;
+  } catch (e) {
+    // A token that can read the PR but not its Actions: no workflow events.
+    if (!(e instanceof GitHubError) || (e.status !== 403 && e.status !== 404)) throw e;
+    runs = null;
+  }
+  return toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString(), runs);
 }
 
-export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string): Snapshot {
+export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string, runs: RawRun[] | null = null): Snapshot {
   const commit = pr.commits.nodes[0]?.commit;
   const contexts = commit?.oid === pr.headRefOid ? commit.statusCheckRollup?.contexts.nodes ?? [] : [];
   return {
@@ -177,6 +217,16 @@ export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedA
     })),
     comments: pr.comments.nodes.map((c) => ({ id: c.databaseId, at: c.createdAt, url: c.url, author: actor(c.author) })),
     checks: contexts.map(toCheck),
+    workflowRuns: runs?.map((r) => ({
+      id: r.id,
+      attempt: r.run_attempt ?? 1,
+      name: r.name,
+      done: r.status === "completed",
+      conclusion: r.conclusion,
+      url: r.html_url,
+      api: r.url,
+      at: r.updated_at,
+    })) ?? null,
   };
 }
 
@@ -192,7 +242,6 @@ function toCheck(c: RawContext): Check {
       type: "check_run",
       checkRunId: c.databaseId ?? null,
       workflowRunId: c.checkSuite?.workflowRun?.databaseId ?? null,
-      workflow: c.checkSuite?.workflowRun?.workflow.name ?? null,
       done: c.status === "COMPLETED",
       conclusion: c.conclusion?.toLowerCase() ?? null,
       url: c.detailsUrl ?? null,
@@ -208,7 +257,6 @@ function toCheck(c: RawContext): Check {
     type: "status",
     checkRunId: null,
     workflowRunId: null,
-    workflow: null,
     done,
     conclusion: done ? (state === "success" ? "success" : "failure") : null,
     url: c.targetUrl ?? null,
