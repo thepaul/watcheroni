@@ -190,31 +190,28 @@ export async function login(server = serverUrl(), deps: LoginDeps = defaultDeps)
   // Saved first, so a revoke that goes wrong can't lose the new key.
   writeCredentials(creds);
   print(`Signed in to ${server} as ${body.account.login}.`);
-  if (replaced?.api_key && replaced.api_key !== entry.api_key) await revokeReplaced(server, replaced, entry, deps);
+  // The key this one replaces would otherwise stay live, counting against
+  // the account's keys. Failing only warns: the login has worked.
+  if (replaced?.api_key && replaced.api_key !== entry.api_key) {
+    if (await revokeKey(server, replaced.api_key, "the previous key", "it stays live", deps)) print("Revoked the previous key.");
+  }
   return entry;
 }
 
-// Revokes the key a new login replaced, which would otherwise stay live
-// and count against the account's keys. The new key revokes it by ID if
-// it's on the same account; a key from another account (or saved with no
-// ID) revokes itself. Failing only warns: the login has worked.
-async function revokeReplaced(server: string, old: ServerCredentials, entry: ServerCredentials, deps: LoginDeps): Promise<void> {
-  const byId = Boolean(old.key_id) && old.account?.id === entry.account.id;
-  if (byId && old.key_id === entry.key_id) return;
+// Revokes an API key with the key itself (DELETE /v1/keys/current). A
+// 401 means it was already revoked. Any other failure only warns, naming
+// `what` and how things stand. True if the server revoked it just now.
+async function revokeKey(server: string, apiKey: string, what: string, outcome: string, deps: LoginDeps): Promise<boolean> {
   try {
-    const res = byId
-      ? await deps.fetch(`${server}/v1/keys/${encodeURIComponent(old.key_id)}`, {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${entry.api_key}` },
-        })
-      : await deps.fetch(`${server}/v1/keys/current`, {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${old.api_key}` },
-        });
-    // 404 by ID, or 401 for the old key itself: already revoked.
-    if (!res.ok && res.status !== (byId ? 404 : 401)) deps.print(`The server didn't revoke the previous key (${res.status}); it stays live.`);
+    const res = await deps.fetch(`${server}/v1/keys/current`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${apiKey}` },
+    });
+    if (!res.ok && res.status !== 401) deps.print(`The server didn't revoke ${what} (${res.status}); ${outcome}.`);
+    return res.ok;
   } catch (e) {
-    deps.print(`Couldn't reach ${server} to revoke the previous key (${(e as Error).message}); it stays live.`);
+    deps.print(`Couldn't reach ${server} to revoke ${what} (${(e as Error).message}); ${outcome}.`);
+    return false;
   }
 }
 
@@ -241,16 +238,7 @@ export async function logout(server = serverUrl(), deps: LoginDeps = defaultDeps
     deps.print(`Not signed in to ${server}.`);
     return false;
   }
-  try {
-    const res = await deps.fetch(`${server}/v1/keys/current`, {
-      method: "DELETE",
-      headers: { Authorization: `Bearer ${entry.api_key}` },
-    });
-    // 401: already revoked, which is what we wanted.
-    if (!res.ok && res.status !== 401) deps.print(`The server didn't revoke the key (${res.status}); forgetting it anyway.`);
-  } catch (e) {
-    deps.print(`Couldn't reach ${server} to revoke the key (${(e as Error).message}); forgetting it anyway.`);
-  }
+  await revokeKey(server, entry.api_key, "the key", "forgetting it anyway", deps);
   delete creds.servers[server];
   writeCredentials(creds);
   deps.print(`Signed out of ${server}.`);

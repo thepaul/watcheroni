@@ -72,7 +72,6 @@ function fake(
         case `${SERVER}/v1/keys/current`:
           return new Response(null, { status: 204 });
       }
-      if (url.startsWith(`${SERVER}/v1/keys/`) && init?.method === "DELETE") return new Response(null, { status: 204 });
       throw new Error(`unexpected ${url}`);
     },
   };
@@ -264,26 +263,36 @@ describe("opening the browser", () => {
 describe("logging in again", () => {
   const deletes = (calls: { url: string; auth: string | null }[]) =>
     calls.filter((c) => c.url.startsWith(`${SERVER}/v1/keys/`)).map((c) => [c.url, c.auth]);
+  // Answers a revoke with `revoke`, recording it in `calls`.
+  const revokeWith = (deps: LoginDeps, calls: { url: string; body: unknown; auth: string | null }[], revoke: () => Promise<Response>) => {
+    const fetch = deps.fetch;
+    deps.fetch = async (input, init) =>
+      init?.method === "DELETE" ? (calls.push({ url: String(input), body: null, auth: new Headers(init.headers).get("Authorization") }), revoke()) : fetch(input, init);
+  };
 
-  it("revokes the key it replaces, with the new one", async () => {
+  it("revokes the key it replaces, with itself, once the new one is saved", async () => {
     const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
     await login(SERVER, deps);
     expect(deletes(calls)).toEqual([]);
+    expect(printed).not.toContain("Revoked the previous key.");
+    revokeWith(deps, calls, async () => {
+      expect(readCredentials().servers[SERVER]?.api_key).toBe("wk2_7_secret2_tag");
+      return new Response(null, { status: 204 });
+    });
     await login(SERVER, deps);
-    expect(deletes(calls)).toEqual([[`${SERVER}/v1/keys/key_1`, "Bearer wk2_7_secret2_tag"]]);
+    expect(deletes(calls)).toEqual([[`${SERVER}/v1/keys/current`, "Bearer wk2_7_secret_tag"]]);
     expect(readCredentials().servers[SERVER]).toMatchObject({ api_key: "wk2_7_secret2_tag", key_id: "key_2" });
-    expect(printed.join("\n")).not.toMatch(/revoke/);
+    expect(printed.at(-1)).toBe("Revoked the previous key.");
+    expect(printed.join("\n")).not.toMatch(/wk2_/);
   });
 
-  it("takes a 404 as already revoked", async () => {
+  it("takes a 401 as already revoked", async () => {
     const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
     await login(SERVER, deps);
-    const fetch = deps.fetch;
-    deps.fetch = async (input, init) =>
-      init?.method === "DELETE" ? (calls.push({ url: String(input), body: null, auth: null }), Response.json({}, { status: 404 })) : fetch(input, init);
+    revokeWith(deps, calls, async () => Response.json({}, { status: 401 }));
     await login(SERVER, deps);
     expect(deletes(calls)).toHaveLength(1);
-    expect(printed.join("\n")).not.toMatch(/revoke/);
+    expect(printed.at(-1)).toBe(`Signed in to ${SERVER} as octocat.`);
   });
 
   it("keeps the new key and only warns when the revoke fails", async () => {
@@ -293,17 +302,16 @@ describe("logging in again", () => {
         throw new Error("connection reset");
       },
     ]) {
-      const { deps, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
+      const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }, { access_token: "ghu_tok2" }]);
       await login(SERVER, deps);
-      const fetch = deps.fetch;
-      deps.fetch = async (input, init) => (init?.method === "DELETE" ? fail() : fetch(input, init));
+      revokeWith(deps, calls, fail);
       await expect(login(SERVER, deps)).resolves.toMatchObject({ api_key: "wk2_7_secret2_tag" });
       expect(readCredentials().servers[SERVER]?.api_key).toBe("wk2_7_secret2_tag");
       expect(printed.at(-1)).toMatch(/^(The server didn't revoke the previous key \(500\)|Couldn't reach .* to revoke the previous key \(connection reset\)); it stays live\.$/);
     }
   });
 
-  it("has a key from another account, or with no ID, revoke itself", async () => {
+  it("revokes a key from another account, or saved with no ID, the same way", async () => {
     for (const old of [
       { api_key: "wk2_9_other_tag", key_id: "key_9", account: { id: 9, login: "someone" } },
       { api_key: "wk2_7_old_tag", account: { id: 7, login: "octocat" } },
@@ -320,9 +328,10 @@ describe("logging in again", () => {
       process.env.WATCHERONI_CREDENTIALS!,
       JSON.stringify({ servers: { [SERVER]: { api_key: "wk2_7_secret_tag", key_id: "key_1", account: { id: 7, login: "octocat" }, github: {} } } }),
     );
-    const { deps, calls } = fake([{ access_token: "ghu_tok" }]);
+    const { deps, calls, printed } = fake([{ access_token: "ghu_tok" }]);
     await login(SERVER, deps);
     expect(deletes(calls)).toEqual([]);
+    expect(printed).not.toContain("Revoked the previous key.");
   });
 
   it("leaves other servers' keys alone", async () => {
