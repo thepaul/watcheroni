@@ -158,6 +158,18 @@ export class FakeServer {
     return event;
   }
 
+  // An `inbox.gap`, as the server sends to a reader behind what it keeps:
+  // about no repo, with the seq just before `resumedAt`.
+  gap(name: string, missedAfter: number, resumedAt: number): void {
+    const inbox = this.inbox(name);
+    inbox.head = resumedAt - 1;
+    inbox.events.push({
+      v: 1, seq: inbox.head, id: `inbox:${name}.gap.${missedAfter}.${resumedAt}`, sub: null, kind: "inbox.gap", at: "t",
+      received_at: "t", repo: null, pr: null, actor: null, data: { missed_after: missedAfter, resumed_at: resumedAt }, links: {},
+    });
+    if (!this.holding) this.deliver(name);
+  }
+
   // Several events that reach a reader in one message or page.
   injectTogether(name: string, ...events: [kind: string, data?: WatchEvent["data"]][]): void {
     this.holding = true;

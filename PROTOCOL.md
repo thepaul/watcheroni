@@ -207,7 +207,8 @@ has read for 30 days that has no subscriptions or connections left.
 ```
 
 `head` is the newest `seq`, `oldest` the oldest still kept. An inbox keeps
-at most 1,000 events and at most 7 days of them.
+at most 1,000 events and at most 7 days of them; a reader whose position
+falls behind what's kept gets `inbox.gap` (see "Gaps").
 
 ## Subscriptions
 
@@ -430,16 +431,23 @@ losing them.
 
 ### Gaps
 
-If a client's position is older than the oldest kept event, the first
-event it gets is:
+If a client reads from a position before the oldest event the inbox
+keeps, so that it missed some, the first event it gets (over long-polling
+or the WebSocket) is:
 
 ```json
 {"seq": 501, "kind": "inbox.gap", "data": {"missed_after": 40, "resumed_at": 502}, ...}
 ```
 
+`missed_after` is the client's position and `resumed_at` the `seq` of the
+first event kept after the gap (the next one to come, if none is kept).
+The gap's own `seq` is `resumed_at - 1`, so a client that handles it and
+moves its position there isn't told again. Its `id` is the same each
+time it's sent for the same position. A client that missed nothing never
+gets one.
+
 The client should re-read the state of what it watches from GitHub
-directly. (The watcheroni server doesn't send `inbox.gap` yet; it drops
-an inbox's oldest events without one.)
+directly.
 
 ## Events
 

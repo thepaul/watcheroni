@@ -43,6 +43,7 @@ export const INBOX_NAME = /^[A-Za-z0-9._-]{1,64}$/;
 export const MAX_WAIT_SECONDS = 300;
 export const MAX_LIMIT = 500;
 export const INBOX_MAX_EVENTS = 1000;
+export const INBOX_MAX_AGE_DAYS = 7;
 
 const ALWAYS_DELIVERED = ["watch.", "repo.", "inbox."];
 

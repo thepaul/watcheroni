@@ -386,8 +386,15 @@ interface Account {
 ```
 
 `deliver` appends each event to its inbox with the next `seq` (dropping
-duplicates by `(inbox, id)`), trims the inbox to 1,000 events or 7 days,
-and sends the new events to that inbox's sockets. If it doesn't recognise
+duplicates by `(inbox, id)`), trims the inbox to 1,000 events, makes sure
+the alarm is set, and sends the new events to that inbox's sockets. The
+alarm deletes events older than 7 days, then sets itself for when the
+next one will be (at least an hour on); reads leave such events out
+meanwhile. Either way an inbox keeps a run of consecutive `seq`s, so a
+read whose first event isn't the one straight after the reader's
+position (or that finds none, from before `head`) has missed some: it
+starts with an `inbox.gap`, made at read time, not stored, whose `seq` is
+just before the first event kept. If it doesn't recognise
 a subscription (the user deleted it, but RepoHub hadn't heard yet), it
 says so, and RepoHub deletes its copy. So the two copies of a
 subscription converge without a transaction across objects: Account
@@ -852,7 +859,7 @@ but unwatched repo is never throttled; it only costs one cheap call.
 | Live API keys | 100 (`422 quota_exceeded` at login) |
 | Open WebSockets | 50 (closed with `4029` beyond) |
 | Long polls waiting at once | 50 (`429 too_many_connections` with `Retry-After` beyond) |
-| Events delivered | 10,000 a day; beyond that the inbox gets `inbox.gap` |
+| Events kept per inbox | 1,000, none older than 7 days; a reader behind what's kept gets `inbox.gap` |
 
 ### Per IPv4 address or IPv6 /64 (Rate Limiting binding)
 
