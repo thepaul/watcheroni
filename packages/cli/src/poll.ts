@@ -55,6 +55,9 @@ export async function pollOnce(inbox: Inbox, log: (msg: string) => void, fetch: 
       }
       continue;
     }
+    // Workflow runs that couldn't be read this time stay as last read, so
+    // a run finishing in between is found once they can be again.
+    if (next.workflowRuns === null && next.head === w.snapshot.head) next = { ...next, workflowRuns: w.snapshot.workflowRuns ?? null };
     const events = diff(w.snapshot, next);
     added.push(...inbox.record(key, next, events));
     if (events.some((e) => e.kind === "watch.ended")) inbox.end(key);

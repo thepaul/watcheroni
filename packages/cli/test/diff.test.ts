@@ -121,7 +121,7 @@ describe("diff", () => {
     events = diff(deploying, finished);
     expect(kinds(events)).toEqual(["check.completed", "check.failed", "workflow.completed"]);
     expect(events[2]).toMatchObject({
-      id: "local:octo/widgets#7:workflow.completed:500:1",
+      id: "local:octo/widgets#7:workflow.completed:500:1:failure",
       at: "2026-10-27T00:03:00Z",
       data: { head_sha: HEAD1, run_id: 500, workflow: "CI", conclusion: "failure" },
       links: { html: "https://github.com/octo/widgets/actions/runs/500", api: "https://api.github.com/repos/octo/widgets/actions/runs/500" },
@@ -140,8 +140,24 @@ describe("diff", () => {
     for (const before of [rerun, finished]) {
       events = diff(before, rerunDone);
       expect(kinds(events)).toEqual(["workflow.completed"]);
-      expect(events[0]).toMatchObject({ id: "local:octo/widgets#7:workflow.completed:500:2", data: { conclusion: "success" } });
+      expect(events[0]).toMatchObject({ id: "local:octo/widgets#7:workflow.completed:500:2:success", data: { conclusion: "success" } });
     }
+  });
+
+  it("workflow runs: a fork's run completed as action_required, then approved", () => {
+    const waiting = snap({ workflowRuns: [run({ conclusion: "action_required" })] });
+    let events = diff(snap({ workflowRuns: [] }), waiting);
+    expect(events.map((e) => [e.id, e.data.conclusion])).toEqual([["local:octo/widgets#7:workflow.completed:500:1:action_required", "action_required"]]);
+
+    // Approved: the same run, same attempt, runs and is completed again.
+    const approved = snap({ workflowRuns: [run({ done: false, conclusion: null })] });
+    expect(diff(waiting, approved)).toEqual([]);
+    const done = snap({ workflowRuns: [run()] });
+    for (const before of [approved, waiting]) {
+      events = diff(before, done);
+      expect(events.map((e) => [e.id, e.data.conclusion])).toEqual([["local:octo/widgets#7:workflow.completed:500:1:success", "success"]]);
+    }
+    expect(diff(done, { ...done })).toEqual([]);
   });
 
   it("workflow runs: other runs, pushes, and runs that can't be read", () => {
@@ -150,8 +166,11 @@ describe("diff", () => {
     const events = diff(snap({ workflowRuns: [two[0], { ...two[1], done: false, conclusion: null }] }), snap({ workflowRuns: two }));
     expect(events.map((e) => [e.kind, e.data.run_id])).toEqual([["workflow.completed", 600]]);
 
-    // After a push, every finished run on the new head counts.
-    expect(kinds(diff(snap({ workflowRuns: two }), snap({ head: HEAD2, workflowRuns: [run()] })))).toEqual(["pr.pushed", "workflow.completed"]);
+    // After a push, every finished run on the new head counts, whatever the
+    // old head's runs were, or if they couldn't be read.
+    for (const workflowRuns of [[run()], null]) {
+      expect(kinds(diff(snap({ workflowRuns }), snap({ head: HEAD2, workflowRuns: [run()] })))).toEqual(["pr.pushed", "workflow.completed"]);
+    }
 
     // Without both polls' runs (a token that can't read Actions, or a
     // snapshot saved before runs were read) there is nothing to compare.

@@ -128,15 +128,17 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
   }
   // Workflow runs on the head commit, finished by GitHub's own account of
   // the run (not its jobs: those waiting on others don't exist yet). A
-  // re-run is a new attempt of the same run, so its finishing counts too.
+  // re-run is a new attempt of the same run, so its finishing counts too,
+  // as does a run completed again with another conclusion (a fork's run
+  // is completed as `action_required` until a maintainer approves it).
   // Without both polls' runs there is nothing to compare.
   const prevRuns = next.head === prev.head ? prev.workflowRuns ?? null : [];
   if (prevRuns && next.workflowRuns) {
     const before = new Map(prevRuns.map((r) => [r.id, r]));
     for (const r of next.workflowRuns) {
       const b = before.get(r.id);
-      if (!r.done || (b?.done && b.attempt === r.attempt)) continue;
-      emit("workflow.completed", `${r.id}:${r.attempt}`, {
+      if (!r.done || (b?.done && b.attempt === r.attempt && b.conclusion === r.conclusion)) continue;
+      emit("workflow.completed", `${r.id}:${r.attempt}:${r.conclusion}`, {
         head_sha: next.head, run_id: r.id, workflow: r.name, conclusion: r.conclusion,
       }, { at: r.at, html: r.url, api: r.api });
     }

@@ -1,10 +1,10 @@
-import { GitHubError, graphql, rest } from "./github.ts";
+import { GitHubError, graphql, restList } from "./github.ts";
 import type { Target } from "./targets.ts";
 
 // What local mode knows about a PR at one moment: one GraphQL query (1
-// point of GitHub's 5,000 an hour) and one REST request for the head
-// commit's workflow runs (free when nothing changed: see rest()), reduced
-// to IDs and states. diff.ts turns two of these into events.
+// point of GitHub's 5,000 an hour) and a REST request per 100 of the head
+// commit's workflow runs (free when nothing changed: see restList()),
+// reduced to IDs and states. diff.ts turns two of these into events.
 
 export interface Actor { id: number; login: string; bot: boolean }
 
@@ -151,27 +151,41 @@ interface Raw {
   repository: { databaseId: number; nameWithOwner: string; pullRequest: RawPr | null } | null;
 }
 // From GET /repos/{owner}/{repo}/actions/runs.
-export interface RawRun {
-  id: number;
-  run_attempt?: number;
-  name: string | null;
-  status: string | null;
-  conclusion: string | null;
-  html_url: string;
-  url: string;
-  updated_at: string;
+interface RawRuns {
+  workflow_runs: {
+    id: number;
+    run_attempt?: number;
+    name: string | null;
+    status: string | null;
+    conclusion: string | null;
+    html_url: string;
+    url: string;
+    updated_at: string;
+  }[];
 }
 
 export async function fetchSnapshot(target: Target): Promise<Snapshot> {
   const data = await graphql<Raw>(QUERY, { owner: target.owner, name: target.name, number: target.number });
   const repo = data.repository;
   if (!repo?.pullRequest) throw new Error(`${target.owner}/${target.name}#${target.number}: no such pull request`);
-  let runs: RawRun[] | null;
+  let runs: WorkflowRun[] | null;
   try {
     const sha = encodeURIComponent(repo.pullRequest.headRefOid);
-    runs = (await rest<{ workflow_runs: RawRun[] }>(
+    runs = await restList(
       `/repos/${repo.nameWithOwner}/actions/runs?head_sha=${sha}&per_page=100&exclude_pull_requests=true`,
-    )).workflow_runs;
+      (body) => (body as RawRuns).workflow_runs.map((r) => ({
+        id: r.id,
+        attempt: r.run_attempt ?? 1,
+        name: r.name,
+        done: r.status === "completed",
+        conclusion: r.conclusion,
+        url: r.html_url,
+        api: r.url,
+        at: r.updated_at,
+      })),
+    );
+    // A run can move to another page between two pages' requests.
+    runs = [...new Map(runs.map((r) => [r.id, r])).values()];
   } catch (e) {
     // A token that can read the PR but not its Actions: no workflow events.
     if (!(e instanceof GitHubError) || (e.status !== 403 && e.status !== 404)) throw e;
@@ -180,7 +194,7 @@ export async function fetchSnapshot(target: Target): Promise<Snapshot> {
   return toSnapshot(repo.databaseId, repo.nameWithOwner, repo.pullRequest, new Date().toISOString(), runs);
 }
 
-export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string, runs: RawRun[] | null = null): Snapshot {
+export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedAt: string, runs: WorkflowRun[] | null = null): Snapshot {
   const commit = pr.commits.nodes[0]?.commit;
   const contexts = commit?.oid === pr.headRefOid ? commit.statusCheckRollup?.contexts.nodes ?? [] : [];
   return {
@@ -217,16 +231,7 @@ export function toSnapshot(repoId: number, fullName: string, pr: RawPr, fetchedA
     })),
     comments: pr.comments.nodes.map((c) => ({ id: c.databaseId, at: c.createdAt, url: c.url, author: actor(c.author) })),
     checks: contexts.map(toCheck),
-    workflowRuns: runs?.map((r) => ({
-      id: r.id,
-      attempt: r.run_attempt ?? 1,
-      name: r.name,
-      done: r.status === "completed",
-      conclusion: r.conclusion,
-      url: r.html_url,
-      api: r.url,
-      at: r.updated_at,
-    })) ?? null,
+    workflowRuns: runs,
   };
 }
 

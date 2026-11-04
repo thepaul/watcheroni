@@ -143,6 +143,28 @@ describe("polling", () => {
     inbox.close();
   });
 
+  it("keeps the last workflow runs read while they can't be, and records each conclusion GitHub gives", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const snapshots: Snapshot[] = [
+      snap({ workflowRuns: [run({ done: false, conclusion: null }), run({ id: 600, done: false, conclusion: null })] }),
+      snap({ workflowRuns: [run({ conclusion: "action_required" }), run({ id: 600, done: false, conclusion: null })] }),
+      // Runs unreadable for a while: run 600 finishes meanwhile.
+      snap({ workflowRuns: null }),
+      snap({ workflowRuns: null }),
+      // Back, with 500 approved and finished.
+      snap({ workflowRuns: [run(), run({ id: 600 })] }),
+    ];
+    const fetch = async () => snapshots.shift()!;
+    const polled = async () => (await pollOnce(inbox, () => {}, fetch)).map((e) => [e.kind, e.data.run_id, e.data.conclusion]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["workflow.completed", 500, "action_required"]]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["workflow.completed", 500, "success"], ["workflow.completed", 600, "success"]]);
+    inbox.close();
+  });
+
   it("says at once if the PR has already ended", async () => {
     const inbox = open();
     inbox.watch(targetKey(target), target);

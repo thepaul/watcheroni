@@ -24,7 +24,7 @@ const runsBody = {
 const target = { owner: "octo", name: "widgets", number: 7 };
 
 describe("fetchSnapshot", () => {
-  let runs: (headers: Headers) => Response;
+  let runs: (headers: Headers, url: string) => Response;
   const asked: { url: string; headers: Headers }[] = [];
 
   beforeEach(() => {
@@ -34,7 +34,7 @@ describe("fetchSnapshot", () => {
       const headers = new Headers(init.headers);
       asked.push({ url, headers });
       if (url.endsWith("/graphql")) return Response.json(graphqlBody);
-      return runs(headers);
+      return runs(headers, url);
     });
   });
   afterEach(() => vi.unstubAllGlobals());
@@ -54,10 +54,33 @@ describe("fetchSnapshot", () => {
     expect(second.workflowRuns).toEqual(first.workflowRuns);
   });
 
+  it("follows the Link header to every page", async () => {
+    const page2 = "https://api.github.com/repositories/99/actions/runs?head_sha=x&page=2";
+    const other = { ...runsBody.workflow_runs[0], id: 600, name: "Docs" };
+    runs = (h, url) => {
+      const etag = url === page2 ? '"p2"' : '"p1"';
+      if (h.get("if-none-match") === etag) return new Response(null, { status: 304 });
+      // Run 500 moved to page 2 between the two requests: it's kept once.
+      return url === page2
+        ? Response.json({ workflow_runs: [runsBody.workflow_runs[0], other] }, { headers: { etag } })
+        : Response.json(runsBody, { headers: { etag, link: `<${page2}>; rel="next", <${page2}>; rel="last"` } });
+    };
+    const first = await fetchSnapshot(target);
+    expect(asked.map((a) => a.url).slice(1)).toEqual([expect.stringContaining("/actions/runs?head_sha="), page2]);
+    expect(first.workflowRuns?.map((r) => r.id)).toEqual([500, 600]);
+    // Both pages unchanged: both answered 304, from what was kept.
+    expect((await fetchSnapshot(target)).workflowRuns).toEqual(first.workflowRuns);
+    expect(asked.slice(4).map((a) => a.headers.get("if-none-match"))).toEqual(['"p1"', '"p2"']);
+  });
+
   it("leaves the runs out when the token can't read Actions, and retries when out of requests", async () => {
-    runs = () => new Response("Resource not accessible by personal access token", { status: 403 });
-    expect((await fetchSnapshot({ ...target, number: 8 })).workflowRuns).toBeNull();
-    runs = () => new Response("API rate limit exceeded", { status: 403, headers: { "x-ratelimit-remaining": "0" } });
-    await expect(fetchSnapshot({ ...target, number: 8 })).rejects.toMatchObject({ status: 429 });
+    for (const status of [403, 404]) {
+      runs = () => new Response("Resource not accessible by personal access token", { status });
+      expect((await fetchSnapshot({ ...target, number: 8 })).workflowRuns).toBeNull();
+    }
+    for (const headers of [{ "x-ratelimit-remaining": "0" }, { "retry-after": "60" }]) {
+      runs = () => new Response("API rate limit exceeded", { status: 403, headers });
+      await expect(fetchSnapshot({ ...target, number: 8 })).rejects.toMatchObject({ status: 429 });
+    }
   });
 });
