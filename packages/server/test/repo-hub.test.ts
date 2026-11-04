@@ -659,13 +659,17 @@ describe("throttling", () => {
     const sub = await subscribe(repo, { account: acct, inbox: "i", pr: 1 });
     await subscribe(repo, { account: acct, inbox: "i", pr: 2 });
     await subscribe(repo, { account: fresh(), inbox: "other", pr: 2 });
+    // repo.* gets through any kinds filter.
+    const checks = fresh();
+    await subscribe(repo, { account: checks, inbox: "c", pr: 1, kinds: ["check.*"] });
 
     // Events for an unwatched PR: they use the bucket but deliver nothing.
     for (let i = 0; i < REPO_LIMITS.ingest.capacity; i++) {
       expect((await hub(repo).ingest(`d${i}`, [fact(repo, "comment.created", 99)])).accepted).toBe(true);
     }
     const over = await hub(repo).ingest("over-1", [fact(repo, "comment.created", 1)]);
-    expect(over).toMatchObject({ accepted: false, reason: "throttled", events: 2 });
+    // One repo.throttled to each of the three inboxes.
+    expect(over).toMatchObject({ accepted: false, reason: "throttled", events: 3 });
     await hub(repo).ingest("over-2", [fact(repo, "comment.created", 1)]);
 
     const throttled = await inbox(acct, "i");
@@ -689,6 +693,7 @@ describe("throttling", () => {
 
     expect((await hub(repo).ingest("after", [fact(repo, "comment.created", 1)])).accepted).toBe(true);
     expect(kinds(await inbox(acct, "i")).at(-1)).toBe("comment.created");
+    expect(kinds(await inbox(checks, "c"))).toEqual(["repo.throttled", "repo.unthrottled"]);
   });
 });
 

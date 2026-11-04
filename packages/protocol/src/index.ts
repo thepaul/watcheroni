@@ -44,11 +44,14 @@ export const MAX_WAIT_SECONDS = 300;
 export const MAX_LIMIT = 500;
 export const INBOX_MAX_EVENTS = 1000;
 
+const ALWAYS_DELIVERED = ["watch.", "repo.", "inbox."];
+
 // Kind patterns, as in `--kinds check.*,review.submitted`: an exact kind,
-// a prefix ending in `.*`, or `*`. `watch.*` kinds always match, because
-// they say the subscription ended.
+// a prefix ending in `.*`, or `*`. Kinds about the subscription, the repo
+// or the inbox (`watch.*`, `repo.*`, `inbox.*`) always match: they say the
+// subscription ended, or that events are being or were dropped.
 export function matchesKind(patterns: readonly string[], kind: string): boolean {
-  if (!patterns.length || kind.startsWith("watch.")) return true;
+  if (!patterns.length || ALWAYS_DELIVERED.some((p) => kind.startsWith(p))) return true;
   return patterns.some((p) => p === "*" || p === kind || (p.endsWith(".*") && kind.startsWith(p.slice(0, -1))));
 }
 

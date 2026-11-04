@@ -132,7 +132,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Whether `kinds` wants the event. A PR's `watch.ended` comes with its
 // `pr.merged` or `pr.closed`, so kinds that leave those out aren't woken
-// by the PR ending; the other `watch.*` kinds always get through.
+// by the PR ending; the other `watch.*` kinds, and `repo.*` and `inbox.*`,
+// always get through.
 export function wants(kinds: string[], e: WatchEvent): boolean {
   const reason = e.data.reason;
   if (e.kind === "watch.ended" && kinds.length && (reason === "merged" || reason === "closed")) return matchesKind(kinds, `pr.${reason}`);

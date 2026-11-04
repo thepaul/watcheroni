@@ -417,8 +417,7 @@ the repo.
 **Local mode:** Not sent.
 
 `repo.*` kinds reach every inbox whatever the subscription's `kinds`,
-but the CLI's own `--kinds` filter lets only `watch.*` through, so
-`watcheroni wait --kinds check.*` doesn't print them.
+and get through the CLI's own `--kinds` filter too.
 
 PROTOCOL.md also describes `inbox.gap`, for a reader whose position
 fell behind the oldest event kept. The server doesn't send it yet: an
