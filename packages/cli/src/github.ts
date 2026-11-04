@@ -77,8 +77,8 @@ export async function restList<T>(path: string, pick: (body: unknown) => T[]): P
   const where = path.replace(/\?.*/, "");
   for (let url: string | null = `${API}${path.replace(/^\//, "")}`; url;) {
     // The token goes to GitHub's API only, and each page once.
-    if (!url.startsWith(API)) throw new GitHubError(`GitHub ${where}: next page outside ${API}: ${url}`, 502);
-    if (seen.has(url)) throw new GitHubError(`GitHub ${where}: next page already read: ${url}`, 502);
+    if (!url.startsWith(API)) throw new GitHubError(`GitHub ${clean(where, PROSE_LENGTH)}: next page outside ${API}: ${clean(url, PROSE_LENGTH)}`, 502);
+    if (seen.has(url)) throw new GitHubError(`GitHub ${clean(where, PROSE_LENGTH)}: next page already read: ${clean(url, PROSE_LENGTH)}`, 502);
     if (seen.size === MAX_PAGES) throw new GitHubError(`GitHub ${where}: more than ${MAX_PAGES} pages`, 502);
     seen.add(url);
     const cached = etags.get(url);
@@ -113,7 +113,8 @@ export async function restList<T>(path: string, pick: (body: unknown) => T[]): P
       } catch {
         // Not JSON: the text as it is.
       }
-      throw new GitHubError(`GitHub ${where}: ${res.status} ${message}`, limited ? 429 : res.status);
+      // GitHub's words are cleaned before they reach a log line, as in graphql().
+      throw new GitHubError(`GitHub ${clean(where, PROSE_LENGTH)}: ${res.status} ${clean(message, PROSE_LENGTH)}`, limited ? 429 : res.status);
     }
     const items = pick(await res.json());
     const next = res.headers.get("link")?.match(/<([^>]+)>;\s*rel="next"/)?.[1] ?? null;
