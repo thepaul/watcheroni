@@ -377,8 +377,9 @@ CREATE TABLE subscribing (inbox TEXT PRIMARY KEY, at INTEGER);
 however long that is: forgetting one would let a recreated inbox start
 again at seq 1, and a client still holding a position from before would
 silently skip its first events. It grows only when an account at the
-inbox cap deletes inboxes nobody has read for 30 days, so by at most
-about 2 x the cap (1,000 rows) per 30 days, at about 50 bytes a row.
+inbox cap deletes inboxes nobody has read for 30 days. Everything deleted
+in a 30-day window already existed at its start, so it grows by about the
+cap (500 rows) per 30 days at most, at roughly 50-100 bytes a row.
 
 RPC methods:
 

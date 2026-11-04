@@ -468,7 +468,7 @@ with a gap too, followed by every event it keeps:
 Here `missed_after` is greater than the gap's `seq`: the client should
 move its position *back* to the gap's `seq` (not ignore it as an event
 it has already seen), and carry on from there. A gap's `seq` can be `0`,
-when the first event kept is `1`.
+when `resumed_at` is `1`.
 
 ## Events
 
