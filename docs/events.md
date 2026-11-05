@@ -48,8 +48,9 @@ miss:
   when that's after the first poll (they couldn't be read until then, or
   the inbox is from watcheroni 0.3.2 or earlier), if no poll since the
   runs were last read (or since the watch started) showed one of its
-  checks still running: one started since included. Other runs are
-  still reported, and the CLI names on stderr the runs it can't
+  checks still running: one started since included (of the polls by
+  0.3.2 or earlier, only its last counts). Other runs are still
+  reported, and the CLI names on stderr the runs it can't
   (`workflow.completed`, below).
 
 Its events' `at` is the time GitHub gives for reviews, comments and
@@ -470,7 +471,10 @@ events, none older than 7 days. It isn't stored; its `seq` is
 `resumed_at - 1`, so a reader that handles it is past the gap. For a
 position ahead of `head`, `missed_after` is above that `seq`, which the
 reader moves back to, and every event kept follows. The CLI always lets
-it through `--kinds`.
+it through `--kinds`. Events it had received before such a gap and not
+yet shown, it keeps in the local inbox file and shows first, never
+acknowledging their old `seq`s to the server; one being shown when the
+gap came may be shown twice.
 
 **Local mode:** Not sent.
 

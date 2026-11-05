@@ -1061,6 +1061,10 @@ watcheroni config [get | set] <key> [value]
   each look at its events. `unwatch` ends the PR's server subscription,
   drops its events not yet read, and remembers the subscription so the
   events the server still had queued for it are dropped as they arrive.
+  Server events received but not yet shown when an `inbox.gap` moves the
+  reader's position back are kept in the inbox file too, shown before
+  the server's, and never acknowledged to the server under their old
+  `seq`s; one being shown when the gap came may be shown twice.
 - **`wait`** connects over WebSocket, waits for at least one event, then
   keeps collecting for a short settle time (default 5 s, `--settle`) so a
   review with ten comments arrives as one wake-up, not ten; `--settle 0`
