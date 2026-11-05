@@ -433,10 +433,10 @@ POST /v1/inboxes/{name}/ack
 
 Or `{"type": "ack"}` over the WebSocket. Moves `acked` forward (never
 back). A `seq` past `head` is ignored, and `acked` stays where it was: it
-can only be from a position the inbox never gave out (see "Gaps"). The
-answer is the same either way: the inbox's `head` and `acked`, as they
-now are. (Older servers took such a `seq` as `head`.) Clients
-SHOULD acknowledge once they have *handled* events, not when they
+can only be from a position the inbox never gave out (see "Gaps"). Over
+HTTP, the answer is the same either way: the inbox's `head` and
+`acked`, as they now are. (Older servers took such a `seq` as `head`.)
+Clients SHOULD acknowledge once they have *handled* events, not when they
 receive them, so a crash means seeing them again rather than losing
 them.
 
@@ -462,8 +462,8 @@ directly.
 
 A position ahead of `head` is one the inbox never gave out: `seq`s are
 never reused, even by an inbox deleted and made again, and an `ack` past
-`head` is ignored. The server can't say what such a client missed, so it answers
-with a gap too, followed by every event it keeps:
+`head` is ignored. The server can't say what such a client missed, so it
+answers with a gap too, followed by every event it keeps:
 
 ```json
 {"seq": 0, "kind": "inbox.gap", "data": {"missed_after": 900, "resumed_at": 1}, ...}

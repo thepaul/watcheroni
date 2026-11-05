@@ -191,6 +191,8 @@ describe("diff", () => {
     expect(diff(carried([600]), next).map((e) => e.data.run_id)).toEqual([600]);
     // Not a list, or not numbers: none carried.
     for (const bad of ["600", { 600: true }, ["600"], null]) expect(diff(carried(bad), next)).toEqual([]);
+    // A list with some numbers: just those carried.
+    expect(diff(carried(["500", 600]), next).map((e) => e.data.run_id)).toEqual([600]);
   });
 
   it("workflow runs: a run whose check was still running at the last poll, its runs unread", () => {

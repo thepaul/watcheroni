@@ -678,9 +678,10 @@ export class Account extends DurableObject<Env> {
   // the inbox when the caller has it.
   //
   // A position ahead of `head` was never this inbox's: seqs are never
-  // reused (see ensureInbox) and `ack` stops at `head`. Whatever it came
-  // from, the reader can't know what it missed, so it gets a gap too, and
-  // then everything kept; that gap's seq is below `after`, moving it back.
+  // reused (see ensureInbox) and an `ack` past `head` is ignored. Whatever
+  // it came from, the reader can't know what it missed, so it gets a gap
+  // too, and then everything kept; that gap's seq is below `after`, moving
+  // it back.
   private eventsAfter(name: string, after: number, limit: number, head?: number): WatchEvent[] {
     const now = Date.now();
     // Leaving out old events by `at` keeps what's left consecutive only

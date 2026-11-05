@@ -353,8 +353,8 @@ export class ServerReader {
   // Whether the position is ahead of the inbox's head, as the server said
   // at the start of this connection: the inbox's numbering went back, and
   // an inbox.gap that moves the position back is on its way. Till then
-  // nothing is acknowledged, as the server would take a position past its
-  // head as its head, and so events of the inbox's new life not yet read.
+  // nothing is acknowledged: the server ignores a position past its head,
+  // and one from before it would be a guess at what was read.
   private ahead = false;
   // Why reading must stop, found where it can't be thrown (see add()).
   private fatal: Error | null = null;
