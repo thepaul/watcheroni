@@ -36,8 +36,8 @@ The words MUST, SHOULD and MAY are used as in RFC 2119.
   (a new process, another machine) starts reading from there.
 
 Delivery is **at least once**. A client can see an event twice (after a
-reconnect, or when two readers share an inbox) and SHOULD drop duplicates
-by `id`.
+reconnect, when two readers share an inbox, or after an `inbox.gap`
+moves the position back) and SHOULD drop duplicates by `id`.
 
 ## Discovery
 
@@ -432,9 +432,13 @@ POST /v1/inboxes/{name}/ack
 ```
 
 Or `{"type": "ack"}` over the WebSocket. Moves `acked` forward (never
-back). Clients SHOULD acknowledge once they have *handled* events, not
-when they receive them, so a crash means seeing them again rather than
-losing them.
+back). A `seq` past `head` is ignored, and `acked` stays where it was: it
+can only be from a position the inbox never gave out (see "Gaps"). The
+answer is the same either way: the inbox's `head` and `acked`, as they
+now are. (Older servers took such a `seq` as `head`.) Clients
+SHOULD acknowledge once they have *handled* events, not when they
+receive them, so a crash means seeing them again rather than losing
+them.
 
 ### Gaps
 
@@ -457,8 +461,8 @@ The client should re-read the state of what it watches from GitHub
 directly.
 
 A position ahead of `head` is one the inbox never gave out: `seq`s are
-never reused, even by an inbox deleted and made again, and `ack` stops at
-`head`. The server can't say what such a client missed, so it answers
+never reused, even by an inbox deleted and made again, and an `ack` past
+`head` is ignored. The server can't say what such a client missed, so it answers
 with a gap too, followed by every event it keeps:
 
 ```json
@@ -468,7 +472,12 @@ with a gap too, followed by every event it keeps:
 Here `missed_after` is greater than the gap's `seq`: the client should
 move its position *back* to the gap's `seq` (not ignore it as an event
 it has already seen), and carry on from there. A gap's `seq` can be `0`,
-when `resumed_at` is `1`.
+when `resumed_at` is `1`. Until it has read that gap, a client whose
+position is above `head` (in `ready`, or a page of events) MUST NOT
+acknowledge anything: an older server takes an ack past `head` as
+`head`, acknowledging events the client hasn't read. Events it received
+before the gap and hasn't handled are from before; it should still
+handle them, but never acknowledge their old `seq`s.
 
 ## Events
 

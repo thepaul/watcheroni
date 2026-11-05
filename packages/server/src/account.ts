@@ -371,11 +371,14 @@ export class Account extends DurableObject<Env> {
     };
   }
 
-  // RPC: move the acknowledged position forward, never back or past head.
+  // RPC: move the acknowledged position forward, never back. An ack past
+  // head is ignored, not taken as head: it's from a position this inbox
+  // never gave out (its numbering went back), and taking it as head would
+  // acknowledge events of the inbox's new life the client hasn't read.
   ack(name: string, seq: number): InboxRow | null {
     if (!this.inbox(name)) return null;
     this.open();
-    this.sql.exec("UPDATE inboxes SET acked = MAX(acked, MIN(?, head)) WHERE name = ?", seq, name);
+    this.sql.exec("UPDATE inboxes SET acked = MAX(acked, ?) WHERE name = ? AND ? <= head", seq, name, seq);
     return this.inbox(name);
   }
 

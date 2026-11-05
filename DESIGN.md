@@ -410,7 +410,7 @@ read whose first event isn't the one straight after the reader's
 position (or that finds none, from before `head`) has missed some: it
 starts with an `inbox.gap`, made at read time, not stored, whose `seq` is
 just before the first event kept. A position ahead of `head` gets one
-too, then everything kept: `ack` stops at `head`, and an inbox deleted
+too, then everything kept: an `ack` past `head` is ignored, and an inbox deleted
 for being idle leaves its `head` and `acked` in `deleted_inboxes` for one
 made again under its name to carry on from, so `seq`s are never reused
 and such a position can't be one the inbox gave out. If it doesn't

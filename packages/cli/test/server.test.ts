@@ -130,6 +130,8 @@ describe("server reader", () => {
     it(`acknowledges nothing of an inbox whose numbering went back till its gap is read, ${longPoll ? "long-polling" : "over a WebSocket"}`, async () => {
       fake.refuseSockets = longPoll;
       fake.aheadGaps = true;
+      // A server that takes an ack past head as head, as older ones did.
+      fake.clampAcks = true;
       const r = reader();
       await r.start();
       for (const kind of ["a", "b", "c"]) fake.inject("box", kind);

@@ -101,6 +101,8 @@ export class FakeServer {
   // Answer each hello with a position with an inbox.gap that moves it
   // back by one, and no events.
   backGaps = false;
+  // Take an ack past head as head (see ackTo()).
+  clampAcks = false;
   // Repos the App is installed on, and whether each is private.
   readonly repos = new Map<string, { private: boolean }>();
   // Where an app_not_installed answer says to install it.
@@ -266,8 +268,14 @@ export class FakeServer {
       if (this.garbageAfterReady) s.send("{not json");
       this.sendFrom(s);
     } else if (msg.type === "ack") {
-      inbox.acked = Math.max(inbox.acked, Math.min(msg.seq, inbox.head));
+      this.ackTo(inbox, msg.seq);
     }
+  }
+
+  // As the server: an ack past head is ignored, or, with clampAcks, taken
+  // as head, as older servers did.
+  private ackTo(inbox: { head: number; acked: number }, seq: number): void {
+    if (seq <= inbox.head || this.clampAcks) inbox.acked = Math.max(inbox.acked, Math.min(seq, inbox.head));
   }
 
   private gapEvent(name: string, after: number, resumedAt: number): WatchEvent {
@@ -395,7 +403,7 @@ export class FakeServer {
     }
     if (route === "POST /ack") {
       const { seq } = await readBody<{ seq: number }>();
-      inbox.acked = Math.max(inbox.acked, Math.min(seq, inbox.head));
+      this.ackTo(inbox, seq);
       return json(200, { name, head: inbox.head, acked: inbox.acked });
     }
     if (route === "GET /events" && typeof this.malformedPage === "string") {

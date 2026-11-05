@@ -87,6 +87,28 @@ describe("long-polling", () => {
     expect(page.acked).toBe(2);
   });
 
+  it("ignores an ack past head, over HTTP or the WebSocket, rather than taking it as head", async () => {
+    const inbox = await newInbox();
+    await inject(inbox, { count: 3 });
+    const ack = async (seq: number) =>
+      (await call(`/v1/inboxes/${inbox}/ack`, { method: "POST", body: JSON.stringify({ seq }) })).json<{ head: number; acked: number }>();
+    expect(await ack(4)).toMatchObject({ head: 3, acked: 0 });
+    expect(await ack(2)).toMatchObject({ head: 3, acked: 2 });
+    expect(await ack(3)).toMatchObject({ head: 3, acked: 3 });
+    expect(await ack(1)).toMatchObject({ acked: 3 });
+    await inject(inbox, { count: 1 });
+    const c = await connect(inbox);
+    c.ws.send(JSON.stringify({ type: "hello" }));
+    await c.waitFor((m) => eventsOf(m).length === 1);
+    c.ws.send(JSON.stringify({ type: "ack", seq: 9 }));
+    await sleep(50);
+    expect((await stats()).inboxes.find((i) => i.name === inbox)?.acked).toBe(3);
+    c.ws.send(JSON.stringify({ type: "ack", seq: 4 }));
+    await sleep(50);
+    expect((await stats()).inboxes.find((i) => i.name === inbox)?.acked).toBe(4);
+    c.ws.close();
+  });
+
   it("waits through the bridge and wakes when an event arrives", async () => {
     const inbox = await newInbox();
     const started = Date.now();
