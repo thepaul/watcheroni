@@ -22,7 +22,9 @@ delivered.
 
 **Local mode** is the CLI polling GitHub itself, every 2 minutes by
 default (`--interval`), when there's no server or the server won't watch
-a PR. Each poll is one GraphQL query per PR (`packages/cli/src/snapshot.ts`);
+a PR. Each poll is one GraphQL query per PR, and a REST request per 100
+of the head commit's workflow runs, which costs nothing when they
+haven't changed (`packages/cli/src/snapshot.ts`);
 `packages/cli/src/diff.ts` turns the difference from the last poll into
 events. The first poll is the starting point and reports nothing. Local
 mode watches single PRs only, never whole repositories. What it can
@@ -32,12 +34,24 @@ miss:
   unresolved again, a draft marked ready and back, a review submitted and
   dismissed (no event at all), a check failing and then passing on a
   re-run of the same commit status;
-- intermediate states: several pushes are one `pr.pushed`, and a check
-  run completed twice with different conclusions reports the last one;
+- intermediate states: several pushes are one `pr.pushed`, a check
+  run completed twice with different conclusions reports the last one,
+  and several attempts of one workflow run finishing between two polls
+  report the last;
 - anything beyond what one query reads: the last 100 reviews, review
   threads and PR comments, the last 100 comments in each thread, the
   first 50 review requests and the first 100 checks on the head commit;
-- checks on a commit that is no longer the head by the next poll.
+  and beyond the 1,000 workflow runs GitHub lists for one commit;
+- checks and workflow runs on a commit that is no longer the head by the
+  next poll (the server reports workflow runs finishing there);
+- a workflow run that finishes before its head's runs are first read,
+  when that's after the first poll (they couldn't be read until then, or
+  the inbox is from watcheroni 0.3.2 or earlier), if no poll since the
+  runs were last read (or since the watch started) showed one of its
+  checks still running: one started since included (of the polls by
+  0.3.2 or earlier, only its last counts). Other runs are still
+  reported, and the CLI names on stderr the runs it can't
+  (`workflow.completed`, below).
 
 Its events' `at` is the time GitHub gives for reviews, comments and
 checks, and the time of the poll for everything else. Their `id`s start
@@ -326,11 +340,33 @@ A GitHub Actions workflow run finished.
 **Server:** `workflow_run` / `completed`, one per PR the run lists (or
 matched by head commit, like a check run), with GitHub's conclusion.
 
-**Local mode:** every check run of one workflow run on the head commit is
-finished, and wasn't at the last poll. The conclusion is worked out from
-the jobs: `failure` if any failed, else `cancelled` if any was cancelled,
-else `success`. A job that GitHub hasn't created yet (one that waits on
-another) isn't counted, so a workflow can be reported finished early.
+**Local mode:** a workflow run on the head commit that GitHub's workflow
+runs API (`GET /repos/{owner}/{repo}/actions/runs?head_sha=...`) says is
+`completed` now and wasn't at the last poll, with GitHub's conclusion.
+That is the run's own status, the one its `workflow_run` webhook
+carries, not worked out from its jobs, so a job still waiting on another
+keeps the run unfinished. A re-run is the same run's next attempt, and
+is sent again when it finishes; of several attempts finishing between
+two polls, only the last is sent. A run completed again with another
+conclusion is sent again: a run from a fork that needs approval is
+completed as `action_required`, and once a maintainer approves it, runs
+and is completed with its real conclusion. While the runs can't be read
+(the GitHub login can't read the repo's Actions, or the request fails)
+nothing is sent; once they can again, runs that finished meanwhile are,
+compared with the head's runs as last read, or, after a push, as runs
+on a new head. When a head's runs are read for the first time after the
+first poll (they couldn't be read until now, or the inbox was saved by
+watcheroni 0.3.2 or earlier, which didn't read them), a run that one of
+its checks showed still running at a poll since is sent once it has
+finished; any other run already finished then can't be told to have
+finished since, so it isn't sent, and the CLI names those runs on
+stderr. The CLI says on stderr, with GitHub's reason, once per run of
+the CLI while the runs can't be read, and once when they can again. A
+403 there is GitHub refusing the GitHub login access to them (a
+fine-grained token, for one, needs read access to the repo's Actions).
+Any 429, or any other answer that isn't a success with
+`x-ratelimit-remaining: 0` or a `retry-after` header, is a rate limit
+instead: the whole poll of that PR is tried again next time.
 
 ## The watch itself
 
@@ -423,7 +459,8 @@ and get through the CLI's own `--kinds` filter too.
 ### `inbox.gap`
 
 The reader's position is older than the oldest event the inbox still
-keeps, so it missed some. Re-read what it watches from GitHub.
+keeps, so it missed some; or it's ahead of the inbox's `head`, so the
+server can't say what it missed. Re-read what it watches from GitHub.
 
 `data`: `missed_after` (the reader's position), `resumed_at` (the `seq`
 of the first event kept after the gap).
@@ -431,8 +468,13 @@ of the first event kept after the gap).
 **Server:** at the start of a read (a long poll, or a WebSocket's
 `hello`) from a position before what the inbox keeps: its last 1,000
 events, none older than 7 days. It isn't stored; its `seq` is
-`resumed_at - 1`, so a reader that handles it is past the gap. The CLI
-always lets it through `--kinds`.
+`resumed_at - 1`, so a reader that handles it is past the gap. For a
+position ahead of `head`, `missed_after` is above that `seq`, which the
+reader moves back to, and every event kept follows. The CLI always lets
+it through `--kinds`. Events it had received before such a gap and not
+yet shown, it keeps in the local inbox file and shows first, never
+acknowledging their old `seq`s to the server; one being shown when the
+gap came may be shown twice.
 
 **Local mode:** Not sent.
 

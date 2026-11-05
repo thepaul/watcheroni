@@ -19,8 +19,9 @@ const BODY = "--jq .body";
 export function formatText(events: WatchEvent[], stillWatching: string[], reading?: string, repoEnded = false): string {
   const groups = new Map<string, WatchEvent[]>();
   for (const e of events) {
-    const repo = e.repo ? word(e.repo.full_name) : e.kind.startsWith("inbox.") ? "inbox" : "other";
-    const key = e.repo && e.pr !== null ? `${repo}#${e.pr}` : repo;
+    // Every field is the server's to fill, sound or not.
+    const repo = e.repo ? word(e.repo.full_name) : typeof e.kind === "string" && e.kind.startsWith("inbox.") ? "inbox" : "other";
+    const key = e.repo && e.pr !== null ? `${repo}#${id(e.pr) ?? "?"}` : repo;
     groups.set(key, [...(groups.get(key) ?? []), e]);
   }
   const lines: string[] = [];
@@ -143,6 +144,11 @@ function describe(e: WatchEvent): [string, string | null] {
     case "watch.revoked":
       return ["watch.revoked: the watcheroni App lost access to this repo", null];
     case "inbox.gap": {
+      // A position ahead of the inbox's head: the server can't say what
+      // was missed.
+      if (typeof d.missed_after === "number" && typeof d.resumed_at === "number" && d.missed_after >= d.resumed_at) {
+        return ["inbox.gap: the server didn't recognise the position read up to, so events may have been missed; check the watched PRs on GitHub", null];
+      }
       // The server dropped them for age or number before they were read.
       const missed = typeof d.missed_after === "number" && typeof d.resumed_at === "number" ? d.resumed_at - d.missed_after - 1 : NaN;
       const what = missed === 1 ? "1 event was dropped before it was" : `${Number.isSafeInteger(missed) && missed > 0 ? `${missed} ` : ""}events were dropped before they were`;
@@ -174,13 +180,36 @@ const REPO_NAME = /^[A-Za-z0-9-]{1,39}\/[\w.-]{1,100}$/;
 const PLAIN = /^[\w.\/@+:-]+$/;
 const MAX_LENGTH = 100;
 // C0 and C1 controls, line and paragraph separators, zero-width and
-// bidirectional formatting characters.
-const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
+// bidirectional formatting characters (the Arabic letter mark and the
+// Mongolian vowel separator among them).
+const UNPRINTABLE = /[\u0000-\u001f\u007f-\u009f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+/g;
 
-// A value made printable on one line, and cut to a sane length.
-export function clean(v: unknown): string {
+// A value made printable on one line, and cut to a sane length: `max`
+// characters, or PROSE_LENGTH for a sentence or two, such as why a
+// server refused. Whole characters, never half a surrogate pair.
+export function clean(v: unknown, max = MAX_LENGTH): string {
   const s = String(v ?? "").replace(UNPRINTABLE, " ").replace(/\s+/g, " ").trim();
-  return s.length > MAX_LENGTH ? `${s.slice(0, MAX_LENGTH - 1)}…` : s;
+  if (s.length <= max) return s;
+  const chars = Array.from(s);
+  return chars.length > max ? `${chars.slice(0, max - 1).join("")}…` : s;
+}
+
+export const PROSE_LENGTH = 1000;
+
+// Text made safe to print as it is, line breaks and all: the last guard
+// on what the CLI logs, such as a stack trace whose message quotes an
+// answer it couldn't parse.
+export function printable(s: string): string {
+  return s.split("\n").map((line) => line.replace(UNPRINTABLE, " ")).join("\n");
+}
+
+// JSON for output, as JSON.stringify writes it but with the characters it
+// leaves raw that a terminal acts on (DEL, C1 controls, zero-width and
+// bidirectional formatting, line and paragraph separators) written as
+// \uXXXX. It parses to the same value. They can only be inside strings,
+// where an escape means the same.
+export function toJson(v: unknown): string {
+  return JSON.stringify(v).replace(/[\u007f-\u009f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 // A value that should be one word (a login, path, branch, state): bare

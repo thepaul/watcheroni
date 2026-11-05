@@ -1,4 +1,4 @@
-import type { Check, Snapshot } from "../src/snapshot.ts";
+import type { Check, Snapshot, WorkflowRun } from "../src/snapshot.ts";
 
 export const HEAD1 = "1".repeat(40);
 export const HEAD2 = "2".repeat(40);
@@ -22,6 +22,7 @@ export function snap(over: Partial<Snapshot> = {}): Snapshot {
     threads: [],
     comments: [],
     checks: [],
+    workflowRuns: [],
     ...over,
   };
 }
@@ -33,11 +34,24 @@ export function check(name: string, over: Partial<Check> = {}): Check {
     type: "check_run",
     checkRunId: name.length,
     workflowRunId: 500,
-    workflow: "CI",
     done: true,
     conclusion: "success",
     url: `https://github.com/octo/widgets/actions/runs/500/job/${name}`,
     at: "2026-10-27T00:01:00Z",
+    ...over,
+  };
+}
+
+export function run(over: Partial<WorkflowRun> = {}): WorkflowRun {
+  return {
+    id: 500,
+    attempt: 1,
+    name: "CI",
+    done: true,
+    conclusion: "success",
+    url: "https://github.com/octo/widgets/actions/runs/500",
+    api: "https://api.github.com/repos/octo/widgets/actions/runs/500",
+    at: "2026-10-27T00:03:00Z",
     ...over,
   };
 }

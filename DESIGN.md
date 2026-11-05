@@ -364,7 +364,22 @@ CREATE UNIQUE INDEX events_dedupe ON events (inbox, id);
 
 CREATE TABLE ticket_nonces (nonce TEXT PRIMARY KEY, exp INTEGER);
 CREATE TABLE buckets (name TEXT PRIMARY KEY, tokens REAL, updated_at INTEGER);
+
+-- Where each inbox deleted for being idle had got to; one made again
+-- under its name carries on from there, so seqs are never reused.
+CREATE TABLE deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER, acked INTEGER);
+-- When a subscription to each inbox was last asked for; keeps it from
+-- being deleted as idle while the Worker makes one.
+CREATE TABLE subscribing (inbox TEXT PRIMARY KEY, at INTEGER);
 ```
+
+`deleted_inboxes` keeps a deleted name until the name is used again,
+however long that is: forgetting one would let a recreated inbox start
+again at seq 1, and a client still holding a position from before would
+silently skip its first events. It grows only when an account at the
+inbox cap deletes inboxes nobody has read for 30 days. Everything deleted
+in a 30-day window already existed at its start, so it grows by about the
+cap (500 rows) per 30 days at most, at roughly 50-100 bytes a row.
 
 RPC methods:
 
@@ -394,12 +409,16 @@ meanwhile. Either way an inbox keeps a run of consecutive `seq`s, so a
 read whose first event isn't the one straight after the reader's
 position (or that finds none, from before `head`) has missed some: it
 starts with an `inbox.gap`, made at read time, not stored, whose `seq` is
-just before the first event kept. If it doesn't recognise
-a subscription (the user deleted it, but RepoHub hadn't heard yet), it
-says so, and RepoHub deletes its copy. So the two copies of a
-subscription converge without a transaction across objects: Account
-writes its index row as pending, calls `RepoHub.subscribe`, and marks the
-row active only when that succeeds.
+just before the first event kept. A position ahead of `head` gets one
+too, then everything kept: an `ack` past `head` is ignored, and an inbox
+deleted for being idle leaves its `head` and `acked` in
+`deleted_inboxes` for one made again under its name to carry on from, so
+`seq`s are never reused and such a position can't be one the inbox gave
+out. If it doesn't recognise a subscription (the user deleted it, but
+RepoHub hadn't heard yet), it says so, and RepoHub deletes its copy. So
+the two copies of a subscription converge without a transaction across
+objects: Account writes its index row as pending, calls
+`RepoHub.subscribe`, and marks the row active only when that succeeds.
 
 Reading an inbox pushes the new `expires_at` to the RepoHubs of its
 subscriptions (`touch`), at most once an hour per subscription, so
@@ -493,9 +512,14 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   installation token as the baseline (404 is `not_found`); the account's
   quota (`Account.checkSubscription`: the inbox must exist, at most 200
   subscriptions); `RepoHub.subscribe`; then `Account.saveSubscription`
-  and `Installation.addRepo`. Account keeps the index that `GET` and
-  `DELETE` read, and drops a row when a `watch.*` event for it is
-  delivered, so it follows RepoHub ending watches.
+  and `Installation.addRepo`. Other requests reach Account between its
+  two calls, so `checkSubscription` notes the inbox in `subscribing`,
+  which keeps it from being deleted as idle for 30 days, and
+  `saveSubscription` checks again that it exists (refusing, and the
+  Worker taking the subscription back from RepoHub, if not). Account
+  keeps the index that `GET` and `DELETE` read, and drops a row when a
+  `watch.*` event for it is delivered, so it follows RepoHub ending
+  watches.
 - The install URL (in `/v1/meta`, `app_not_installed` and the landing
   page) comes from the `GITHUB_APP_SLUG` var, through `installUrl(env)`
   in `src/subscriptions.ts`; a self-hosted copy has its own App.
@@ -1037,6 +1061,10 @@ watcheroni config [get | set] <key> [value]
   each look at its events. `unwatch` ends the PR's server subscription,
   drops its events not yet read, and remembers the subscription so the
   events the server still had queued for it are dropped as they arrive.
+  Server events received but not yet shown when an `inbox.gap` moves the
+  reader's position back are kept in the inbox file too, shown before
+  the server's, and never acknowledged to the server under their old
+  `seq`s; one being shown when the gap came may be shown twice.
 - **`wait`** connects over WebSocket, waits for at least one event, then
   keeps collecting for a short settle time (default 5 s, `--settle`) so a
   review with ten comments arrives as one wake-up, not ten; `--settle 0`
@@ -1094,7 +1122,8 @@ server doesn't send it, with a `--jq` filter that keeps just the text.
 
 When the App isn't installed on a target (`app_not_installed`), the server
 is unreachable, or the repo is throttled, the CLI polls GitHub directly for
-that target every 2 minutes with one GraphQL query, and turns what changed
+that target every 2 minutes with one GraphQL query (and a conditional
+REST request for the head commit's workflow runs), and turns what changed
 into the same event kinds. It needs GitHub credentials that can read the
 repo; it uses `gh auth token` or `GITHUB_TOKEN`, **locally only**. These
 are never sent to the watcheroni server. `doctor` explains which mode

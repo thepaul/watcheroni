@@ -1,5 +1,5 @@
 import type { DataValue, UnsequencedEvent } from "@watcheroni/protocol";
-import type { Actor, Check, Snapshot } from "./snapshot.ts";
+import type { Actor, Check, Snapshot, WorkflowRun } from "./snapshot.ts";
 
 // Turns the change between two snapshots of a PR into the same event kinds
 // the server sends (PROTOCOL.md, "Kinds"), with IDs prefixed `local:`. The
@@ -126,12 +126,23 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
     emit("check.completed", discriminator, data, opts);
     if (isFailed(c)) emit("check.failed", discriminator, data, opts);
   }
-  for (const [runId, run] of workflowRuns(next.checks)) {
-    const before = workflowRuns([...prevChecks.values()]).get(runId);
-    if (!run.done || before?.done) continue;
-    emit("workflow.completed", String(runId), {
-      head_sha: next.head, run_id: runId, workflow: run.workflow, conclusion: run.conclusion,
-    }, { html: `https://github.com/${full}/actions/runs/${runId}`, api: `${api}/actions/runs/${runId}` });
+  // Workflow runs on the head commit, finished by GitHub's own account of
+  // the run (not its jobs: those waiting on others don't exist yet). A
+  // re-run is a new attempt of the same run, so its finishing counts too,
+  // as does a run completed again with another conclusion (a fork's run
+  // is completed as `action_required` until a maintainer approves it).
+  // Without the last poll's runs, only those its checks show were still
+  // running can be told to have finished since (see runsBefore()).
+  const before = runsBefore(prev, next);
+  if (before && next.workflowRuns) {
+    for (const r of next.workflowRuns) {
+      if (!r.done) continue;
+      const b = before.runs.get(r.id);
+      if (b ? b.done && b.attempt === r.attempt && b.conclusion === r.conclusion : !before.all) continue;
+      emit("workflow.completed", `${r.id}:${r.attempt}:${r.conclusion}`, {
+        head_sha: next.head, run_id: r.id, workflow: r.name, conclusion: r.conclusion,
+      }, { at: r.at, html: r.url, api: r.api });
+    }
   }
 
   // Last, so an agent reads what happened before being told it's over.
@@ -146,19 +157,41 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
   return events;
 }
 
-function isFailed(c: Check): boolean {
-  return c.done && c.conclusion !== null && FAILED.has(c.conclusion);
+// The IDs of the runs known to have been still running at some poll on
+// `snap`'s head since its runs were last read, when they weren't read for
+// `snap`: those a check of its showed still running, and those carried
+// from the polls before it on that head (poll.ts saves them with it).
+export function runningRuns(snap: Snapshot): number[] {
+  // From the inbox file, so checked.
+  const ids = new Set(Array.isArray(snap.runningRuns) ? snap.runningRuns.filter((id) => typeof id === "number") : []);
+  for (const c of snap.checks) if (!c.done && c.workflowRunId !== null) ids.add(c.workflowRunId);
+  return [...ids];
 }
 
-function workflowRuns(checks: Check[]): Map<number, { workflow: string | null; done: boolean; conclusion: string }> {
-  const runs = new Map<number, { workflow: string | null; done: boolean; conclusion: string }>();
-  for (const c of checks) {
-    if (c.workflowRunId === null) continue;
-    const run = runs.get(c.workflowRunId) ?? { workflow: c.workflow, done: true, conclusion: "success" };
-    run.done &&= c.done;
-    if (isFailed(c)) run.conclusion = "failure";
-    else if (c.conclusion === "cancelled" && run.conclusion === "success") run.conclusion = "cancelled";
-    runs.set(c.workflowRunId, run);
-  }
-  return runs;
+// What's known of the workflow runs at the last poll, to compare `next`'s
+// with: `all` of them, by ID (none after a push, as every run on a new
+// head is new), or, when they weren't read (a snapshot saved before runs
+// were, or while they couldn't be), only the runs known to have been
+// still running at a poll since (see runningRuns()), as not done. Null
+// when `next`'s runs weren't read either.
+export function runsBefore(prev: Snapshot, next: Snapshot): { all: boolean; runs: Map<number, Pick<WorkflowRun, "done" | "attempt" | "conclusion">> } | null {
+  if (!next.workflowRuns) return null;
+  if (next.head !== prev.head) return { all: true, runs: new Map() };
+  if (prev.workflowRuns) return { all: true, runs: new Map(prev.workflowRuns.map((r) => [r.id, r])) };
+  const running = new Map<number, Pick<WorkflowRun, "done" | "attempt" | "conclusion">>();
+  for (const id of runningRuns(prev)) running.set(id, { done: false, attempt: 0, conclusion: null });
+  return { all: false, runs: running };
+}
+
+// Runs in `next` that had finished by a poll that couldn't compare them
+// with the last one's (see runsBefore()): whether they finished since the
+// last poll can't be known, so they aren't reported.
+export function unknownRuns(prev: Snapshot, next: Snapshot): WorkflowRun[] {
+  const before = runsBefore(prev, next);
+  if (!before || before.all) return [];
+  return next.workflowRuns!.filter((r) => r.done && !before.runs.has(r.id));
+}
+
+function isFailed(c: Check): boolean {
+  return c.done && c.conclusion !== null && FAILED.has(c.conclusion);
 }

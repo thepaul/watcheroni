@@ -517,6 +517,11 @@ async function longPoll(
   signal: AbortSignal,
 ): Promise<Response> {
   const after = intParam(url, "after");
+  // As for `hello` over a WebSocket: a position that isn't one is refused,
+  // not read as "from acked".
+  if (url.searchParams.has("after") && !Number.isSafeInteger(after)) {
+    return problem(400, "invalid_request", "after must be a non-negative integer");
+  }
   const wait = clamp(intParam(url, "wait") ?? 0, 0, MAX_WAIT_SECONDS);
   const limit = clamp(intParam(url, "limit") ?? 100, 1, MAX_LIMIT);
 

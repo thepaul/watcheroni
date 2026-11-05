@@ -2,19 +2,20 @@ import { mkdtempSync, readdirSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { UnsequencedEvent, WatchEvent } from "@watcheroni/protocol";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
-import { formatText } from "../src/format.ts";
-import { GitHubError } from "../src/github.ts";
+import { clean, formatText, toJson } from "../src/format.ts";
+import { GitHubError, graphql, restList } from "../src/github.ts";
 import { Inbox, InboxBusy } from "../src/inbox.ts";
-import { pollOnce } from "../src/poll.ts";
+import { forgetWarnings, pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { UsageError, parseTarget, repoKey, targetKey, type Target } from "../src/targets.ts";
-import { alice, bob, check, snap } from "./fixtures.ts";
+import { HEAD1, HEAD2, alice, bob, check, run, snap } from "./fixtures.ts";
 
 let n = 0;
 beforeEach(() => {
   process.env.WATCHERONI_STATE_DIR = mkdtempSync(join(tmpdir(), "watcheroni-test-"));
+  forgetWarnings();
 });
 const open = () => Inbox.open(`t${n++}`);
 const age = (file: string, days: number) => {
@@ -54,8 +55,29 @@ describe("inbox", () => {
     const inbox = open();
     expect(inbox.append([event("a"), event("b")]).map((e) => e.seq)).toEqual([1, 2]);
     expect(inbox.append([event("b"), event("c")]).map((e) => e.id)).toEqual(["c"]);
-    inbox.ack(2);
+    inbox.handled(inbox.pending().filter((e) => e.seq <= 2));
     expect(inbox.pending().map((e) => e.seq)).toEqual([3]);
+    inbox.close();
+  });
+
+  it("handles exactly the events given, and keeps what's held, under its own numbering, till handled", () => {
+    const inbox = open();
+    inbox.append([event("a"), event("b"), event("c")]);
+    inbox.handled(inbox.pending().filter((e) => e.id === "b"));
+    expect(inbox.pending().map((e) => e.id)).toEqual(["a", "c"]);
+    // From a server's inbox, numbered there.
+    inbox.hold([{ ...event("s1"), seq: 40 }, { ...event("s2"), seq: 41 }]);
+    expect(inbox.pending().map((e) => [e.seq, e.id])).toEqual([[1, "a"], [3, "c"], [4, "s1"], [5, "s2"]]);
+    expect([...inbox.heldSeqs()]).toEqual([4, 5]);
+    inbox.handled(inbox.pending().filter((e) => e.id === "s1"));
+    expect([...inbox.heldSeqs()]).toEqual([5]);
+    // Unwatching a PR drops its events, held ones too.
+    const eight = { owner: "octo", name: "widgets", number: 8 };
+    inbox.watch(targetKey(eight), eight);
+    inbox.hold([{ ...event("s3"), seq: 42, repo: { id: 1, full_name: "octo/widgets" }, pr: 8 }]);
+    expect([...inbox.heldSeqs()]).toEqual([5, 6]);
+    inbox.unwatch(targetKey(eight));
+    expect([...inbox.heldSeqs()]).toEqual([5]);
     inbox.close();
   });
 
@@ -96,11 +118,11 @@ describe("inbox", () => {
     const [old, dead, recent, busy, current] = [`t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`];
     for (const name of [old, dead, recent, current]) {
       const i = Inbox.open(name);
-      i.ack(0);
+      i.append([]);
       i.close();
     }
     const held = Inbox.open(busy);
-    held.ack(0);
+    held.append([]);
     // One left locked by a process that has gone.
     writeFileSync(at(`${dead}.lock`), "999999");
     // Opened, never saved: by a process that has gone, and by one still running.
@@ -141,6 +163,191 @@ describe("polling", () => {
     expect((await pollOnce(inbox, log, fetch)).map((e) => e.kind)).toEqual(["pr.merged", "watch.ended"]);
     expect(inbox.watched()).toEqual([]);
     inbox.close();
+  });
+
+  it("keeps the last workflow runs read while they can't be, and records each conclusion GitHub gives", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const snapshots: Snapshot[] = [
+      snap({ workflowRuns: [run({ done: false, conclusion: null }), run({ id: 600, done: false, conclusion: null })] }),
+      snap({ workflowRuns: [run({ conclusion: "action_required" }), run({ id: 600, done: false, conclusion: null })] }),
+      // Runs unreadable for a while: run 600 finishes meanwhile.
+      snap({ workflowRuns: null }),
+      snap({ workflowRuns: null }),
+      // Back, with 500 approved and finished.
+      snap({ workflowRuns: [run(), run({ id: 600 })] }),
+    ];
+    const fetch = async () => snapshots.shift()!;
+    const polled = async () => (await pollOnce(inbox, () => {}, fetch)).map((e) => [e.kind, e.data.run_id, e.data.conclusion]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["workflow.completed", 500, "action_required"]]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["workflow.completed", 500, "success"], ["workflow.completed", 600, "success"]]);
+    inbox.close();
+  });
+
+  it("after a push with runs unreadable, keeps none of the old head's and reports the new head's", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const snapshots: Snapshot[] = [
+      // Run 500 had finished when watching started: never reported.
+      snap({ workflowRuns: [run()] }),
+      // Pushed; the new head's runs can't be read yet, and then are.
+      snap({ head: HEAD2, workflowRuns: null }),
+      snap({ head: HEAD2, workflowRuns: [run({ id: 700, done: false, conclusion: null })] }),
+      // Pushed again; a run on that head finishes before its runs can be read.
+      snap({ head: HEAD1, workflowRuns: null }),
+      snap({ head: HEAD1, workflowRuns: [run({ id: 800, conclusion: "failure" })] }),
+    ];
+    const fetch = async () => snapshots.shift()!;
+    const polled = async () => (await pollOnce(inbox, () => {}, fetch)).map((e) => [e.kind, e.data.run_id ?? null]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["pr.pushed", null]]);
+    expect(await polled()).toEqual([]);
+    expect(await polled()).toEqual([["pr.pushed", null]]);
+    expect(await polled()).toEqual([["workflow.completed", 800]]);
+    inbox.close();
+  });
+
+  it("says once that workflow runs can't be read, and once that they can again", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const unreadable = (why: string) => ({ ...snap({ workflowRuns: null }), workflowRunsError: why });
+    const snapshots: Snapshot[] = [
+      unreadable("GitHub /repos/octo/widgets/actions/runs: 403 Resource not accessible by personal access token"),
+      unreadable("GitHub /repos/octo/widgets/actions/runs: 502 Server Error"),
+      snap(),
+      snap(),
+      unreadable("fetch failed"),
+    ];
+    const logged: string[] = [];
+    for (let i = 0; i < 5; i++) await pollOnce(inbox, (m) => logged.push(m), async () => snapshots.shift()!);
+    expect(logged).toEqual([
+      "octo/widgets#7: can't read its workflow runs (GitHub /repos/octo/widgets/actions/runs: 403 Resource not accessible by personal access token); no workflow.completed until they can be read",
+      "octo/widgets#7: its workflow runs can be read again",
+      "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
+    ]);
+
+    // Still unreadable: not said again in this process, but said in the
+    // next one (a later `watcheroni wait`), even though the inbox already
+    // knew.
+    logged.length = 0;
+    for (let i = 0; i < 2; i++) await pollOnce(inbox, (m) => logged.push(m), async () => unreadable("fetch failed"));
+    expect(logged).toEqual([]);
+    forgetWarnings();
+    for (let i = 0; i < 2; i++) await pollOnce(inbox, (m) => logged.push(m), async () => unreadable("fetch failed"));
+    expect(logged).toEqual([
+      "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read",
+    ]);
+    inbox.close();
+  });
+
+  it("says which runs it can't report when it first reads them after the first poll", async () => {
+    // Saved by a version that didn't read runs, with run 500's job running.
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const { workflowRuns: _, ...saved } = snap({ checks: [check("lint", { done: false, conclusion: null })] });
+    inbox.record(targetKey(target), saved as Snapshot, []);
+    const logged: string[] = [];
+    const runs = [run(), run({ id: 600, name: "Docs" })];
+    const events = await pollOnce(inbox, (m) => logged.push(m), async () => snap({ checks: [check("lint")], workflowRuns: runs }));
+    expect(events.filter((e) => e.kind === "workflow.completed").map((e) => e.data.run_id)).toEqual([500]);
+    expect(logged).toEqual([
+      "octo/widgets#7: read its workflow runs on this head for the first time; workflow run 600 had already finished, so if it finished since the last poll, no workflow.completed is sent for it",
+    ]);
+    // Read since: nothing more to say.
+    logged.length = 0;
+    await pollOnce(inbox, (m) => logged.push(m), async () => snap({ checks: [check("lint")], workflowRuns: runs }));
+    expect(logged).toEqual([]);
+
+    // Runs that couldn't be read from the first poll, read at last.
+    const other = open();
+    other.watch(targetKey(target), target);
+    const unreadable = { ...snap({ workflowRuns: null }), workflowRunsError: "fetch failed" };
+    await pollOnce(other, () => {}, async () => unreadable);
+    await pollOnce(other, (m) => logged.push(m), async () => snap({ workflowRuns: runs }));
+    expect(logged.at(-1)).toBe(
+      "octo/widgets#7: its workflow runs can be read again; workflow runs 500, 600 had already finished, so any of them that finished since the last poll gets no workflow.completed",
+    );
+    inbox.close();
+    other.close();
+  });
+
+  it("remembers a run seen running at any poll while the runs couldn't be read", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const unreadable = (s: Snapshot) => ({ ...s, workflowRuns: null, workflowRunsError: "fetch failed" });
+    const snapshots: Snapshot[] = [
+      // Run 500's job running at the first poll, done by the second, and
+      // the runs read only at the third.
+      unreadable(snap({ checks: [check("lint", { done: false, conclusion: null })] })),
+      unreadable(snap({ checks: [check("lint")] })),
+      snap({ checks: [check("lint")], workflowRuns: [run()] }),
+    ];
+    const logged: string[] = [];
+    const events: WatchEvent[] = [];
+    // Each poll by a new process, as each `wait` is: what's carried is
+    // in the inbox file.
+    const name = `t${n++}`;
+    let current = inbox;
+    current.close();
+    for (let i = 0; i < 3; i++) {
+      current = Inbox.open(name);
+      if (i === 0) current.watch(targetKey(target), target);
+      events.push(...await pollOnce(current, (m) => logged.push(m), async () => snapshots.shift()!));
+      if (i === 1) expect(current.watched()[0].snapshot?.runningRuns).toEqual([500]);
+      if (i < 2) current.close();
+    }
+    expect(events.filter((e) => e.kind === "workflow.completed").map((e) => e.data.run_id)).toEqual([500]);
+    expect(logged.at(-1)).toBe("octo/widgets#7: its workflow runs can be read again");
+    // Once read, nothing is carried.
+    expect(current.watched()[0].snapshot).not.toHaveProperty("runningRuns");
+    current.close();
+  });
+
+  it("forgets it said so once the PR is unwatched or ends, so watching it again says so again", async () => {
+    const unreadable = (o: Partial<Snapshot> = {}) => ({ ...snap({ workflowRuns: null, ...o }), workflowRunsError: "fetch failed" });
+    const warning = "octo/widgets#7: can't read its workflow runs (fetch failed); no workflow.completed until they can be read";
+    const inbox = open();
+    const logged: string[] = [];
+    const poll = (s: Snapshot) => pollOnce(inbox, (m) => logged.push(m), async () => s);
+    // Unwatched, then watched again.
+    inbox.watch(targetKey(target), target);
+    await poll(unreadable());
+    inbox.unwatch(targetKey(target));
+    await poll(unreadable());
+    inbox.watch(targetKey(target), target);
+    await poll(unreadable());
+    expect(logged).toEqual([warning, warning]);
+    // Ended, then watched again.
+    logged.length = 0;
+    await poll(unreadable({ state: "MERGED" }));
+    expect(inbox.watched()).toEqual([]);
+    inbox.watch(targetKey(target), target);
+    await poll(unreadable());
+    expect(logged).toEqual([warning]);
+    inbox.close();
+  });
+
+  it("has nothing to compare when runs have never been read on this head", async () => {
+    const inbox = open();
+    inbox.watch(targetKey(target), target);
+    const { workflowRuns: _, ...saved } = snap();
+    const snapshots: Snapshot[] = [snap({ workflowRuns: null }), snap({ workflowRuns: null }), snap({ workflowRuns: [run()] })];
+    const fetch = async () => snapshots.shift()!;
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    expect(await pollOnce(inbox, () => {}, fetch)).toEqual([]);
+    // A snapshot saved by an older version, without runs.
+    const old = open();
+    old.watch(targetKey(target), target);
+    old.record(targetKey(target), saved as Snapshot, []);
+    const later = [snap({ workflowRuns: null }), snap({ workflowRuns: [run()] })];
+    expect(await pollOnce(old, () => {}, async () => later.shift()!)).toEqual([]);
+    expect(await pollOnce(old, () => {}, async () => later.shift()!)).toEqual([]);
+    inbox.close();
+    old.close();
   });
 
   it("says at once if the PR has already ended", async () => {
@@ -251,7 +458,7 @@ describe("changing an inbox a wait holds", () => {
     const editor = Inbox.edit(name);
     expect(editor.watch(targetKey(seven), seven)).toBe(true);
     // The reader's own change keeps the watch it hadn't seen.
-    reader.ack(1);
+    reader.handled(reader.pending());
     expect(reader.watched().map((w) => targetKey(w.target))).toEqual(["octo/widgets#7"]);
     expect(Inbox.peek(name)).toMatchObject({ pending: 0 });
     reader.close();
@@ -310,9 +517,10 @@ describe("text output", () => {
     const inbox = open();
     const target = { owner: "octo", name: "widgets", number: 7 };
     inbox.watch(targetKey(target), target);
-    const before = snap({ checks: [check("lint", { done: false, conclusion: null })] });
+    const before = snap({ checks: [check("lint", { done: false, conclusion: null })], workflowRuns: [run({ done: false, conclusion: null })] });
     const after = snap({
       checks: [check("lint", { conclusion: "failure" })],
+      workflowRuns: [run({ conclusion: "failure" })],
       reviews: [{ id: 10, state: "CHANGES_REQUESTED", empty: false, at: "t", url: "u", author: alice }],
       reviewComments: [
         { id: 20, reviewId: 10, inReplyTo: null, path: "a.ts", line: 3, at: "t", url: "u", author: alice },
@@ -434,5 +642,87 @@ describe("text output", () => {
       "",
       "octo/widgets#7 is still open. Run `watcheroni wait` again to keep watching.",
     ].join("\n"));
+  });
+
+  it("carries no control or formatting character from any field", () => {
+    const NASTY = "x\x1b]0;pwned\x07\u202e\u009b2J\u200b\u2028\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180e\r\n";
+    const kinds = [
+      "review.submitted", "review.dismissed", "review_comment.created", "comment.created", "thread.resolved", "check.completed",
+      "check.failed", "workflow.completed", "pr.pushed", "pr.base_changed", "pr.review_requested", "pr.merged", "watch.ended",
+      "watch.expired", "watch.unverified", "watch.revoked", "inbox.gap", NASTY,
+    ];
+    const data = Object.fromEntries([
+      "review_id", "state", "path", "line", "in_reply_to", "comment_id", "name", "conclusion", "head_sha", "workflow_run_id",
+      "check_run_id", "workflow", "run_id", "before", "after", "from", "to", "reviewer", "merge_sha", "reason", "missed_after", "resumed_at",
+    ].map((k) => [k, NASTY]));
+    const events = kinds.map((kind, i) => ({
+      v: 1, seq: i + 1, id: NASTY, sub: NASTY, kind, at: NASTY, received_at: NASTY,
+      repo: { id: 1, full_name: NASTY }, pr: NASTY, actor: { id: 1, login: NASTY, bot: false }, data,
+      links: { html: `https://evil.test/${NASTY}`, api: `https://api.github.com/${NASTY}` },
+    })) as unknown as WatchEvent[];
+    // And a kind that isn't even a string, about no repo.
+    events.push({ ...events[0], kind: { toString: () => NASTY }, repo: null } as unknown as WatchEvent);
+    const text = formatText(events, ["octo/widgets#7"]);
+    expect(text).toMatch(/^"x \]0;pwned 2J"#\?: 18 new events/);
+    expect(text.replace(/\n/g, "")).not.toMatch(/[\x00-\x1f\x7f-\x9f\u061c\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/);
+  });
+});
+
+describe("GitHub's errors", () => {
+  it("are cleaned, and not cut short", async () => {
+    vi.stubEnv("GH_TOKEN", "ghp_test");
+    const NASTY = `\x1b[31mred\x1b]8;;https://evil.test\x07link\r\x00 ${"because ".repeat(20)}end`;
+    const fetches = vi.spyOn(globalThis, "fetch");
+    try {
+      fetches.mockResolvedValueOnce(new Response(NASTY, { status: 502 }));
+      const down = (await graphql("{}", {}).catch((e: Error) => e)) as GitHubError;
+      expect(down.message).toMatch(/^GitHub GraphQL: 502 \[31mred \]8;;https:\/\/evil\.test link because .* end$/);
+      fetches.mockResolvedValueOnce(Response.json({ errors: [{ type: "NOT_FOUND", message: NASTY }, { message: NASTY }] }));
+      const missing = (await graphql("{}", {}).catch((e: Error) => e)) as GitHubError;
+      expect(missing.status).toBe(404);
+      expect(missing.message).toMatch(/^\[31mred .* end; \[31mred .* end$/);
+      // And from a REST list, as JSON or not.
+      fetches.mockResolvedValueOnce(Response.json({ message: NASTY }, { status: 403 }));
+      const denied = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(denied.message).toMatch(/^GitHub \/repos\/octo\/widgets\/actions\/runs: 403 \[31mred .* end$/);
+      fetches.mockResolvedValueOnce(new Response(NASTY, { status: 500 }));
+      const failed = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      // A next page outside GitHub's API, or one already read, is named
+      // cleaned too. (A header can't hold a line break or a NUL.)
+      const LINK = "\x1b[31mred\x1b]8;;x\x07link\x7fend";
+      const page = (next: string) => Response.json([], { headers: { link: `<${next}>; rel="next"` } });
+      fetches.mockResolvedValueOnce(page(`https://evil.test/${LINK}`));
+      const outside = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(outside.message).toMatch(/^GitHub \/repos\/octo\/widgets\/actions\/runs: next page outside https:\/\/api\.github\.com\/: https:\/\/evil\.test\/ \[31mred/);
+      const again = `https://api.github.com/repos/octo/widgets/actions/runs?x=${LINK}`;
+      fetches.mockResolvedValueOnce(page(again)).mockResolvedValueOnce(page(again));
+      const repeated = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(repeated.message).toMatch(/: next page already read: https:\/\/api\.github\.com\/repos\/octo\/widgets\/actions\/runs\?x= \[31mred/);
+      // Pages without end stop at 20.
+      let asked = 0;
+      fetches.mockImplementation(async () => page(`https://api.github.com/repos/octo/widgets/actions/runs?page=${++asked}`));
+      const endless = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(endless.message).toBe("GitHub /repos/octo/widgets/actions/runs: more than 20 pages");
+      expect(asked).toBe(20);
+      for (const m of [down.message, missing.message, denied.message, failed.message, outside.message, repeated.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
+    } finally {
+      fetches.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe("JSON output", () => {
+  it("escapes what a terminal would act on, and parses to the same value", () => {
+    const value = { s: "a\x1b[31m\x7f\u009b\u200b\u202e\u2028\u2066\ufeff\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180ez", n: 1, list: ["é", "日本"] };
+    const json = toJson(value);
+    expect(json).toBe(String.raw`{"s":"a\u001b[31m\u007f\u009b\u200b\u202e\u2028\u2066\ufeff\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180ez","n":1,"list":["é","日本"]}`);
+    expect(JSON.parse(json)).toEqual(value);
+  });
+
+  it("and what's printed on one line is cleaned of the same, cut by whole characters", () => {
+    expect(clean("a\u200c\u200f\u202a\u202d\u2060\u2069\u061c\u180e\u202e\x1bb")).toBe("a b");
+    const cut = clean("\u{1F600}".repeat(10), 5);
+    expect(Array.from(cut)).toEqual(["\u{1F600}", "\u{1F600}", "\u{1F600}", "\u{1F600}", "\u2026"]);
   });
 });

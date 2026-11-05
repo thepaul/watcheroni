@@ -190,6 +190,12 @@ export class Account extends DurableObject<Env> {
         verified_until INTEGER
       );
       CREATE INDEX IF NOT EXISTS subscriptions_inbox ON subscriptions (inbox);
+      -- Where each inbox deleted for being idle had got to, so one made
+      -- again under its name carries on from there.
+      CREATE TABLE IF NOT EXISTS deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER NOT NULL, acked INTEGER NOT NULL);
+      -- When a subscription to each inbox was last asked for, so it isn't
+      -- taken for idle while the Worker makes one (checkSubscription).
+      CREATE TABLE IF NOT EXISTS subscribing (inbox TEXT PRIMARY KEY, at INTEGER NOT NULL);
     `);
   }
 
@@ -298,30 +304,51 @@ export class Account extends DurableObject<Env> {
 
   // Creates the inbox if needed, whatever the cap. Only API calls and
   // client sockets are held to it; deliveries go to inboxes they made.
+  // An inbox made again after roomForInbox deleted it takes up its old
+  // `head` and `acked`, as if its events had all expired: seqs are never
+  // reused, so a reader still holding a position from before is behind
+  // (and gets `inbox.gap`), never silently ahead. PROTOCOL.md promises
+  // that, so any other way of deleting an inbox (such as the documented
+  // but not yet built DELETE /v1/inboxes/{name}) must write
+  // deleted_inboxes too.
   private ensureInbox(name: string): InboxRow {
     this.open();
-    this.sql.exec("INSERT OR IGNORE INTO inboxes (name, created_at) VALUES (?, ?)", name, Date.now());
+    const existing = this.inbox(name);
+    if (existing) return existing;
+    const old = this.sql
+      .exec<{ head: number; acked: number }>("SELECT head, acked FROM deleted_inboxes WHERE name = ?", name)
+      .toArray()[0];
+    this.sql.exec(
+      "INSERT INTO inboxes (name, created_at, head, acked) VALUES (?, ?, ?, ?)",
+      name, Date.now(), old?.head ?? 0, old?.acked ?? 0,
+    );
+    if (old) this.sql.exec("DELETE FROM deleted_inboxes WHERE name = ?", name);
     return this.inbox(name)!;
   }
 
   // Is there room for the inbox, if it's new? At the cap, deletes the
-  // inboxes nobody has read for INBOX_IDLE_DAYS, if nothing is subscribed
-  // or connected to them, to make some.
+  // inboxes nobody has read (or asked to subscribe to) for
+  // INBOX_IDLE_DAYS, if nothing is subscribed or connected to them, to
+  // make some.
   private roomForInbox(name: string): { ok: true } | Refusal {
     if (this.inbox(name)) return { ok: true };
     const count = () => this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM inboxes").one().n;
     if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
     const idle = this.sql
       .exec<{ name: string }>(
-        `SELECT name FROM inboxes WHERE MAX(created_at, COALESCE(last_read_at, 0)) < ?
-         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.inbox = inboxes.name)`,
+        `SELECT name FROM inboxes WHERE MAX(created_at, COALESCE(last_read_at, 0)) < ?1
+         AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.inbox = inboxes.name)
+         AND NOT EXISTS (SELECT 1 FROM subscribing WHERE subscribing.inbox = inboxes.name AND subscribing.at >= ?1)`,
         Date.now() - INBOX_IDLE_DAYS * 24 * 3600 * 1000,
       )
       .toArray();
     for (const { name: old } of idle) {
       if (this.ctx.getWebSockets(`inbox:${old}`).length) continue;
       this.sql.exec("DELETE FROM events WHERE inbox = ?", old);
+      // Remembered so the name never reuses a seq (see ensureInbox).
+      this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ?", old);
       this.sql.exec("DELETE FROM inboxes WHERE name = ?", old);
+      this.sql.exec("DELETE FROM subscribing WHERE inbox = ?", old);
     }
     if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
     return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many inboxes on this account (at most ${ACCOUNT_MAX_INBOXES})` };
@@ -344,28 +371,45 @@ export class Account extends DurableObject<Env> {
     };
   }
 
-  // RPC: move the acknowledged position forward, never back or past head.
+  // RPC: move the acknowledged position forward, never back. An ack past
+  // head is ignored, not taken as head: it's from a position this inbox
+  // never gave out (its numbering went back), and taking it as head would
+  // acknowledge events of the inbox's new life the client hasn't read.
   ack(name: string, seq: number): InboxRow | null {
     if (!this.inbox(name)) return null;
     this.open();
-    this.sql.exec("UPDATE inboxes SET acked = MAX(acked, MIN(?, head)) WHERE name = ?", seq, name);
+    this.sql.exec("UPDATE inboxes SET acked = MAX(acked, ?) WHERE name = ? AND ? <= head", seq, name, seq);
     return this.inbox(name);
   }
 
   // RPC, before subscribing: does the inbox exist, and is there room for
-  // another subscription?
+  // another subscription? The Worker calls RepoHub before saveSubscription,
+  // and other requests run here meanwhile, so this notes the inbox in
+  // `subscribing`: roomForInbox, making room for another inbox, then won't
+  // take it for idle for INBOX_IDLE_DAYS. (Not by setting `last_read_at`,
+  // which would also keep the inbox's subscriptions from expiring.)
   checkSubscription(inbox: string): SubscriptionCheck {
     if (!this.inbox(inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
     const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions").one().n;
     if (n >= ACCOUNT_MAX_SUBSCRIPTIONS) {
       return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many subscriptions on this account (at most ${ACCOUNT_MAX_SUBSCRIPTIONS})` };
     }
+    this.open();
+    this.sql.exec(
+      "INSERT INTO subscribing (inbox, at) VALUES (?, ?) ON CONFLICT (inbox) DO UPDATE SET at = excluded.at",
+      inbox, Date.now(),
+    );
     return { ok: true };
   }
 
-  // RPC, once RepoHub has the subscription.
-  saveSubscription(sub: SubscriptionInfo): void {
+  // RPC, once RepoHub has the subscription. Refuses if the inbox is gone
+  // after all, so no subscription is ever kept for a missing inbox (which
+  // deliveries would make again, past the cap); the Worker then takes it
+  // back from RepoHub. This runs without an await, so nothing can delete
+  // the inbox between the check and the insert.
+  saveSubscription(sub: SubscriptionInfo): SubscriptionCheck {
     const { baseline: _, ...rest } = sub;
+    if (!this.inbox(rest.inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
     this.open();
     this.sql.exec(
       `INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at, verified_until)
@@ -376,6 +420,7 @@ export class Account extends DurableObject<Env> {
       Date.parse(rest.created_at), Date.parse(rest.expires_at),
       rest.verified_until === null ? null : Date.parse(rest.verified_until),
     );
+    return { ok: true };
   }
 
   // RPC: an inbox's subscriptions, oldest first, or null if there's no
@@ -604,9 +649,11 @@ export class Account extends DurableObject<Env> {
       if (!events.length) return;
       send(ws, { type: "events", events });
       const last = events[events.length - 1].seq;
-      // Every page should move the position on; if one doesn't, stop
-      // rather than send it forever.
-      if (last <= attachment.pos) {
+      // Every page should move the position on, but for one starting with
+      // the `inbox.gap` that brings a position ahead of `head` back (see
+      // eventsAfter); if one doesn't, stop rather than send it forever.
+      const back = events[0].kind === "inbox.gap" && events[0].data.missed_after === attachment.pos;
+      if (last <= attachment.pos && !back) {
         console.error(`inbox ${attachment.inbox}: a page from ${attachment.pos} ended at ${last}`);
         return;
       }
@@ -629,20 +676,30 @@ export class Account extends DurableObject<Env> {
   // last one dropped), so handling it moves the reader past the gap, and
   // asking again from there brings no second one. `head` saves looking up
   // the inbox when the caller has it.
+  //
+  // A position ahead of `head` was never this inbox's: seqs are never
+  // reused (see ensureInbox) and an `ack` past `head` is ignored. Whatever
+  // it came from, the reader can't know what it missed, so it gets a gap
+  // too, and then everything kept; that gap's seq is below `after`, moving
+  // it back.
   private eventsAfter(name: string, after: number, limit: number, head?: number): WatchEvent[] {
     const now = Date.now();
     // Leaving out old events by `at` keeps what's left consecutive only
     // because `at` rises with `seq`.
-    const events = this.sql
-      .exec<{ body: string }>(
-        "SELECT body FROM events WHERE inbox = ? AND seq > ? AND at >= ? ORDER BY seq LIMIT ?",
-        name, after, now - INBOX_MAX_AGE_MS, limit,
-      )
-      .toArray()
-      .map((row) => JSON.parse(row.body) as WatchEvent);
+    const read = (from: number) =>
+      this.sql
+        .exec<{ body: string }>(
+          "SELECT body FROM events WHERE inbox = ? AND seq > ? AND at >= ? ORDER BY seq LIMIT ?",
+          name, from, now - INBOX_MAX_AGE_MS, limit,
+        )
+        .toArray()
+        .map((row) => JSON.parse(row.body) as WatchEvent);
+    let events = read(after);
     if (events.length && events[0].seq === after + 1) return events;
-    const resumedAt = events.length ? events[0].seq : (head ?? this.inbox(name)?.head ?? 0) + 1;
-    if (after + 1 >= resumedAt) return events;
+    const top = head ?? this.inbox(name)?.head ?? 0;
+    if (after > top) events = read(0);
+    const resumedAt = events.length ? events[0].seq : top + 1;
+    if (resumedAt === after + 1) return events;
     return [gapEvent(name, after, resumedAt, now), ...events.slice(0, limit - 1)];
   }
 }
