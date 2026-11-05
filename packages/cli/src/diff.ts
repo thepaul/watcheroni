@@ -162,7 +162,8 @@ export function diff(prev: Snapshot, next: Snapshot): UnsequencedEvent[] {
 // `snap`: those a check of its showed still running, and those carried
 // from the polls before it on that head (poll.ts saves them with it).
 export function runningRuns(snap: Snapshot): number[] {
-  const ids = new Set(snap.runningRuns ?? []);
+  // From the inbox file, so checked.
+  const ids = new Set(Array.isArray(snap.runningRuns) ? snap.runningRuns.filter((id) => typeof id === "number") : []);
   for (const c of snap.checks) if (!c.done && c.workflowRunId !== null) ids.add(c.workflowRunId);
   return [...ids];
 }

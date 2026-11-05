@@ -185,6 +185,14 @@ describe("diff", () => {
     expect(unknownRuns(snap({ workflowRuns: [run({ done: false })] }), snap({ workflowRuns: null }))).toEqual([]);
   });
 
+  it("workflow runs: runs carried as running, as the inbox file has them", () => {
+    const next = snap({ workflowRuns: [run(), run({ id: 600 })] });
+    const carried = (runningRuns: unknown) => ({ ...snap({ workflowRuns: null }), runningRuns } as unknown as Snapshot);
+    expect(diff(carried([600]), next).map((e) => e.data.run_id)).toEqual([600]);
+    // Not a list, or not numbers: none carried.
+    for (const bad of ["600", { 600: true }, ["600"], null]) expect(diff(carried(bad), next)).toEqual([]);
+  });
+
   it("workflow runs: a run whose check was still running at the last poll, its runs unread", () => {
     // Saved by a version that didn't read runs: run 500's lint job was
     // running, run 600's had finished.
