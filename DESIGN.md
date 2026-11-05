@@ -414,12 +414,11 @@ too, then everything kept: an `ack` past `head` is ignored, and an inbox
 deleted for being idle leaves its `head` and `acked` in
 `deleted_inboxes` for one made again under its name to carry on from, so
 `seq`s are never reused and such a position can't be one the inbox gave
-out. If it doesn't
-recognise a subscription (the user deleted it, but RepoHub hadn't heard
-yet), it says so, and RepoHub deletes its copy. So the two copies of a
-subscription converge without a transaction across objects: Account
-writes its index row as pending, calls `RepoHub.subscribe`, and marks the
-row active only when that succeeds.
+out. If it doesn't recognise a subscription (the user deleted it, but
+RepoHub hadn't heard yet), it says so, and RepoHub deletes its copy. So
+the two copies of a subscription converge without a transaction across
+objects: Account writes its index row as pending, calls
+`RepoHub.subscribe`, and marks the row active only when that succeeds.
 
 Reading an inbox pushes the new `expires_at` to the RepoHubs of its
 subscriptions (`touch`), at most once an hour per subscription, so

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { diff, unknownRuns } from "../src/diff.ts";
+import { diff, runningRuns, unknownRuns } from "../src/diff.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { HEAD1, HEAD2, alice, check, run, snap } from "./fixtures.ts";
 
@@ -189,10 +189,13 @@ describe("diff", () => {
     const next = snap({ workflowRuns: [run(), run({ id: 600 })] });
     const carried = (runningRuns: unknown) => ({ ...snap({ workflowRuns: null }), runningRuns } as unknown as Snapshot);
     expect(diff(carried([600]), next).map((e) => e.data.run_id)).toEqual([600]);
-    // Not a list, or not numbers: none carried.
-    for (const bad of ["600", { 600: true }, ["600"], null]) expect(diff(carried(bad), next)).toEqual([]);
+    // Not a list, or not numbers: none carried, nor saved again.
+    for (const bad of ["600", { 600: true }, ["600"], null]) {
+      expect(diff(carried(bad), next)).toEqual([]);
+      expect(runningRuns(carried(bad))).toEqual([]);
+    }
     // A list with some numbers: just those carried.
-    expect(diff(carried(["500", 600]), next).map((e) => e.data.run_id)).toEqual([600]);
+    expect(runningRuns(carried(["500", 600]))).toEqual([600]);
   });
 
   it("workflow runs: a run whose check was still running at the last poll, its runs unread", () => {
