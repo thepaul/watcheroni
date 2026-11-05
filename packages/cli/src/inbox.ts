@@ -233,6 +233,7 @@ export class Inbox {
       delete s.watched[key];
       const k = key.toLowerCase();
       s.events = s.events.filter((e) => prKey(e)?.toLowerCase() !== k);
+      if (s.held) s.held = s.held.filter((seq) => s.events.some((e) => e.seq === seq));
       if (w.sub) s.unwatched = [...(s.unwatched ?? []), w.sub].slice(-UNWATCHED_KEPT);
       return w;
     });

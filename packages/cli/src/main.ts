@@ -10,7 +10,7 @@ import { Inbox, InboxBusy } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
 import { selfhost } from "./selfhost.ts";
-import { RENEW_EVERY_MS, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "./server.ts";
+import { RENEW_EVERY_MS, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "./server.ts";
 import { UsageError, currentBranchPr, isPr, parseTarget, repoKey, targetKey, type RepoTarget, type Target } from "./targets.ts";
 
 // Exit codes (DESIGN.md, "The CLI").
@@ -508,7 +508,7 @@ main(process.argv.slice(2)).then(
       log(e.message);
       process.exit(EXIT.login);
     }
-    if (e instanceof UsageError || e instanceof InboxBusy || e instanceof LoginFailed || e instanceof Unreachable || e instanceof ServerError) log(e.message);
+    if (e instanceof UsageError || e instanceof InboxBusy || e instanceof LoginFailed || e instanceof Unreachable || e instanceof ServerError || e instanceof ReadingStopped) log(e.message);
     else log(e instanceof Error ? e.stack ?? e.message : String(e));
     process.exit(EXIT.error);
   },

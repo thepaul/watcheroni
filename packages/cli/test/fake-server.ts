@@ -103,6 +103,8 @@ export class FakeServer {
   backGaps = false;
   // Take an ack past head as head (see ackTo()).
   clampAcks = false;
+  // Leave out head from ready and pages of events.
+  noHead = false;
   // Repos the App is installed on, and whether each is private.
   readonly repos = new Map<string, { private: boolean }>();
   // Where an app_not_installed answer says to install it.
@@ -257,7 +259,8 @@ export class FakeServer {
     if (msg.type === "hello") {
       this.helloTimes.push(Date.now());
       s.pos = msg.after ?? inbox.acked;
-      s.send({ type: "ready", inbox: s.inbox, head: inbox.head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
+      const head = this.noHead ? (undefined as unknown as number) : inbox.head;
+      s.send({ type: "ready", inbox: s.inbox, head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
       if (this.aheadGaps && s.pos > inbox.head) {
         const events = [this.gapEvent(s.inbox, s.pos, inbox.events[0]?.seq ?? inbox.head + 1), ...inbox.events];
         s.send({ type: "events", events });
@@ -439,7 +442,7 @@ export class FakeServer {
           res.on("close", done);
         });
       }
-      if (!res.destroyed) json(200, page());
+      if (!res.destroyed) json(200, this.noHead ? { ...page(), head: undefined } : page());
       return;
     }
     json(404, { status: 404, code: "not_found" });

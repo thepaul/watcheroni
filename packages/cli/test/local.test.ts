@@ -71,6 +71,13 @@ describe("inbox", () => {
     expect([...inbox.heldSeqs()]).toEqual([4, 5]);
     inbox.handled(inbox.pending().filter((e) => e.id === "s1"));
     expect([...inbox.heldSeqs()]).toEqual([5]);
+    // Unwatching a PR drops its events, held ones too.
+    const eight = { owner: "octo", name: "widgets", number: 8 };
+    inbox.watch(targetKey(eight), eight);
+    inbox.hold([{ ...event("s3"), seq: 42, repo: { id: 1, full_name: "octo/widgets" }, pr: 8 }]);
+    expect([...inbox.heldSeqs()]).toEqual([5, 6]);
+    inbox.unwatch(targetKey(eight));
+    expect([...inbox.heldSeqs()]).toEqual([5]);
     inbox.close();
   });
 
@@ -280,10 +287,23 @@ describe("polling", () => {
     ];
     const logged: string[] = [];
     const events: WatchEvent[] = [];
-    for (let i = 0; i < 3; i++) events.push(...await pollOnce(inbox, (m) => logged.push(m), async () => snapshots.shift()!));
+    // Each poll by a new process, as each `wait` is: what's carried is
+    // in the inbox file.
+    const name = `t${n++}`;
+    let current = inbox;
+    current.close();
+    for (let i = 0; i < 3; i++) {
+      current = Inbox.open(name);
+      if (i === 0) current.watch(targetKey(target), target);
+      events.push(...await pollOnce(current, (m) => logged.push(m), async () => snapshots.shift()!));
+      if (i === 1) expect(current.watched()[0].snapshot?.runningRuns).toEqual([500]);
+      if (i < 2) current.close();
+    }
     expect(events.filter((e) => e.kind === "workflow.completed").map((e) => e.data.run_id)).toEqual([500]);
     expect(logged.at(-1)).toBe("octo/widgets#7: its workflow runs can be read again");
-    inbox.close();
+    // Once read, nothing is carried.
+    expect(current.watched()[0].snapshot).not.toHaveProperty("runningRuns");
+    current.close();
   });
 
   it("forgets it said so once the PR is unwatched or ends, so watching it again says so again", async () => {
@@ -678,6 +698,12 @@ describe("GitHub's errors", () => {
       fetches.mockResolvedValueOnce(page(again)).mockResolvedValueOnce(page(again));
       const repeated = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
       expect(repeated.message).toMatch(/: next page already read: https:\/\/api\.github\.com\/repos\/octo\/widgets\/actions\/runs\?x= \[31mred/);
+      // Pages without end stop at 20.
+      let asked = 0;
+      fetches.mockImplementation(async () => page(`https://api.github.com/repos/octo/widgets/actions/runs?page=${++asked}`));
+      const endless = (await restList("/repos/octo/widgets/actions/runs", () => []).catch((e: Error) => e)) as GitHubError;
+      expect(endless.message).toBe("GitHub /repos/octo/widgets/actions/runs: more than 20 pages");
+      expect(asked).toBe(20);
       for (const m of [down.message, missing.message, denied.message, failed.message, outside.message, repeated.message]) expect(m).not.toMatch(/[\x00-\x1f\x7f-\x9f]/);
     } finally {
       fetches.mockRestore();

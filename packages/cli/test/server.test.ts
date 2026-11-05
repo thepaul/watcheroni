@@ -8,7 +8,7 @@ import { formatText } from "../src/format.ts";
 import { LoginNeeded } from "../src/github.ts";
 import { Inbox } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
-import { MalformedAnswer, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
+import { MalformedAnswer, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -242,6 +242,74 @@ describe("server reader", () => {
     await until(() => r.pending().length === 3);
     expect(r.pending().map((e) => e.seq)).toEqual([0, 1, 2]);
     expect(fake.requests).toContain("GET /v1/inboxes/box/events?wait=300&after=1");
+  });
+
+  for (const longPoll of [false, true]) {
+    it(`names what a gap took back and stops when it can't be kept, ${longPoll ? "long-polling" : "over a WebSocket"}`, async () => {
+      fake.refuseSockets = longPoll;
+      fake.aheadGaps = true;
+      const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", {
+        log: (m) => messages.push(m),
+        takeBack: () => {
+          throw new Error("ENOSPC: no space left on device\x1b[31m");
+        },
+        backoff: [20, 100],
+      });
+      readers.push(r);
+      await r.start();
+      fake.inject("box", "comment.created", {}, "e1", null, 7);
+      fake.inject("box", "check.failed", {}, "e2");
+      await until(() => r.pending().length === 2);
+      Object.assign(fake.inbox("box"), { head: 0, acked: 0, events: [] });
+      fake.inject("box", "x", {}, "new-x");
+      if (!longPoll) fake.closeSockets(1012, "restarting");
+      expect(await r.changed(1000)).toBe(true);
+      await until(() => r.failure !== null);
+      expect(r.failure).toBeInstanceOf(ReadingStopped);
+      expect(r.failure!.message).toBe("stopped reading inbox box: couldn't keep events received before an inbox.gap (ENOSPC: no space left on device [31m)");
+      expect(messages.at(-1)).toBe(
+        `couldn't keep the 2 events received before an inbox.gap from ${fake.url} (ENOSPC: no space left on device [31m), so they're lost: comment.created on octo/widgets#7 (id "e1"), check.failed on octo/widgets#7 (id "e2"); check on GitHub`,
+      );
+      expect(fake.inbox("box").acked).toBe(0);
+    });
+  }
+
+  it("sends no acknowledgement over HTTP while not connected, but once connected again", async () => {
+    fake.refuseSockets = true;
+    const r = new ServerReader(new ServerClient({ url: fake.url, apiKey: fake.token }), "box", {
+      log: (m) => messages.push(m), takeBack: (e) => void takenBack.push(...e), backoff: [300, 600],
+    });
+    readers.push(r);
+    await r.start();
+    fake.inject("box", "a");
+    await until(() => r.pending().length === 1);
+    // The next page can't be read: no longer connected.
+    fake.malformedPage = { events: null, next: 0, acked: 0 };
+    fake.inject("box", "b");
+    await until(() => !r.connected);
+    handleThrough(r, 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.requests.filter((q) => q.startsWith("POST /v1/inboxes/box/ack"))).toEqual([]);
+    expect(fake.inbox("box").acked).toBe(0);
+    fake.malformedPage = undefined;
+    await until(() => fake.inbox("box").acked === 1);
+  });
+
+  it("warns once of a ready or page without a sound head, and reads on", async () => {
+    fake.noHead = true;
+    for (const longPoll of [false, true]) {
+      fake.refuseSockets = longPoll;
+      messages.length = 0;
+      const r = reader(longPoll ? "box2" : "box");
+      await r.start();
+      fake.inject(longPoll ? "box2" : "box", "a");
+      fake.inject(longPoll ? "box2" : "box", "b");
+      await until(() => r.pending().length === 2);
+      const what = longPoll ? "page of events" : "ready message";
+      expect(messages.filter((m) => !m.startsWith("couldn't open"))).toEqual([
+        `${fake.url} sent a ${what} without a sound head; if this keeps happening, report it to the server's operator`,
+      ]);
+    }
   });
 
   it("stops when the key is revoked", async () => {
@@ -524,6 +592,23 @@ describe("feed", () => {
     const feed = new Feed(inbox, r, { interval: 60_000, log: () => {} });
     expect(feed.wanted([]).map((i) => i.event.id)).toEqual(["e2"]);
     await until(() => fake.inbox("feed7").acked === 1);
+    inbox.close();
+  });
+
+  it("takes what a gap took back as the server's, dropping it for a PR unwatched and ending a subscription", async () => {
+    const inbox = Inbox.open("feed11");
+    const seven = { owner: "octo", name: "widgets", number: 7 };
+    const eight = { owner: "octo", name: "widgets", number: 8 };
+    inbox.watch(targetKey(seven), seven, "sub_7");
+    inbox.unwatch(targetKey(seven));
+    inbox.watch(targetKey(eight), eight, "sub_8");
+    const held = (id: string, sub: string, pr: number, kind: string, data: WatchEvent["data"] = {}): WatchEvent => ({
+      v: 1, seq: 50, id, sub, kind, at: "t", received_at: "t", repo: { id: 1, full_name: "octo/widgets" }, pr, actor: null, data, links: {},
+    });
+    inbox.hold([held("h1", "sub_7", 7, "comment.created"), held("h2", "sub_8", 8, "pr.merged"), held("h3", "sub_8", 8, "watch.ended", { reason: "merged" })]);
+    const feed = new Feed(inbox, null, { interval: 60_000, log: () => {} });
+    expect(feed.wanted([]).map((i) => i.event.id)).toEqual(["h2", "h3"]);
+    expect(inbox.watched()).toEqual([]);
     inbox.close();
   });
 

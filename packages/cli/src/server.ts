@@ -31,6 +31,10 @@ export class MalformedAnswer extends Unreachable {}
 // is asked again this often, unless the server says otherwise.
 const CROWDED_RETRY_SECONDS = 30;
 
+// Reading stopped for something on this machine, already explained in
+// the log (see ServerReader's keepTakenBack()).
+export class ReadingStopped extends Error {}
+
 // Any other error the server answered with. Not worth retrying.
 export class ServerError extends Error {
   readonly status: number;
@@ -352,6 +356,8 @@ export class ServerReader {
   // nothing is acknowledged, as the server would take a position past its
   // head as its head, and so events of the inbox's new life not yet read.
   private ahead = false;
+  // Why reading must stop, found where it can't be thrown (see add()).
+  private fatal: Error | null = null;
   // IDs of events received, to drop one sent again (delivery is at least
   // once).
   private seen = new Set<string>();
@@ -422,6 +428,8 @@ export class ServerReader {
   // while not connected: the next connection's ready does it then.
   private acknowledge(): void {
     if (this.pos === null || this.ahead || !this.connected) return;
+    // Defensive: `connected` is cleared only once run() hears the socket
+    // closed, so an ack meant for it mustn't go over HTTP meanwhile.
     if (this.mode === "ws" && this.ws?.readyState !== WebSocket.OPEN) return;
     let seq = this.pos;
     for (const e of this.queue) if (e.seq <= seq) seq = e.seq - 1;
@@ -464,6 +472,7 @@ export class ServerReader {
         if (this.mode === "ws") {
           const { opened, code, reason } = await this.openSocket();
           if (this.stopped) break;
+          if (this.fatal) throw this.fatal;
           if (!opened) {
             // No socket. Find out over HTTP whether the server is there at
             // all; this throws if it isn't, or if the key is wrong.
@@ -523,6 +532,9 @@ export class ServerReader {
           this.markConnected();
           if (this.pos === null) this.pos = page.acked;
           if (isSeq(page.acked)) this.acked = page.acked;
+          // Defensive: a sound server answers a position ahead of head with
+          // the gap that moves it back in this same page.
+          if (!isSeq(page.head)) this.noHead("page of events");
           this.ahead = isSeq(page.head) && this.pos > page.head;
           this.add(page.events);
           this.pos = Math.max(this.pos ?? 0, page.next);
@@ -651,6 +663,7 @@ export class ServerReader {
           if (!isSeq(msg.acked)) return broken("ready message");
           this.ws = ws;
           this.acked = msg.acked;
+          if (!isSeq(msg.head)) this.noHead("ready message");
           this.ahead = this.pos !== null && isSeq(msg.head) && this.pos > msg.head;
           if (this.pos === null) this.pos = msg.acked;
           this.markConnected();
@@ -662,7 +675,14 @@ export class ServerReader {
           // read soundly. An empty one, one whose events are all at or
           // below the position, or one that only moves it back (an
           // inbox.gap) says nothing of the server.
-          if (this.add(msg.events)) this.readSince = true;
+          try {
+            if (this.add(msg.events)) this.readSince = true;
+          } catch (e) {
+            // What add() can't go on from (see keepTakenBack()): reading
+            // stops once the socket is closed.
+            this.fatal = e as Error;
+            ws.close(4000, "stopping");
+          }
         } else if (msg.type === "error") {
           // The server's own words, cleaned like the rest.
           this.o.log(`${this.client.url}: ${clean(msg.code)}${msg.detail ? `: ${clean(msg.detail, PROSE_LENGTH)}` : ""}`);
@@ -714,7 +734,7 @@ export class ServerReader {
       // the server's) to acknowledge.
       const back = sound && e.kind === "inbox.gap" && this.pos !== null && e.seq < this.pos && e.data.missed_after === this.pos;
       if (back) {
-        if (this.queue.length) this.o.takeBack(this.queue);
+        if (this.queue.length) this.keepTakenBack(this.queue);
         this.queue = [];
         this.ahead = false;
       }
@@ -770,6 +790,33 @@ export class ServerReader {
       this.wake();
     }
     return advanced;
+  }
+
+  // Hands what a gap took back to takeBack. If that fails (the local
+  // inbox can't be saved, say), they can't be kept: each is named, so
+  // it's known what to look up on GitHub, and reading stops, as nothing
+  // after the gap can be acknowledged soundly without them.
+  private keepTakenBack(events: WatchEvent[]): void {
+    try {
+      this.o.takeBack(events);
+    } catch (e) {
+      const named = events.map((q) => {
+        const where = q.repo ? (q.pr === null ? clean(q.repo.full_name, 140) : `${clean(q.repo.full_name, 140)}#${q.pr}`) : null;
+        return `${clean(q.kind)}${where ? ` on ${where}` : ""} (id ${JSON.stringify(clean(q.id))})`;
+      });
+      const why = clean((e as Error)?.message ?? e, PROSE_LENGTH);
+      this.o.log(`couldn't keep ${events.length === 1 ? "the event" : `the ${events.length} events`} received before an inbox.gap from ${this.client.url} (${why}), so ${events.length === 1 ? "it's" : "they're"} lost: ${named.join(", ")}; check on GitHub`);
+      throw new ReadingStopped(`stopped reading inbox ${this.name}: couldn't keep events received before an inbox.gap (${why})`);
+    }
+  }
+
+  // A ready or page without a sound head: a position ahead of it can't be
+  // noticed (see `ahead`). Warned of once for each.
+  private noHead(what: string): void {
+    const key = `no head: ${what}`;
+    if (this.warned.has(key)) return;
+    this.warned.add(key);
+    this.o.log(`${this.client.url} sent a ${what} without a sound head; ${REPORT}`);
   }
 
   private wake(): void {
