@@ -523,7 +523,7 @@ function mtime(dir: string, file: string): number | null {
 //
 // Its lock is held while the server is asked, so nobody opens it
 // meanwhile; a `<name>.sweep` file with this process's PID says why, so
-// Inbox.open() waits for it rather than call it in use (see SWEEP_HOLD_MS).
+// Inbox.openWaiting() waits for it rather than call it in use (see SWEEP_HOLD_MS).
 // `watch` and `unwatch` take no lock, so whether it's still stale is
 // checked again after asking: one used meanwhile is kept.
 async function sweepOne(dir: string, name: string, deleteOnServer: DeleteOnServer | null): Promise<"skipped" | "done" | "asked" | "stop" | number> {
@@ -540,7 +540,11 @@ async function sweepOne(dir: string, name: string, deleteOnServer: DeleteOnServe
     return "skipped"; // In use.
   }
   try {
-    if (deleteOnServer) writeFileSync(marker, String(process.pid));
+    if (deleteOnServer) {
+      // Renamed into place, so no other sweep reads it empty.
+      writeFileSync(`${marker}.${process.pid}.tmp`, String(process.pid));
+      renameSync(`${marker}.${process.pid}.tmp`, marker);
+    }
     // Opened and closed again while we were deciding?
     if (saved && !stale(dir, json)) return "skipped";
     if (!deleteOnServer) {
