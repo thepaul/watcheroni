@@ -25,6 +25,12 @@ A PR named once stays watched in that inbox, and `wait` reports on
 everything in it, so later runs need no target. Events wait in the inbox
 until a `wait` prints them, so nothing is lost between runs.
 
+Naming a PR adds it to the inbox; it doesn't narrow the wait to it.
+`watcheroni wait octo/widgets#45` also prints whatever is still queued
+for other PRs in the inbox, such as #44's merge from an hour ago, and
+exits on it at once. To keep finished PRs from turning up like that,
+unwatch them (see "Done with a PR?").
+
 Only one `wait` can read an inbox at a time. To change what it watches
 while one is running, don't stop it: `watcheroni watch owner/repo#456`
 adds a PR and `watcheroni unwatch owner/repo#123` drops one, and the
@@ -39,9 +45,28 @@ sessions on this machine run `watcheroni wait` too, and a pattern like
 ## Watching only what you need
 
 One `wait` reports on every PR in the inbox, and wakes for any event on
-any of them. To be woken only for what you're waiting on, give each PR
-the kinds you want with `--kinds`. The inbox remembers them for that PR,
-so later runs of a plain `watcheroni wait` use them too:
+any of them. Without `--kinds` that includes every check that passes,
+one wake each, and your own pushes and comments. To be woken only for
+what you're waiting on, give each PR the kinds you want with `--kinds`.
+The inbox remembers them for that PR, so later runs of a plain
+`watcheroni wait` use them too.
+
+**Waiting for CI and review before merging** is the common case. Use:
+
+```
+watcheroni watch octo/widgets#123 --kinds check.failed,workflow.completed,review.*,comment.created,review_comment.created,pr.merged,pr.closed
+```
+
+A failing check wakes you at once. A passing one doesn't; instead,
+`workflow.completed` wakes you once per GitHub Actions run, and then
+`gh pr checks 123 -R octo/widgets` tells you whether everything is green.
+(If the repository's checks don't come from Actions, keep
+`check.completed` instead.) `pr.pushed` is left out because the pushes
+are usually yours or your worker's. `comment.created` still wakes you
+for comments you post yourself; drop it if you're only waiting for
+reviews.
+
+Other examples:
 
 ```
 # A comment or review on #123, or #123 merging or closing
@@ -76,9 +101,22 @@ need them after all, ask GitHub (`gh pr view`, `gh pr checks`).
 that one run, on every PR, and isn't saved.
 
 **Done with a PR?** Unwatch it: `watcheroni unwatch octo/widgets#123`.
-If you're about to merge or close it yourself, unwatch it first, since
-you already know what's going to happen. Its events not yet read are
-dropped too.
+Its events not yet read are dropped too.
+
+**Merging or closing it yourself?** Unwatch it in the same command,
+before the merge:
+
+```
+watcheroni unwatch octo/widgets#123; gh pr merge 123 -R octo/widgets --merge
+```
+
+Otherwise its `pr.merged` and `watch.ended` stay queued and wake you
+later, often from a `wait` you started for a different PR, to tell you
+about a merge you did yourself.
+
+Once nothing is left in the inbox (`watcheroni ls`), the watch is done:
+don't run `wait` again. A bare `wait` with nothing watched falls back to
+the current branch's PR, which is rarely what you mean.
 
 **Events you don't need to act on.** If an event needs nothing from you,
 such as your own push, a check passing, or a PR you've finished with
