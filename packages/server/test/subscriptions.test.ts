@@ -6,7 +6,7 @@ import { Account } from "../src/account";
 import { appJwt } from "../src/app";
 import { Installation } from "../src/installation";
 import { installUrl } from "../src/subscriptions";
-import { ACCOUNT_MAX_INBOXES, INBOX_IDLE_DAYS, type LoginResponse, type Meta, type SubscriptionInfo, type SubscriptionsResponse, type WatchEvent } from "../src/protocol";
+import { ACCOUNT_MAX_INBOXES, INBOX_IDLE_DAYS, type InboxInfo, type LoginResponse, type Meta, type SubscriptionInfo, type SubscriptionsResponse, type WatchEvent } from "../src/protocol";
 import { RepoHub, type RepoHubStats } from "../src/repo-hub";
 import { sign } from "../src/webhook/signature";
 
@@ -301,6 +301,46 @@ describe("subscribing to a public repo", () => {
     const other = await signedIn();
     expect((await call(`/v1/inboxes/box/subscriptions/${b.id}`, { headers: other.auth })).status).toBe(404);
     expect((await call(`/v1/inboxes/box/subscriptions/${b.id}`, { method: "DELETE", headers: other.auth })).status).toBe(404);
+  });
+
+  it("deletes an inbox with its subscriptions, telling RepoHub", async () => {
+    const user = await signedIn();
+    const repo = newRepo({ prs: { 7: { state: "open" }, 8: { state: "open" } } });
+    mockGitHub({ repos: [repo] });
+    const a = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 })).json<SubscriptionInfo>();
+    expect((await subscribe(user.auth, { repo: fullName(repo), pr: 8 })).status).toBe(201);
+    expect((await call("/v1/inboxes/other", { method: "PUT", headers: user.auth })).status).toBe(200);
+    const kept = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 }, {}, "other")).json<SubscriptionInfo>();
+    expect(await (await call("/v1/inboxes/box", { headers: user.auth })).json<InboxInfo>()).toMatchObject({ subscriptions: 2 });
+
+    const del = await call("/v1/inboxes/box", { method: "DELETE", headers: user.auth });
+    expect(del.status).toBe(204);
+    expect((await hubStats(repo.id)).subscriptions.map((s) => s.id)).toEqual([kept.id]);
+    expect((await call("/v1/inboxes/box/subscriptions", { headers: user.auth })).status).toBe(404);
+    expect((await list(user.auth, "other")).map((s) => s.id)).toEqual([kept.id]);
+
+    // Made again, it has none of them.
+    expect((await call("/v1/inboxes/box", { method: "PUT", headers: user.auth })).status).toBe(200);
+    expect(await list(user.auth)).toEqual([]);
+    expect((await call(`/v1/inboxes/box/subscriptions/${a.id}`, { headers: user.auth })).status).toBe(404);
+  });
+
+  it("deletes nothing when a RepoHub can't give up the inbox's subscriptions", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const sub = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 })).json<SubscriptionInfo>();
+    const spy = vi.spyOn(RepoHub.prototype, "unsubscribe").mockImplementation(() => {
+      throw new Error("unreachable");
+    });
+    const del = await call("/v1/inboxes/box", { method: "DELETE", headers: user.auth });
+    expect(del.status).toBe(503);
+    expect(del.headers.get("Retry-After")).toBe("30");
+    expect((await list(user.auth)).map((s) => s.id)).toEqual([sub.id]);
+
+    spy.mockRestore();
+    expect((await call("/v1/inboxes/box", { method: "DELETE", headers: user.auth })).status).toBe(204);
+    expect((await hubStats(repo.id)).subscriptions).toEqual([]);
   });
 
   it("forgets a subscription once its PR is merged", async () => {

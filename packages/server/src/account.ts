@@ -17,6 +17,7 @@ import {
   type KeyInfo,
   type ClientMessage,
   type EventsPage,
+  type InboxInfo,
   type ServerMessage,
   type SubscriptionInfo,
   type UnsequencedEvent,
@@ -296,10 +297,63 @@ export class Account extends DurableObject<Env> {
   }
 
   // RPC: create the inbox if needed and there's room for it.
-  openInbox(name: string): { ok: true; inbox: InboxRow } | Refusal {
+  openInbox(name: string): { ok: true; inbox: InboxInfo } | Refusal {
     this.open();
     const room = this.roomForInbox(name);
-    return room.ok ? { ok: true, inbox: this.ensureInbox(name) } : room;
+    return room.ok ? { ok: true, inbox: this.inboxInfoOf(this.ensureInbox(name)) } : room;
+  }
+
+  // RPC: every inbox, by name.
+  listInboxes(): InboxInfo[] {
+    if (!this.created) return [];
+    return this.sql.exec<InboxRow>("SELECT * FROM inboxes ORDER BY name").toArray().map((row) => this.inboxInfoOf(row));
+  }
+
+  // RPC: one inbox, or null if there's no such inbox. Not a read: it
+  // leaves `last_read_at` alone.
+  inboxInfo(name: string): InboxInfo | null {
+    const row = this.inbox(name);
+    return row ? this.inboxInfoOf(row) : null;
+  }
+
+  // RPC: deletes the inbox with its events and subscriptions, and hangs up
+  // its sockets. Returns the subscriptions it had, so the Worker can take
+  // them back from their RepoHubs, or null if there was no such inbox.
+  deleteInbox(name: string): SubscriptionInfo[] | null {
+    if (!this.inbox(name)) return null;
+    this.open();
+    const subs = this.listSubscriptions(name) ?? [];
+    this.dropInbox(name);
+    for (const ws of this.ctx.getWebSockets(`inbox:${name}`)) ws.close(4004, "inbox deleted");
+    return subs;
+  }
+
+  // The inbox as the API shows it. `oldest` leaves out events past
+  // INBOX_MAX_AGE_MS that the alarm hasn't deleted yet, as reads do.
+  private inboxInfoOf(row: InboxRow): InboxInfo {
+    const oldest = this.sql
+      .exec<{ seq: number | null }>("SELECT MIN(seq) AS seq FROM events WHERE inbox = ? AND at >= ?", row.name, Date.now() - INBOX_MAX_AGE_MS)
+      .one().seq;
+    const subscriptions = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions WHERE inbox = ?", row.name).one().n;
+    return {
+      name: row.name,
+      created_at: new Date(row.created_at).toISOString(),
+      head: row.head,
+      acked: row.acked,
+      oldest: oldest ?? row.head + 1,
+      subscriptions,
+      last_read_at: row.last_read_at === null ? null : new Date(row.last_read_at).toISOString(),
+    };
+  }
+
+  // Deletes an inbox and everything kept for it, remembering its `head`
+  // and `acked` so the name never reuses a seq (see ensureInbox).
+  private dropInbox(name: string): void {
+    this.sql.exec("DELETE FROM events WHERE inbox = ?", name);
+    this.sql.exec("DELETE FROM subscriptions WHERE inbox = ?", name);
+    this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ?", name);
+    this.sql.exec("DELETE FROM inboxes WHERE name = ?", name);
+    this.sql.exec("DELETE FROM subscribing WHERE inbox = ?", name);
   }
 
   // Creates the inbox if needed, whatever the cap. Only API calls and
@@ -308,9 +362,8 @@ export class Account extends DurableObject<Env> {
   // `head` and `acked`, as if its events had all expired: seqs are never
   // reused, so a reader still holding a position from before is behind
   // (and gets `inbox.gap`), never silently ahead. PROTOCOL.md promises
-  // that, so any other way of deleting an inbox (such as the documented
-  // but not yet built DELETE /v1/inboxes/{name}) must write
-  // deleted_inboxes too.
+  // that, so every way of deleting an inbox goes through dropInbox, which
+  // writes deleted_inboxes.
   private ensureInbox(name: string): InboxRow {
     this.open();
     const existing = this.inbox(name);
@@ -344,11 +397,7 @@ export class Account extends DurableObject<Env> {
       .toArray();
     for (const { name: old } of idle) {
       if (this.ctx.getWebSockets(`inbox:${old}`).length) continue;
-      this.sql.exec("DELETE FROM events WHERE inbox = ?", old);
-      // Remembered so the name never reuses a seq (see ensureInbox).
-      this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ?", old);
-      this.sql.exec("DELETE FROM inboxes WHERE name = ?", old);
-      this.sql.exec("DELETE FROM subscribing WHERE inbox = ?", old);
+      this.dropInbox(old);
     }
     if (count() < ACCOUNT_MAX_INBOXES) return { ok: true };
     return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many inboxes on this account (at most ${ACCOUNT_MAX_INBOXES})` };
@@ -470,13 +519,21 @@ export class Account extends DurableObject<Env> {
     return sub;
   }
 
-  // RPC: append events to inboxes and push them to waiting sockets. In the
-  // full design RepoHub calls this; in the prototype /debug does.
-  async deliver(items: Delivery[]): Promise<{ delivered: number; duplicates: number }> {
+  // RPC: append events to inboxes and push them to waiting sockets.
+  // RepoHub passes `makeInboxes` false: its events are for inboxes that
+  // had a subscription when it queued them, so one that's gone was deleted
+  // (DELETE /v1/inboxes/{name}), and a late delivery mustn't make it
+  // again. Those events are dropped. /debug makes inboxes as it goes.
+  async deliver(items: Delivery[], makeInboxes = true): Promise<{ delivered: number; duplicates: number; dropped: number }> {
     let delivered = 0;
     let duplicates = 0;
+    let dropped = 0;
     const touched = new Set<string>();
     for (const { inbox: name, event } of items) {
+      if (!makeInboxes && !this.inbox(name)) {
+        dropped++;
+        continue;
+      }
       const inbox = this.ensureInbox(name);
       const seen = this.sql.exec("SELECT 1 FROM events WHERE inbox = ? AND id = ?", name, event.id).toArray();
       if (seen.length) {
@@ -505,7 +562,7 @@ export class Account extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Math.max(oldest + INBOX_MAX_AGE_MS, Date.now()));
     }
     for (const name of touched) this.push(name);
-    return { delivered, duplicates };
+    return { delivered, duplicates, dropped };
   }
 
   // Deletes every inbox's events older than INBOX_MAX_AGE_MS, then waits

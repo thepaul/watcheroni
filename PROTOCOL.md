@@ -188,14 +188,27 @@ GET    /v1/inboxes/{name}        details
 DELETE /v1/inboxes/{name}        delete, with its subscriptions and events
 ```
 
-Names: 1-64 characters from `[A-Za-z0-9._-]`. An inbox and its
-subscriptions are deleted after 30 days in which nothing read it.
+Names: 1-64 characters from `[A-Za-z0-9._-]`. An inbox stays until it's
+deleted, or until the account needs room for another (below). Its
+subscriptions end by themselves once nobody reads it (`ttl_seconds`,
+under "Subscriptions").
+
+`PUT` and `GET /v1/inboxes/{name}` answer with the inbox, `GET
+/v1/inboxes` with `{"inboxes": [...]}`, every inbox on the account by
+name. Looking at an inbox doesn't count as reading it; reading its events
+does. `DELETE` answers `204`, ends its subscriptions without a `watch.*`
+event (as deleting each would), and closes its WebSockets with `4004`; a
+long poll waiting on it answers with no events. If the server can't end
+a subscription it answers `503` and deletes nothing, so try again.
+`GET` and `DELETE` on an inbox that doesn't exist answer `404
+not_found`. An inbox made again under a deleted one's name carries on
+its numbering, as below.
 
 An account has at most `limits.inboxes_per_account` inboxes. Creating
 another, with `PUT` or by connecting a WebSocket to a new name, answers
 `422 quota_exceeded`, unless the server can first delete an inbox nobody
-has read for 30 days that has no subscriptions or connections left. An
-inbox deleted this way keeps its numbering: if its name is used again,
+has read for 30 days that has no subscriptions or connections left. A
+deleted inbox keeps its numbering: if its name is used again,
 `head` and `acked` carry on from where they were, as if all its events
 had expired, so a client still holding a position from before is told
 what it missed (see "Gaps").
@@ -212,7 +225,8 @@ what it missed (see "Gaps").
 }
 ```
 
-`head` is the newest `seq`, `oldest` the oldest still kept. An inbox keeps
+`head` is the newest `seq`, `oldest` the oldest still kept (`head + 1`
+when none is), and `subscriptions` how many it has. An inbox keeps
 at most 1,000 events and at most 7 days of them; a reader whose position
 falls behind what's kept gets `inbox.gap` (see "Gaps").
 

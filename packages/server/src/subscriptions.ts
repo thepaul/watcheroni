@@ -209,6 +209,33 @@ export async function deleteSubscription(env: Env, account: AccountStub, inbox: 
   return new Response(null, { status: 204 });
 }
 
+// DELETE /v1/inboxes/{name}. The RepoHubs give up their subscriptions
+// first, so if one can't be reached nothing is deleted and the client can
+// try again; a RepoHub still routing to a deleted inbox would only have
+// its events dropped (Account.deliver), but would keep its repo watched.
+// A subscription made meanwhile comes back from Account.deleteInbox and
+// is taken back from its RepoHub then.
+export async function deleteInbox(env: Env, account: AccountStub, inbox: string): Promise<Response> {
+  const subs = await account.listSubscriptions(inbox);
+  if (!subs) return problem(404, "not_found", "No such inbox");
+  const unsubscribe = (list: SubscriptionInfo[]) =>
+    Promise.all(list.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id)));
+  try {
+    await unsubscribe(subs);
+  } catch (e) {
+    console.error(`deleting inbox ${inbox}: unsubscribing failed`, e);
+    return unavailable("Couldn't end the inbox's subscriptions");
+  }
+  const removed = await account.deleteInbox(inbox);
+  if (!removed) return problem(404, "not_found", "No such inbox");
+  const done = new Set(subs.map((s) => s.id));
+  const late = removed.filter((s) => !done.has(s.id));
+  if (late.length) {
+    await unsubscribe(late).catch((e: unknown) => console.error(`deleting inbox ${inbox}: unsubscribing ${late.map((s) => s.id).join(", ")} failed`, e));
+  }
+  return new Response(null, { status: 204 });
+}
+
 // The repo's first `base` or `author` filter: RepoHub learns its open PRs
 // (the 100 most recently updated; others from their next event), so PRs
 // opened before can match. Best effort: the subscription stands anyway.

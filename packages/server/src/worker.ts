@@ -15,6 +15,7 @@ import type { Control } from "./control";
 import {
   installUrl,
   createSubscription,
+  deleteInbox,
   deleteSubscription,
   verifySubscription,
   getSubscription,
@@ -44,6 +45,7 @@ import {
   readJson,
   withRetryAfter,
   type EventsPage,
+  type InboxesResponse,
   type DataValue,
   type LoginRequest,
   type LoginResponse,
@@ -148,6 +150,10 @@ async function api(
     return (await account.revokeKey(id)) ? new Response(null, { status: 204 }) : problem(404, "not_found", "No such key");
   }
 
+  if (pathname === "/v1/inboxes" && request.method === "GET") {
+    return json({ inboxes: await account.listInboxes() } satisfies InboxesResponse);
+  }
+
   if (inbox === null) return problem(404, "not_found", "No such endpoint");
   const name = inbox;
   switch (`${request.method} /v1/inboxes/{name}${rest}`) {
@@ -155,6 +161,12 @@ async function api(
       const opened = await account.openInbox(name);
       return opened.ok ? json(opened.inbox) : problem(opened.status, opened.code, opened.detail);
     }
+    case "GET /v1/inboxes/{name}": {
+      const info = await account.inboxInfo(name);
+      return info ? json(info) : problem(404, "not_found", "No such inbox");
+    }
+    case "DELETE /v1/inboxes/{name}":
+      return deleteInbox(env, account, name);
 
     case "POST /v1/inboxes/{name}/subscriptions":
       return createSubscription(request, env, account, accountId, name);
@@ -477,7 +489,8 @@ function installationFact(payload: {
 }
 
 // Subscriptions straight into RepoHub, with no GitHub checks, for tests
-// and for poking at a RepoHub:
+// and for poking at a RepoHub. The inbox is made if need be, as the /v1
+// route needs it to exist: RepoHub's deliveries don't make inboxes.
 //   GET    /debug/repos/{id}                     RepoHub's state
 //   POST   /debug/repos/{id}/subscriptions       {account, inbox, pr, kinds?, base?, author?, ignore?, full_name?, baseline?}
 //   DELETE /debug/repos/{id}/subscriptions/{sub}
@@ -486,9 +499,11 @@ async function debugRepo(request: Request, env: Env, repoId: number, subs: boole
   if (!subs && request.method === "GET") return json(await hub.stats());
   if (subs && !subId && request.method === "POST") {
     const body = await readJson<NewSubscription & { full_name?: string; private?: boolean; baseline?: PrBaseline }>(request);
-    if (!body || typeof body.inbox !== "string" || !INBOX_NAME.test(body.inbox)) {
+    if (!body || typeof body.inbox !== "string" || !INBOX_NAME.test(body.inbox) || !Number.isSafeInteger(body.account)) {
       return problem(400, "invalid_request", "Body needs account, inbox and pr");
     }
+    const opened = await accountStub(env, body.account).openInbox(body.inbox);
+    if (!opened.ok) return problem(opened.status, opened.code, opened.detail);
     const { full_name = `repo-${repoId}`, private: isPrivate, baseline, ...sub } = body;
     const repo = { id: repoId, full_name, private: isPrivate };
     const result = await hub.subscribe({ ...sub, pr: sub.pr ?? null }, repo, baseline);

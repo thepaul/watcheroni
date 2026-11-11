@@ -284,6 +284,9 @@ describe("repo-wide base and author filters", () => {
       { number: 1, head_sha: SHA_A, base_ref: "main", author: "Carol", draft: false },
       { number: 2, head_sha: SHA_B, base_ref: "main", author: "dave", draft: true },
     ];
+    // Straight to the hub, so the inbox is made here; RepoHub's deliveries
+    // don't make inboxes.
+    await env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${acct}`)).openInbox("wide");
     const wide = (body: { kinds: string[]; author?: string; base?: string }) =>
       hub(repo).subscribe({ account: acct, inbox: "wide", pr: null, ...body }, { id: repo, full_name: "octo/widgets" });
     const result = await wide({ kinds: ["check.failed", "pr.closed"], author: "carol" });

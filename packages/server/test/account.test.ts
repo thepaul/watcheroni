@@ -10,6 +10,8 @@ import {
   INBOX_MAX_AGE_DAYS,
   INBOX_MAX_EVENTS,
   type EventsPage,
+  type InboxInfo,
+  type InboxesResponse,
   type LoginResponse,
   type ServerMessage,
   type SubscriptionInfo,
@@ -630,5 +632,132 @@ describe("per-account caps", () => {
 
     await inject("many");
     for (const res of await Promise.all(polls)) expect(res.status).toBe(200);
+  });
+});
+
+describe("inboxes", () => {
+  // An account of its own, so its list holds only this test's inboxes.
+  let nextAccount = 7000;
+  async function account() {
+    const id = nextAccount++;
+    const res = await exports.default.fetch(`${BASE}/debug/accounts/${id}/keys`, { method: "POST", headers: DEBUG });
+    const auth = { Authorization: `Bearer ${(await res.json<LoginResponse>()).api_key}` };
+    const call = (path: string, init: RequestInit = {}) =>
+      exports.default.fetch(`${BASE}${path}`, { ...init, headers: { ...auth, ...init.headers } });
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
+    const inject = (inbox: string, count = 1) =>
+      exports.default.fetch(`${BASE}/debug/accounts/${id}/inboxes/${inbox}/events`, { method: "POST", headers: DEBUG, body: JSON.stringify({ count }) });
+    const info = async (inbox: string) => {
+      const res = await call(`/v1/inboxes/${inbox}`);
+      expect(res.status).toBe(200);
+      return res.json<InboxInfo>();
+    };
+    return { call, stub, inject, info };
+  }
+
+  it("answers PUT, GET and the list with the whole inbox", async () => {
+    const { call, stub, inject, info } = await account();
+    const put = await call("/v1/inboxes/b", { method: "PUT" });
+    expect(put.status).toBe(200);
+    const made = await put.json<InboxInfo>();
+    expect(made).toEqual({
+      name: "b",
+      created_at: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+      head: 0,
+      acked: 0,
+      oldest: 1,
+      subscriptions: 0,
+      last_read_at: null,
+    });
+    expect(await info("b")).toEqual(made);
+
+    await inject("b", 3);
+    await call("/v1/inboxes/b/ack", { method: "POST", body: JSON.stringify({ seq: 2 }) });
+    // Looking at it isn't reading it.
+    expect(await info("b")).toMatchObject({ head: 3, acked: 2, oldest: 1, last_read_at: null });
+    await call("/v1/inboxes/b/events");
+    expect((await info("b")).last_read_at).toEqual(expect.stringMatching(/^\d{4}-/));
+
+    // Events too old to keep, though not yet deleted, don't count.
+    await runInDurableObject(stub, (_, state) => {
+      state.storage.sql.exec("UPDATE events SET at = ? WHERE inbox = 'b' AND seq <= 2", Date.now() - (INBOX_MAX_AGE_DAYS + 1) * 24 * 3600 * 1000);
+      state.storage.sql.exec(
+        "INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at) VALUES ('sub_x', 'b', 1, 'o/r', 0, 1, '{}', 0, 0)",
+      );
+    });
+    expect(await info("b")).toMatchObject({ head: 3, oldest: 3, subscriptions: 1 });
+    // With none kept, `oldest` is the seq the next event will have.
+    await runInDurableObject(stub, (_, state) => {
+      state.storage.sql.exec("DELETE FROM events WHERE inbox = 'b'");
+    });
+    expect(await info("b")).toMatchObject({ head: 3, oldest: 4 });
+
+    expect((await call("/v1/inboxes/a", { method: "PUT" })).status).toBe(200);
+    const listed = await call("/v1/inboxes");
+    expect(listed.status).toBe(200);
+    const { inboxes } = await listed.json<InboxesResponse>();
+    expect(inboxes.map((i) => i.name)).toEqual(["a", "b"]);
+    expect(inboxes[1]).toEqual(await info("b"));
+  });
+
+  it("404s for an inbox that doesn't exist, and lists none for a new account", async () => {
+    const { call } = await account();
+    expect(await (await call("/v1/inboxes")).json()).toEqual({ inboxes: [] });
+    for (const method of ["GET", "DELETE"]) {
+      const res = await call("/v1/inboxes/nope", { method });
+      expect(res.status).toBe(404);
+      expect(await res.json()).toMatchObject({ code: "not_found", title: "No such inbox" });
+    }
+  });
+
+  it("deletes an inbox with its events, hangs up its sockets, and makes it again where it left off", async () => {
+    const { call, stub, inject, info } = await account();
+    expect((await call("/v1/inboxes/gone", { method: "PUT" })).status).toBe(200);
+    expect((await call("/v1/inboxes/kept", { method: "PUT" })).status).toBe(200);
+    await inject("gone", 4);
+    await inject("kept", 1);
+    await call("/v1/inboxes/gone/ack", { method: "POST", body: JSON.stringify({ seq: 1 }) });
+
+    const res = await call("/v1/inboxes/gone/ws", { headers: { Upgrade: "websocket" } });
+    const ws = res.webSocket!;
+    const closed = new Promise<{ code: number; reason: string }>((resolve) =>
+      ws.addEventListener("close", (ev) => resolve({ code: ev.code, reason: ev.reason })),
+    );
+    ws.accept();
+    const poll = call("/v1/inboxes/gone/events?after=4&wait=30");
+    await sleep(200);
+
+    expect((await call("/v1/inboxes/gone", { method: "DELETE" })).status).toBe(204);
+    expect(await closed).toEqual({ code: 4004, reason: "inbox deleted" });
+    // The long poll waiting on it ends with nothing.
+    expect((await (await poll).json<EventsPage>()).events).toEqual([]);
+    expect((await call("/v1/inboxes/gone")).status).toBe(404);
+    expect((await call("/v1/inboxes/gone/events")).status).toBe(404);
+    expect((await call("/v1/inboxes/gone", { method: "DELETE" })).status).toBe(404);
+    expect((await (await call("/v1/inboxes")).json<InboxesResponse>()).inboxes.map((i) => i.name)).toEqual(["kept"]);
+    const rows = await runInDurableObject(stub, (_, state) =>
+      state.storage.sql.exec<{ inbox: string }>("SELECT inbox FROM events ORDER BY inbox").toArray().map((r) => r.inbox),
+    );
+    expect(rows).toEqual(["kept"]);
+
+    // Made again, its numbering carries on, as for an idle inbox.
+    expect(await (await call("/v1/inboxes/gone", { method: "PUT" })).json()).toMatchObject({ head: 4, acked: 1, oldest: 5 });
+    await inject("gone");
+    expect((await info("gone")).head).toBe(5);
+  });
+
+  it("drops RepoHub's deliveries to a deleted inbox rather than make it again", async () => {
+    const { call, stub } = await account();
+    expect((await call("/v1/inboxes/gone", { method: "PUT" })).status).toBe(200);
+    expect((await call("/v1/inboxes/gone", { method: "DELETE" })).status).toBe(204);
+    const event = {
+      v: 1 as const, id: "e1", sub: "sub_x", kind: "review.submitted", at: new Date().toISOString(), received_at: new Date().toISOString(),
+      repo: null, pr: null, actor: null, data: {}, links: {},
+    };
+    expect(await stub.deliver([{ inbox: "gone", event }], false)).toEqual({ delivered: 0, duplicates: 0, dropped: 1 });
+    expect((await call("/v1/inboxes/gone")).status).toBe(404);
+    // /debug still makes inboxes as it goes.
+    expect(await stub.deliver([{ inbox: "gone", event }])).toEqual({ delivered: 1, duplicates: 0, dropped: 0 });
+    expect((await call("/v1/inboxes/gone")).status).toBe(200);
   });
 });

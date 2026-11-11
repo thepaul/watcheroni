@@ -30,6 +30,22 @@ export interface EventsPage {
   acked: number;
 }
 
+// An inbox (PROTOCOL.md, "Inboxes"). `oldest` is the oldest seq still
+// kept, or `head + 1` when none is.
+export interface InboxInfo {
+  name: string;
+  created_at: string;
+  head: number;
+  acked: number;
+  oldest: number;
+  subscriptions: number;
+  last_read_at: string | null;
+}
+
+export interface InboxesResponse {
+  inboxes: InboxInfo[];
+}
+
 export type ClientMessage =
   | { type: "hello"; after?: number }
   | { type: "ack"; seq: number };
