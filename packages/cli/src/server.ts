@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { EventsPage, InboxInfo, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
+import type { EventsPage, InboxInfo, InboxesResponse, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { type ServerConfig, checkServerUrl, configDir } from "./config.ts";
 import { clean, PROSE_LENGTH } from "./format.ts";
@@ -233,52 +233,87 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
   }
 }
 
-// What became of a stale inbox's copy on the server (see deleteStaleInbox).
-// "gone": there's none left for this machine to delete, so its local file
-// can go too. "kept": it couldn't be deleted now; `retryAfter` (seconds)
-// when the server said when to try again.
+// What became of a stale inbox's copy on the server (see sweep() in
+// inbox.ts): `done` once there's none left for this machine to delete;
+// otherwise `retryAfter` (seconds) if the server said when to try again.
 export type StaleInboxOutcome = { done: true } | { done: false; retryAfter: number | null };
 
-// Deletes the server's inbox `name`, which nobody has opened on this
-// machine for `staleMs`, with its subscriptions (PROTOCOL.md, "Inboxes").
-// The local inbox is the server's of the same name: every command that
-// reads one with a server makes sure of the other (ensureInbox). One read
-// on the server within `staleMs`, by another machine, say, or made then,
-// is left alone: it's in use, just not from here. Done too when the server
-// has no such inbox. Not done if the server can't be reached or refuses,
-// or couldn't end every subscription (a 503, with Retry-After): the local
-// file is kept so the next sweep tries again.
-export async function deleteStaleInbox(client: ServerClient, name: string, staleMs: number, log: (msg: string) => void, now = Date.now()): Promise<StaleInboxOutcome> {
-  const path = `/v1/inboxes/${name}`;
-  const kept = (e: unknown): StaleInboxOutcome => {
-    if (e instanceof ServerError && e.status === 404) return { done: true };
-    if (e instanceof Unreachable) return { done: false, retryAfter: e.retryAfter };
-    // A refusal to show or delete it, or a rejected key: said once a sweep.
+// Deletes, for one sweep, the server's copies of inboxes nobody has opened
+// on this machine for `staleMs`, with their subscriptions (PROTOCOL.md,
+// "Inboxes"). The local inbox is the server's of the same name: every
+// command that reads one with a server makes sure of the other
+// (ensureInbox).
+//
+// - A server without these routes (GET /v1/inboxes answers 404) can't be
+//   asked: the local file goes, and the server's inbox ends by itself.
+// - One made or read on the server within `staleMs`, from another machine,
+//   say, is in use, just not from here: left alone.
+// - One the server doesn't have (404) is done.
+// - One that can't be deleted now (unreachable, refused, or a 503 when not
+//   every subscription could be ended) isn't: its local file is kept so a
+//   later sweep tries again.
+export function staleInboxDeleter(
+  client: ServerClient,
+  staleMs: number,
+  log: (msg: string) => void,
+  timeoutMs: number,
+): (name: string) => Promise<StaleInboxOutcome> {
+  let supported: Promise<boolean | StaleInboxOutcome> | null = null;
+  const failed = (name: string, e: unknown): StaleInboxOutcome => {
+    if (e instanceof Unreachable) {
+      // A server that answered, but not when to try again, is worth a word;
+      // one that can't be reached is said by the command itself.
+      if (e.code !== null && e.retryAfter === null) log(`couldn't delete inbox ${name}, unused here for a week, on ${client.url}: ${e.message}`);
+      return { done: false, retryAfter: e.retryAfter };
+    }
     if (e instanceof ServerError || e instanceof LoginNeeded) {
       log(`couldn't delete inbox ${name}, unused here for a week, on ${client.url}: ${e.message}`);
       return { done: false, retryAfter: null };
     }
     throw e;
   };
+  return async (name) => {
+    supported ??= client.request<InboxesResponse>("GET", "/v1/inboxes", { timeoutMs }).then(
+      () => true,
+      (e: unknown) => (e instanceof ServerError && e.status === 404 ? false : failed(name, e)),
+    );
+    const ok = await supported;
+    if (ok === false) return { done: true };
+    if (ok !== true) {
+      // Asked again next time; only a definite answer is kept.
+      supported = null;
+      return ok;
+    }
+    return deleteStaleInbox(client, name, staleMs, failed, timeoutMs);
+  };
+}
+
+async function deleteStaleInbox(
+  client: ServerClient,
+  name: string,
+  staleMs: number,
+  failed: (name: string, e: unknown) => StaleInboxOutcome,
+  timeoutMs: number,
+): Promise<StaleInboxOutcome> {
+  const path = `/v1/inboxes/${name}`;
   let info: InboxInfo;
   try {
-    info = await client.request<InboxInfo>("GET", path);
+    info = await client.request<InboxInfo>("GET", path, { timeoutMs });
   } catch (e) {
-    return kept(e);
+    return e instanceof ServerError && e.status === 404 ? { done: true } : failed(name, e);
   }
   // Without both times, whether it's in use can't be told, so it's kept.
   const created = Date.parse(String(info?.created_at));
   const read = info?.last_read_at === null ? created : Date.parse(String(info?.last_read_at));
   if (Number.isNaN(created) || Number.isNaN(read)) {
-    log(`didn't delete inbox ${name}, unused here for a week, on ${client.url}: its answer doesn't say when it was made and last read`);
-    return { done: false, retryAfter: null };
+    return failed(name, new ServerError(`its answer doesn't say when it was made and last read`, 200, "malformed"));
   }
-  if (now - Math.max(created, read) < staleMs) return { done: true };
+  if (Date.now() - Math.max(created, read) < staleMs) return { done: true };
   try {
-    await client.request("DELETE", path);
+    await client.request("DELETE", path, { timeoutMs });
     return { done: true };
   } catch (e) {
-    return kept(e);
+    return e instanceof ServerError && e.status === 404 ? { done: true } : failed(name, e);
   }
 }
 

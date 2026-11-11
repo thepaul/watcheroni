@@ -124,7 +124,12 @@ export class FakeServer {
   // this Retry-After, if any) as if a subscription couldn't be ended.
   readonly deletedInboxes: string[] = [];
   failDeletes = 0;
+  deleteStatus = 503;
   deleteRetryAfter: string | null = "1";
+  // Answer GET /v1/inboxes with 404, as a server from before it did; or
+  // never answer it.
+  noInboxList = false;
+  hangInboxList = false;
   // Private subscriptions' verified_until, by ID, and the verify calls seen.
   readonly verifiedUntil = new Map<string, string>();
   readonly verified: { id: string; githubToken: string | null }[] = [];
@@ -369,6 +374,11 @@ export class FakeServer {
       return this.refreshLimited ? json(429, { status: 429, code: "rate_limited" }) : json(200, this.refreshAnswer);
     }
     if (!this.authorized(req)) return json(401, { status: 401, code: "unauthorized" });
+    if (req.method === "GET" && url.pathname === "/v1/inboxes") {
+      if (this.hangInboxList) return;
+      if (this.noInboxList) return json(404, { status: 404, code: "not_found", title: "No such endpoint" });
+      return json(200, { inboxes: [...this.inboxes.keys()].map((name) => ({ name })) });
+    }
     const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?(?:\/([^/]+)(\/[a-z]+)?)?$/);
     if (!m) return json(404, { status: 404, code: "not_found" });
     const name = decodeURIComponent(m[1]);
@@ -385,7 +395,7 @@ export class FakeServer {
       if (this.failDeletes > 0) {
         this.failDeletes--;
         if (this.deleteRetryAfter) res.setHeader("Retry-After", this.deleteRetryAfter);
-        return json(503, { status: 503, code: "unavailable", title: "Couldn't end every subscription; try again" });
+        return json(this.deleteStatus, { status: this.deleteStatus, code: "unavailable", title: "Couldn't end every subscription; try again" });
       }
       this.inboxes.delete(name);
       this.deletedInboxes.push(name);

@@ -65,6 +65,14 @@ export const STALE_MS = 7 * 24 * 3600 * 1000;
 // when to try again, and the longest it waits for that.
 const SWEEP_TRIES = 3;
 const SWEEP_RETRY_MAX_SECONDS = 60;
+// How many stale inboxes one sweep takes to the server, at two requests
+// each: a backlog, such as Claude Code sessions' inboxes, is cleared a few
+// at a time rather than crowd the account's rate limit.
+const SWEEP_SERVER_MAX = 5;
+// How long Inbox.open() waits for a sweep that holds the inbox's lock
+// while asking the server (two requests, each given SWEEP_REQUEST_MS).
+export const SWEEP_REQUEST_MS = 10_000;
+const SWEEP_HOLD_MS = 2 * SWEEP_REQUEST_MS + 5000;
 
 export class InboxBusy extends Error {}
 
@@ -95,11 +103,20 @@ export class Inbox {
   }
 
   // Opens the inbox to read it, holding its lock until close() or process
-  // exit: one `wait`, `stream` or `exec` at a time. Whoever opens one also
-  // runs sweep() for the others.
+  // exit: one `wait`, `stream` or `exec` at a time. (Those also run
+  // sweep() for the other inboxes; see main.ts.) If another process's
+  // sweep holds the lock, deleting the inbox on the server, this waits
+  // till it's done, and the inbox then starts out empty.
   static open(name: string): Inbox {
     const dir = inboxDir(name);
-    lock(join(dir, `${name}.lock`), (pid) => `Inbox ${name} is in use${pid ? ` by process ${pid}` : ""}, another wait, stream or exec; stop it, or use another inbox with --inbox`);
+    const busy = (pid: number | null) => `Inbox ${name} is in use${pid ? ` by process ${pid}` : ""}, another wait, stream or exec; stop it, or use another inbox with --inbox`;
+    const lockFile = join(dir, `${name}.lock`);
+    try {
+      lock(lockFile, busy);
+    } catch (e) {
+      if (!(e instanceof InboxBusy) || !beingSwept(dir, name)) throw e;
+      lock(lockFile, (pid) => `Inbox ${name} is still being deleted${pid ? ` by process ${pid}` : ""}, as nobody had used it for a week; try again shortly`, SWEEP_HOLD_MS / 20);
+    }
     const inbox = new Inbox(name, dir);
     opened.add(inbox);
     if (!closingOnExit) {
@@ -374,6 +391,17 @@ export class Inbox {
   }
 }
 
+// Whether a live process's sweep holds the inbox's lock: the PID in its
+// `.sweep` file is the lock's.
+function beingSwept(dir: string, name: string): boolean {
+  try {
+    const pid = Number(readFileSync(join(dir, `${name}.sweep`), "utf8"));
+    return !!pid && pid === Number(readFileSync(join(dir, `${name}.lock`), "utf8")) && alive(pid);
+  } catch {
+    return false;
+  }
+}
+
 function emptyState(): State {
   return { version: 1, seq: 0, acked: 0, events: [], seen: [], watched: {} };
 }
@@ -403,17 +431,19 @@ function add(s: State, events: UnsequencedEvent[]): WatchEvent[] {
 export const prKey = (e: { repo: { full_name: string } | null; pr: number | null }) => (e.repo && e.pr !== null ? `${e.repo.full_name}#${e.pr}` : null);
 
 // What sweep() asks the server: to delete its copy of a stale inbox (see
-// deleteStaleInbox() in server.ts), or null with no server.
+// staleInboxDeleter() in server.ts), or null with no server. `done` once
+// there's none left for this machine to delete; otherwise `retryAfter`
+// (seconds) if the server said when to try again.
 export type DeleteOnServer = (name: string) => Promise<{ done: true } | { done: false; retryAfter: number | null }>;
 
 // Deletes the inboxes nobody has opened for STALE_MS, except `keep` and
 // any in use, with what they watched and any events never acknowledged.
 // One that's wanted again starts out empty. With a server, its inbox of
 // the same name goes first, and the local file is deleted only once the
-// server's is gone (or is in use elsewhere): while it can't be, the file
-// stays, still stale, and the next sweep tries again. An inbox's lock is
-// held while the server is asked, so nobody opens it meanwhile, and let go
-// while waiting the Retry-After of a 503.
+// server's is gone (or is in use elsewhere): till then the file stays,
+// still stale, as the record of what's left to delete, and a later sweep
+// tries again. At most SWEEP_SERVER_MAX inboxes are taken to the server
+// in one sweep, so a backlog is cleared a few at a time.
 export async function sweep(keep: string, deleteOnServer: DeleteOnServer | null, wait = pauseAsync): Promise<void> {
   const dir = join(stateDir(), "inboxes");
   let files: string[];
@@ -422,82 +452,105 @@ export async function sweep(keep: string, deleteOnServer: DeleteOnServer | null,
   } catch {
     return;
   }
-  const mtime = (file: string) => {
-    try {
-      return statSync(join(dir, file)).mtimeMs;
-    } catch {
-      return null;
-    }
-  };
-  const stale = (file: string) => {
-    const t = mtime(file);
-    return t !== null && Date.now() - t > STALE_MS;
-  };
   const names = new Set<string>();
   for (const file of files) {
-    // Left by a save that was killed.
-    if (file.endsWith(".tmp") && stale(file)) tryUnlink(join(dir, file));
+    // Left by a save, or a sweep, that was killed.
+    if ((file.endsWith(".tmp") || file.endsWith(".sweep")) && stale(dir, file)) tryUnlink(join(dir, file));
     const m = /^(.*)\.(json|lock)$/.exec(file);
     if (m && INBOX_NAME.test(m[1]!) && m[1] !== keep) names.add(m[1]!);
   }
+  let asked = 0;
   names: for (const name of names) {
     for (let attempt = 1; ; attempt++) {
-      const retryAfter = await sweepOne(dir, name, stale, mtime, deleteOnServer);
-      if (retryAfter === null) break;
-      // Unreachable, refusing, or not soon: the rest wait for another sweep.
-      if (retryAfter === "stop" || attempt >= SWEEP_TRIES || retryAfter > SWEEP_RETRY_MAX_SECONDS) break names;
-      await wait(retryAfter * 1000);
+      const outcome = await sweepOne(dir, name, deleteOnServer);
+      if (outcome === "asked") asked++;
+      if (typeof outcome !== "number") {
+        // Unreachable, refusing, or enough for one sweep: the rest wait for another.
+        if (outcome === "stop" || asked >= SWEEP_SERVER_MAX) break names;
+        break;
+      }
+      if (attempt >= SWEEP_TRIES || outcome > SWEEP_RETRY_MAX_SECONDS) break names;
+      await wait(outcome * 1000);
     }
   }
 }
 
-// Sweeps one inbox if it's stale and not in use. Returns null when done
-// with it, or when it's not to be swept; the seconds to wait before trying
-// again, if the server said; or "stop" if the server couldn't delete it
-// and didn't say when to try again.
-async function sweepOne(
-  dir: string,
-  name: string,
-  stale: (file: string) => boolean,
-  mtime: (file: string) => number | null,
-  deleteOnServer: DeleteOnServer | null,
-): Promise<number | "stop" | null> {
+// Whether a file in `dir` is older than STALE_MS; false if it isn't there.
+function stale(dir: string, file: string): boolean {
+  const t = mtime(dir, file);
+  return t !== null && Date.now() - t > STALE_MS;
+}
+
+function mtime(dir: string, file: string): number | null {
+  try {
+    return statSync(join(dir, file)).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
+// Sweeps one inbox if it's stale and not in use. Returns "skipped" if it
+// isn't to be swept; "done" once it's deleted without asking the server,
+// "asked" once with; the seconds to wait before trying again, if the
+// server said; or "stop" if the server couldn't delete it and didn't say
+// when to try again.
+//
+// Its lock is held while the server is asked, so nobody opens it
+// meanwhile; a `<name>.sweep` file with this process's PID says why, so
+// Inbox.open() waits for it rather than call it in use (see SWEEP_HOLD_MS).
+// `watch` and `unwatch` take no lock, so whether it's still stale is
+// checked again after asking: one used meanwhile is kept.
+async function sweepOne(dir: string, name: string, deleteOnServer: DeleteOnServer | null): Promise<"skipped" | "done" | "asked" | "stop" | number> {
   const json = `${name}.json`;
   // A lock with no inbox file is one opened but never saved.
   const saved = existsSync(join(dir, json));
-  if (!(saved ? stale(json) : stale(`${name}.lock`))) return null;
-  const lockedAt = mtime(`${name}.lock`);
+  if (!(saved ? stale(dir, json) : stale(dir, `${name}.lock`))) return "skipped";
+  const lockedAt = mtime(dir, `${name}.lock`);
   const lockFile = join(dir, `${name}.lock`);
+  const marker = join(dir, `${name}.sweep`);
   try {
     lock(lockFile, () => "in use", 1);
   } catch {
-    return null; // In use.
+    return "skipped"; // In use.
   }
   try {
+    if (deleteOnServer) writeFileSync(marker, String(process.pid));
     // Opened and closed again while we were deciding?
-    if (saved && !stale(json)) return null;
-    if (deleteOnServer) {
-      const outcome = await deleteOnServer(name);
-      if (!outcome.done) {
-        // Kept as a record of the server's inbox still to delete: one never
-        // saved is saved empty, as old as its lock, so it stays stale.
-        if (!saved && lockedAt !== null) {
-          writeFileSync(join(dir, json), JSON.stringify(emptyState()));
-          const t = new Date(lockedAt);
-          utimesSync(join(dir, json), t, t);
-        }
-        return outcome.retryAfter ?? "stop";
-      }
-      // Used again, by `watch` (which takes no lock), while the server was asked?
-      if (saved && !stale(json)) return null;
+    if (saved && !stale(dir, json)) return "skipped";
+    if (!deleteOnServer) {
+      if (saved) deleteFiles(dir, name);
+      return "done";
     }
-    if (existsSync(join(dir, json))) tryUnlink(join(dir, json));
-    // Left by a change that was killed.
-    tryUnlink(join(dir, `${name}.writing`));
-    return null;
+    if (!saved) {
+      // An inbox the server may have, never saved here: saved empty, as old
+      // as its lock, first, so it's still on record should this process be
+      // cut short or the server not delete it.
+      if (lockedAt === null) return "skipped";
+      try {
+        writeFileSync(join(dir, json), JSON.stringify(emptyState()), { flag: "wx" });
+        const t = new Date(lockedAt);
+        utimesSync(join(dir, json), t, t);
+      } catch (e) {
+        // `watch` saved it meanwhile.
+        if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+        if (!stale(dir, json)) return "skipped";
+      }
+    }
+    const outcome = await deleteOnServer(name);
+    if (!outcome.done) return outcome.retryAfter ?? "stop";
+    // Used again, by `watch`, while the server was asked?
+    if (stale(dir, json)) deleteFiles(dir, name);
+    return "asked";
   } finally {
+    tryUnlink(marker);
     release(lockFile);
   }
+}
+
+// Deletes an inbox's file, and the write lock of a change that was killed.
+function deleteFiles(dir: string, name: string): void {
+  tryUnlink(join(dir, `${name}.json`));
+  tryUnlink(join(dir, `${name}.writing`));
 }
 
 function pauseAsync(ms: number): Promise<void> {
@@ -516,7 +569,8 @@ function tryUnlink(file: string): void {
 // appears with the PID already in it, by linking a file written
 // beforehand, so nobody reads it empty. A lock held by a live process is
 // tried again every 20 ms, `tries` times in all: by default for a moment,
-// as another process's sweep() holds a reading lock only briefly. One left
+// as another process's sweep() holds a reading lock only briefly (unless
+// it's asking the server: see Inbox.open()). One left
 // by a process that has gone is taken over.
 function lock(file: string, busy: (pid: number | null) => string, tries = 6): void {
   const tmp = `${file}.${process.pid}.tmp`;

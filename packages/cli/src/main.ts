@@ -6,11 +6,11 @@ import { loadServer } from "./config.ts";
 import { Feed } from "./feed.ts";
 import { clean, command, formatText, footer, PROSE_LENGTH, printable, toJson } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
-import { Inbox, InboxBusy, STALE_MS, sweep } from "./inbox.ts";
+import { Inbox, InboxBusy, STALE_MS, SWEEP_REQUEST_MS, sweep } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
 import { selfhost } from "./selfhost.ts";
-import { RENEW_EVERY_MS, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, deleteStaleInbox, renewSubscriptions, subscribe } from "./server.ts";
+import { RENEW_EVERY_MS, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, staleInboxDeleter, subscribe } from "./server.ts";
 import { UsageError, currentBranchPr, isPr, parseTarget, repoKey, targetKey, type RepoTarget, type Target } from "./targets.ts";
 
 // Exit codes (DESIGN.md, "The CLI").
@@ -234,7 +234,7 @@ async function main(argv: string[]): Promise<number> {
   // Other inboxes nobody has used for a week are deleted meanwhile, on the
   // server too, while this one is read.
   if (verb !== "watch" && verb !== "unwatch") {
-    sweeping = sweep(inboxName, client && ((name) => deleteStaleInbox(client, name, STALE_MS, log))).catch((e: unknown) => {
+    sweeping = sweep(inboxName, client && staleInboxDeleter(client, STALE_MS, log, SWEEP_REQUEST_MS)).catch((e: unknown) => {
       log(`couldn't clear away old inboxes: ${clean(e instanceof Error ? e.message : String(e), PROSE_LENGTH)}`);
     });
   }
