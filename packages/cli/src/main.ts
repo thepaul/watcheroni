@@ -229,7 +229,7 @@ async function main(argv: string[]): Promise<number> {
   }
   // watch and unwatch only change what the inbox watches, so they may run
   // while a wait reads it, which picks up the change.
-  const inbox = verb === "watch" || verb === "unwatch" ? Inbox.edit(inboxName) : Inbox.open(inboxName);
+  const inbox = verb === "watch" || verb === "unwatch" ? Inbox.edit(inboxName) : await Inbox.openWaiting(inboxName);
   const client = config && new ServerClient(config);
   // Other inboxes nobody has used for a week are deleted meanwhile, on the
   // server too, while this one is read.

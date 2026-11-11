@@ -236,7 +236,7 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
 // What became of a stale inbox's copy on the server (see sweep() in
 // inbox.ts): `done` once there's none left for this machine to delete;
 // otherwise `retryAfter` (seconds) if the server said when to try again.
-export type StaleInboxOutcome = { done: true } | { done: false; retryAfter: number | null };
+export type StaleInboxOutcome = { done: true; local?: true } | { done: false; retryAfter: number | null };
 
 // Deletes, for one sweep, the server's copies of inboxes nobody has opened
 // on this machine for `staleMs`, with their subscriptions (PROTOCOL.md,
@@ -278,7 +278,7 @@ export function staleInboxDeleter(
       (e: unknown) => (e instanceof ServerError && e.status === 404 ? false : failed(name, e)),
     );
     const ok = await supported;
-    if (ok === false) return { done: true };
+    if (ok === false) return { done: true, local: true };
     if (ok !== true) {
       // Asked again next time; only a definite answer is kept.
       supported = null;

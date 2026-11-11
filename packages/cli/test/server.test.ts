@@ -1270,6 +1270,8 @@ describe("sweeping old inboxes on the server", () => {
   });
 
   it("deletes only local files with a server from before inboxes could be deleted", async () => {
+    // As many as there are: the server isn't asked for each.
+    for (let i = 0; i < 7; i++) old(`b${i}`);
     old("a");
     fake.noInboxList = true;
     await sweep("current", onServer(), wait);
@@ -1381,17 +1383,22 @@ describe("sweeping old inboxes on the server", () => {
     for (const name of watched) expect(Inbox.peek(name).watched.map((w) => targetKey(w.target))).toEqual(["octo/widgets#1"]);
   });
 
-  it("makes Inbox.open wait for a sweep deleting it on the server, but not for a reader", async () => {
+  it("makes Inbox.openWaiting wait for a sweep deleting it on the server, but not for a reader", async () => {
     mkdirSync(dir(), { recursive: true });
-    // Another process, holding the lock for a moment, then letting go.
+    // Another process, holding the lock for a while, then letting go.
     const lockFile = join(dir(), "held.lock");
-    const holder = spawn(process.execPath, ["-e", `setTimeout(() => require("fs").unlinkSync(${JSON.stringify(lockFile)}), 300)`]);
+    const holder = spawn(process.execPath, ["-e", `setTimeout(() => require("fs").unlinkSync(${JSON.stringify(lockFile)}), 1000)`]);
+    const exited = new Promise((r) => holder.on("exit", r));
     writeFileSync(lockFile, String(holder.pid));
-    expect(() => Inbox.open("held")).toThrow(InboxBusy);
+    // A reader, not a sweep: in use.
+    await expect(Inbox.openWaiting("held")).rejects.toThrow(/is in use by process/);
     writeFileSync(join(dir(), "held.sweep"), String(holder.pid));
-    const started = Date.now();
-    Inbox.open("held").close();
-    expect(Date.now() - started).toBeGreaterThan(100);
-    await new Promise((r) => holder.on("exit", r));
+    // The event loop goes on meanwhile.
+    let ticks = 0;
+    const ticking = setInterval(() => ticks++, 50);
+    (await Inbox.openWaiting("held")).close();
+    clearInterval(ticking);
+    expect(ticks).toBeGreaterThan(2);
+    await exited;
   });
 });
