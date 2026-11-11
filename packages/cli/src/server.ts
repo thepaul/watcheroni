@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
+import type { EventsPage, InboxInfo, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { type ServerConfig, checkServerUrl, configDir } from "./config.ts";
 import { clean, PROSE_LENGTH } from "./format.ts";
@@ -230,6 +230,55 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
       return null;
     }
     throw e;
+  }
+}
+
+// What became of a stale inbox's copy on the server (see deleteStaleInbox).
+// "gone": there's none left for this machine to delete, so its local file
+// can go too. "kept": it couldn't be deleted now; `retryAfter` (seconds)
+// when the server said when to try again.
+export type StaleInboxOutcome = { done: true } | { done: false; retryAfter: number | null };
+
+// Deletes the server's inbox `name`, which nobody has opened on this
+// machine for `staleMs`, with its subscriptions (PROTOCOL.md, "Inboxes").
+// The local inbox is the server's of the same name: every command that
+// reads one with a server makes sure of the other (ensureInbox). One read
+// on the server within `staleMs`, by another machine, say, or made then,
+// is left alone: it's in use, just not from here. Done too when the server
+// has no such inbox. Not done if the server can't be reached or refuses,
+// or couldn't end every subscription (a 503, with Retry-After): the local
+// file is kept so the next sweep tries again.
+export async function deleteStaleInbox(client: ServerClient, name: string, staleMs: number, log: (msg: string) => void, now = Date.now()): Promise<StaleInboxOutcome> {
+  const path = `/v1/inboxes/${name}`;
+  const kept = (e: unknown): StaleInboxOutcome => {
+    if (e instanceof ServerError && e.status === 404) return { done: true };
+    if (e instanceof Unreachable) return { done: false, retryAfter: e.retryAfter };
+    // A refusal to show or delete it, or a rejected key: said once a sweep.
+    if (e instanceof ServerError || e instanceof LoginNeeded) {
+      log(`couldn't delete inbox ${name}, unused here for a week, on ${client.url}: ${e.message}`);
+      return { done: false, retryAfter: null };
+    }
+    throw e;
+  };
+  let info: InboxInfo;
+  try {
+    info = await client.request<InboxInfo>("GET", path);
+  } catch (e) {
+    return kept(e);
+  }
+  // Without both times, whether it's in use can't be told, so it's kept.
+  const created = Date.parse(String(info?.created_at));
+  const read = info?.last_read_at === null ? created : Date.parse(String(info?.last_read_at));
+  if (Number.isNaN(created) || Number.isNaN(read)) {
+    log(`didn't delete inbox ${name}, unused here for a week, on ${client.url}: its answer doesn't say when it was made and last read`);
+    return { done: false, retryAfter: null };
+  }
+  if (now - Math.max(created, read) < staleMs) return { done: true };
+  try {
+    await client.request("DELETE", path);
+    return { done: true };
+  } catch (e) {
+    return kept(e);
   }
 }
 

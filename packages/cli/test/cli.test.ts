@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -311,6 +311,21 @@ describe("wait against a server", () => {
     const second = cli(["wait", "octo/widgets#7", "--timeout", "1s"], { GH_TOKEN: "x" });
     expect(await second.code, second.stderr()).toBe(2);
     expect(fake.subscriptions.map((s) => s.repo)).toEqual(["octo/widgets"]);
+  });
+
+  it("deletes inboxes unused here for a week, on the server too", async () => {
+    process.env.WATCHERONI_STATE_DIR = env.WATCHERONI_STATE_DIR;
+    const old = Inbox.edit("old");
+    old.append([]);
+    const t = new Date(Date.now() - 8 * 24 * 3600_000);
+    utimesSync(join(env.WATCHERONI_STATE_DIR, "inboxes", "old.json"), t, t);
+    Object.assign(fake.inbox("old"), { createdAt: t.toISOString(), lastReadAt: t.toISOString() });
+    fake.inject("box", "comment.created", { comment_id: 9 });
+    const run = cli(["wait", "--settle", "0"]);
+    expect(await run.code).toBe(0);
+    expect(fake.deletedInboxes).toEqual(["old"]);
+    expect(Inbox.names()).not.toContain("old");
+    expect(run.stderr()).toBe("");
   });
 
   it("times out with exit code 2", async () => {

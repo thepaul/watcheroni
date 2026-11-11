@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
 import { clean, formatText, toJson } from "../src/format.ts";
 import { GitHubError, graphql, restList } from "../src/github.ts";
-import { Inbox, InboxBusy } from "../src/inbox.ts";
+import { Inbox, InboxBusy, sweep } from "../src/inbox.ts";
 import { forgetWarnings, pollOnce } from "../src/poll.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { UsageError, parseTarget, repoKey, targetKey, type Target } from "../src/targets.ts";
@@ -112,7 +112,7 @@ describe("inbox", () => {
     Inbox.open(name).close();
   });
 
-  it("deletes inboxes nobody has used for a week, unless in use", () => {
+  it("deletes inboxes nobody has used for a week, unless in use", async () => {
     const dir = join(process.env.WATCHERONI_STATE_DIR!, "inboxes");
     const at = (file: string) => join(dir, file);
     const [old, dead, recent, busy, current] = [`t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`, `t${n++}`];
@@ -133,6 +133,7 @@ describe("inbox", () => {
     age(at(`${recent}.json`), 6);
 
     const inbox = Inbox.open(current);
+    await sweep(current, null);
     expect(Inbox.names()).toEqual([busy, current, recent].sort());
     expect(readdirSync(dir).filter((f) => f.endsWith(".lock")).sort()).toEqual([`${busy}.lock`, `${current}.lock`, "running.lock"].sort());
     expect(readdirSync(dir).filter((f) => f.endsWith(".tmp"))).toEqual([]);
@@ -141,6 +142,7 @@ describe("inbox", () => {
     // Closing one counts as using it: held past a week, it's kept once let go.
     held.close();
     Inbox.open(recent).close();
+    await sweep(recent, null);
     expect(Inbox.names()).toEqual([busy, current, recent].sort());
   });
 });

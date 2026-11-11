@@ -6,11 +6,11 @@ import { loadServer } from "./config.ts";
 import { Feed } from "./feed.ts";
 import { clean, command, formatText, footer, PROSE_LENGTH, printable, toJson } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
-import { Inbox, InboxBusy } from "./inbox.ts";
+import { Inbox, InboxBusy, STALE_MS, sweep } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
 import { selfhost } from "./selfhost.ts";
-import { RENEW_EVERY_MS, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "./server.ts";
+import { RENEW_EVERY_MS, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, deleteStaleInbox, renewSubscriptions, subscribe } from "./server.ts";
 import { UsageError, currentBranchPr, isPr, parseTarget, repoKey, targetKey, type RepoTarget, type Target } from "./targets.ts";
 
 // Exit codes (DESIGN.md, "The CLI").
@@ -231,6 +231,13 @@ async function main(argv: string[]): Promise<number> {
   // while a wait reads it, which picks up the change.
   const inbox = verb === "watch" || verb === "unwatch" ? Inbox.edit(inboxName) : Inbox.open(inboxName);
   const client = config && new ServerClient(config);
+  // Other inboxes nobody has used for a week are deleted meanwhile, on the
+  // server too, while this one is read.
+  if (verb !== "watch" && verb !== "unwatch") {
+    sweeping = sweep(inboxName, client && ((name) => deleteStaleInbox(client, name, STALE_MS, log))).catch((e: unknown) => {
+      log(`couldn't clear away old inboxes: ${clean(e instanceof Error ? e.message : String(e), PROSE_LENGTH)}`);
+    });
+  }
 
   if (verb === "unwatch") {
     if (!parsed.length) throw new UsageError("unwatch needs a target");
@@ -501,15 +508,26 @@ process.on("SIGTERM", () => process.exit(143));
 // command `exec` runs should look for watcheroni afresh.
 delete process.env.WATCHERONI_WRAPPER;
 
+// The sweep of old inboxes main() started, if any, and how long it's given
+// to finish once the command is done. One cut short is taken up again by
+// the next: what it hasn't deleted on the server is still on disk here.
+let sweeping: Promise<void> = Promise.resolve();
+const SWEEP_GRACE_MS = 3000;
+
+async function exit(code: number): Promise<never> {
+  await Promise.race([sweeping, new Promise((r) => setTimeout(r, SWEEP_GRACE_MS).unref())]);
+  process.exit(code);
+}
+
 main(process.argv.slice(2)).then(
-  (code) => process.exit(code),
+  (code) => exit(code),
   (e: unknown) => {
     if (e instanceof LoginNeeded) {
       log(e.message);
-      process.exit(EXIT.login);
+      return exit(EXIT.login);
     }
     if (e instanceof UsageError || e instanceof InboxBusy || e instanceof LoginFailed || e instanceof Unreachable || e instanceof ServerError || e instanceof ReadingStopped) log(e.message);
     else log(e instanceof Error ? e.stack ?? e.message : String(e));
-    process.exit(EXIT.error);
+    return exit(EXIT.error);
   },
 );

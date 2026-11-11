@@ -230,7 +230,11 @@ sessions' included, with what each watches and how many events wait in it.
 An inbox nobody has opened or closed for a week is deleted the next time any inbox
 is opened, with what it watched and any events left in it, unless a
 process is using it; `default` and the rest start out empty if used again.
-(A server stops feeding an inbox after a week unread, too.)
+With a server, its inbox of the same name is deleted there first, with
+its subscriptions, unless it was read there within the week (from
+another machine, say). The local file stays until the server's inbox is
+gone, so a server that can't be reached or can't delete it yet is asked
+again next time.
 
 What local mode can't see that the server will: events between polls
 that undo each other (a thread resolved and then unresolved within one
