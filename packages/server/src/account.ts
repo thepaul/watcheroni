@@ -191,8 +191,8 @@ export class Account extends DurableObject<Env> {
         verified_until INTEGER
       );
       CREATE INDEX IF NOT EXISTS subscriptions_inbox ON subscriptions (inbox);
-      -- Where each inbox deleted for being idle had got to, so one made
-      -- again under its name carries on from there.
+      -- Where each deleted inbox that had had events had got to, so one
+      -- made again under its name carries on from there.
       CREATE TABLE IF NOT EXISTS deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER NOT NULL, acked INTEGER NOT NULL);
       -- When a subscription to each inbox was last asked for, so it isn't
       -- taken for idle while the Worker makes one (checkSubscription).
@@ -351,13 +351,17 @@ export class Account extends DurableObject<Env> {
   private dropInbox(name: string): void {
     this.sql.exec("DELETE FROM events WHERE inbox = ?", name);
     this.sql.exec("DELETE FROM subscriptions WHERE inbox = ?", name);
-    this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ?", name);
+    // One that never had an event would start again just the same without
+    // a row, so it leaves none: making and deleting empty inboxes costs no
+    // storage.
+    this.sql.exec("INSERT OR REPLACE INTO deleted_inboxes (name, head, acked) SELECT name, head, acked FROM inboxes WHERE name = ? AND head > 0", name);
     this.sql.exec("DELETE FROM inboxes WHERE name = ?", name);
     this.sql.exec("DELETE FROM subscribing WHERE inbox = ?", name);
   }
 
   // Creates the inbox if needed, whatever the cap. Only API calls and
-  // client sockets are held to it; deliveries go to inboxes they made.
+  // client sockets are held to it; /debug deliveries go to inboxes they
+  // made. RepoHub's deliveries and long-poll bridges never make one.
   // An inbox made again after roomForInbox deleted it takes up its old
   // `head` and `acked`, as if its events had all expired: seqs are never
   // reused, so a reader still holding a position from before is behind
@@ -452,9 +456,9 @@ export class Account extends DurableObject<Env> {
   }
 
   // RPC, once RepoHub has the subscription. Refuses if the inbox is gone
-  // after all, so no subscription is ever kept for a missing inbox (which
-  // deliveries would make again, past the cap); the Worker then takes it
-  // back from RepoHub. This runs without an await, so nothing can delete
+  // after all (deleted, or deleted to make room), so no subscription is
+  // ever kept for a missing inbox; the Worker then takes it back from
+  // RepoHub. This runs without an await, so nothing can delete
   // the inbox between the check and the insert.
   saveSubscription(sub: SubscriptionInfo): SubscriptionCheck {
     const { baseline: _, ...rest } = sub;
@@ -633,11 +637,16 @@ export class Account extends DurableObject<Env> {
       }
       const room = this.roomForInbox(name);
       if (!room.ok) return problem(room.status, room.code, room.detail);
-    } else if (this.ctx.getWebSockets("mode:bridge").length >= ACCOUNT_MAX_LONG_POLLS) {
-      const res = problem(429, "too_many_connections", `Too many long polls waiting on this account (at most ${ACCOUNT_MAX_LONG_POLLS})`);
-      return withRetryAfter(res, LONG_POLL_RETRY_SECONDS);
+      this.ensureInbox(name);
+    } else {
+      // The inbox existed when the Worker read it, but may have been
+      // deleted since; a bridge mustn't make it again.
+      if (!this.inbox(name)) return problem(404, "not_found", "No such inbox");
+      if (this.ctx.getWebSockets("mode:bridge").length >= ACCOUNT_MAX_LONG_POLLS) {
+        const res = problem(429, "too_many_connections", `Too many long polls waiting on this account (at most ${ACCOUNT_MAX_LONG_POLLS})`);
+        return withRetryAfter(res, LONG_POLL_RETRY_SECONDS);
+      }
     }
-    this.ensureInbox(name);
 
     const { 0: client, 1: server } = new WebSocketPair();
     // A bridge says where it is reading from up front; a client says so in

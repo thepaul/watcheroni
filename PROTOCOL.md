@@ -182,7 +182,7 @@ server revokes all of that account's keys.
 ## Inboxes
 
 ```
-PUT    /v1/inboxes/{name}        create, or touch if it exists (idempotent)
+PUT    /v1/inboxes/{name}        create, or answer the existing one (idempotent)
 GET    /v1/inboxes               list
 GET    /v1/inboxes/{name}        details
 DELETE /v1/inboxes/{name}        delete, with its subscriptions and events
@@ -199,7 +199,8 @@ name. Looking at an inbox doesn't count as reading it; reading its events
 does. `DELETE` answers `204`, ends its subscriptions without a `watch.*`
 event (as deleting each would), and closes its WebSockets with `4004`; a
 long poll waiting on it answers with no events. If the server can't end
-a subscription it answers `503` and deletes nothing, so try again.
+every subscription, it ends what it can, keeps the inbox and the rest,
+and answers `503`; try again.
 `GET` and `DELETE` on an inbox that doesn't exist answer `404
 not_found`. An inbox made again under a deleted one's name carries on
 its numbering, as below.

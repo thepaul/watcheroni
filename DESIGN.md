@@ -377,12 +377,13 @@ CREATE TABLE subscribing (inbox TEXT PRIMARY KEY, at INTEGER);
 `deleted_inboxes` keeps a deleted name until the name is used again,
 however long that is: forgetting one would let a recreated inbox start
 again at seq 1, and a client still holding a position from before would
-silently skip its first events. It grows when an account at the inbox
-cap deletes inboxes nobody has read for 30 days, and when a client
-deletes one (`DELETE /v1/inboxes/{name}`). Each row is roughly 50-100
-bytes, and making a deleted name again removes its row; a client that
-keeps making and deleting new names grows it by one row per name, paid
-for out of the account's request budget.
+silently skip its first events. An inbox that never had an event leaves
+no row, since it would start again the same without one. So it grows
+only by inboxes that had events, which only GitHub activity on a
+subscription makes, when an account at the inbox cap deletes ones nobody
+has read for 30 days or a client deletes one (`DELETE
+/v1/inboxes/{name}`). Each row is roughly 50-100 bytes, and making a
+deleted name again removes its row.
 
 RPC methods:
 
@@ -524,15 +525,18 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   `watch.*` event for it is delivered, so it follows RepoHub ending
   watches.
 - `DELETE /v1/inboxes/{name}` (`deleteInbox` in `src/subscriptions.ts`)
-  takes the inbox's subscriptions back from their RepoHubs first, and
-  answers `503` with nothing deleted if one fails; then
+  takes the inbox's subscriptions back from their RepoHubs first; if one
+  fails, it drops the ones that did end from the index, so the index
+  still says what RepoHub has, and answers `503` with the inbox kept.
+  Then
   `Account.deleteInbox` deletes the inbox, its events and its index rows,
   remembers its numbering in `deleted_inboxes`, and closes its sockets
   with `4004`. A subscription saved in between comes back from
   `deleteInbox` and is taken back from its RepoHub then. RepoHub's
   deliveries (`deliver(items, false)`) never make an inbox, so an event
   already queued in its outbox for the deleted inbox is dropped rather
-  than bringing it back; `/debug` injection still makes them.
+  than bringing it back; `/debug` injection still makes them. Nor does a
+  long poll's bridge: one opened after the delete answers `404`.
 - The install URL (in `/v1/meta`, `app_not_installed` and the landing
   page) comes from the `GITHUB_APP_SLUG` var, through `installUrl(env)`
   in `src/subscriptions.ts`; a self-hosted copy has its own App.

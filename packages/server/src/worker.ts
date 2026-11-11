@@ -549,8 +549,9 @@ async function longPoll(
   target.searchParams.set("mode", "bridge");
   target.searchParams.set("after", String(first.next));
   const upgraded = await account.fetch(target, { headers: { Upgrade: "websocket" } });
-  // Too many long polls already waiting on this account.
-  if (upgraded.status === 429) return upgraded;
+  // Too many long polls already waiting on this account, or the inbox was
+  // deleted since the read.
+  if (upgraded.status === 429 || upgraded.status === 404) return upgraded;
   const ws = upgraded.webSocket;
   if (!ws) return problem(503, "unavailable", "Could not open the bridge");
   ws.accept();

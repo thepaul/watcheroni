@@ -744,6 +744,32 @@ describe("inboxes", () => {
     expect(await (await call("/v1/inboxes/gone", { method: "PUT" })).json()).toMatchObject({ head: 4, acked: 1, oldest: 5 });
     await inject("gone");
     expect((await info("gone")).head).toBe(5);
+
+    // One that never had an event leaves nothing behind.
+    expect((await call("/v1/inboxes/empty", { method: "PUT" })).status).toBe(200);
+    expect((await call("/v1/inboxes/empty", { method: "DELETE" })).status).toBe(204);
+    const remembered = await runInDurableObject(stub, (_, state) =>
+      state.storage.sql.exec<{ name: string }>("SELECT name FROM deleted_inboxes").toArray().map((r) => r.name),
+    );
+    expect(remembered).toEqual([]);
+  });
+
+  it("doesn't let a long poll's bridge make a deleted inbox again", async () => {
+    const { call, stub } = await account();
+    expect((await call("/v1/inboxes/gone", { method: "PUT" })).status).toBe(200);
+    expect((await call("/v1/inboxes/gone", { method: "DELETE" })).status).toBe(204);
+    // As the Worker opens one after a read that found the inbox.
+    const res = await stub.fetch("https://account/ws?inbox=gone&mode=bridge&after=0", { headers: { Upgrade: "websocket" } });
+    expect(res.status).toBe(404);
+    expect((await call("/v1/inboxes/gone")).status).toBe(404);
+  });
+
+  it(`moves oldest on as the inbox trims to ${INBOX_MAX_EVENTS} events`, async () => {
+    const { call, inject, info } = await account();
+    expect((await call("/v1/inboxes/full", { method: "PUT" })).status).toBe(200);
+    // /debug injects at most 100 at a time.
+    for (let n = 0; n < INBOX_MAX_EVENTS + 100; n += 100) await inject("full", 100);
+    expect(await info("full")).toMatchObject({ head: INBOX_MAX_EVENTS + 100, oldest: 101 });
   });
 
   it("drops RepoHub's deliveries to a deleted inbox rather than make it again", async () => {
