@@ -126,9 +126,9 @@ export class FakeServer {
   failDeletes = 0;
   deleteStatus = 503;
   deleteRetryAfter: string | null = "1";
-  // What /v1/meta lists (without inbox_delete: a server whose DELETE takes
-  // no unused_since), or never answer it.
-  features = ["ws", "longpoll", "repo_scope", "inbox_delete"];
+  // What /v1/meta lists (without inbox_unused_since: a server whose
+  // DELETE ignores unused_since, deleting whatever), or never answer it.
+  features = ["ws", "longpoll", "repo_scope", "inbox_unused_since"];
   hangMeta = false;
   // Inboxes another DELETE is under way on.
   readonly deleting = new Set<string>();
@@ -395,7 +395,7 @@ export class FakeServer {
       }
       if (this.deleting.has(name)) return json(409, { status: 409, code: "inbox_deleting", title: "The inbox is being deleted" });
       const since = url.searchParams.get("unused_since");
-      if (since !== null && this.features.includes("inbox_delete")) {
+      if (since !== null && this.features.includes("inbox_unused_since")) {
         const t = Date.parse(since);
         if (!/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(since) || Number.isNaN(t) || t > Date.now()) {
           return json(400, { status: 400, code: "invalid_request", title: "unused_since must be one RFC 3339 timestamp" });

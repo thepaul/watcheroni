@@ -242,7 +242,7 @@ export type StaleInboxOutcome = { done: true; local?: true } | { done: false; re
 
 // The /v1/meta feature of a server that deletes an inbox only if nobody
 // has used it since a given time (DELETE /v1/inboxes/{name}?unused_since).
-export const INBOX_DELETE_FEATURE = "inbox_delete";
+export const INBOX_UNUSED_SINCE_FEATURE = "inbox_unused_since";
 
 // Deletes, for one sweep, the server's copies of inboxes nobody has opened
 // on this machine for `staleMs`, with their subscriptions (PROTOCOL.md,
@@ -286,7 +286,7 @@ export function staleInboxDeleter(
   };
   return async (name) => {
     supported ??= client.request<Meta>("GET", "/v1/meta", { timeoutMs }).then(
-      (meta) => Array.isArray(meta?.features) && meta.features.includes(INBOX_DELETE_FEATURE),
+      (meta) => Array.isArray(meta?.features) && meta.features.includes(INBOX_UNUSED_SINCE_FEATURE),
       (e: unknown) => failed(name, e),
     );
     const ok = await supported;
