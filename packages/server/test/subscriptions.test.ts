@@ -446,6 +446,100 @@ describe("subscribing to a public repo", () => {
     expect((await hubStats(repo.id)).subscriptions.map((s) => s.id)).toEqual([late.id]);
   });
 
+  // A slow delete, D: it marks the inbox and lists X, then its
+  // RepoHub.unsubscribe(X) is held up past the mark's 60 seconds. A
+  // request for X again (a renewal) comes in meanwhile; D's unsubscribe
+  // lands either after RepoHub renews X or before.
+  async function slowDelete(unsubscribeLandsFirst: boolean) {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const x = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 })).json<SubscriptionInfo>();
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${user.id}`));
+    const begun = await account.beginDeleteInbox("box", null);
+    if (!begun.ok) throw new Error("not begun");
+    expect(begun.subscriptions.map((s) => s.id)).toEqual([x.id]);
+    // The mark lapses: as if D, and X's request before it, were 61
+    // seconds ago.
+    await runInDurableObject(account, (_, state) => {
+      state.storage.sql.exec("UPDATE deleting SET at = at - 61000");
+    });
+    await runInDurableObject(repoHubStub(repo.id), (_, state) => {
+      state.storage.sql.exec("UPDATE subscriptions SET checked_at = checked_at - 61000");
+    });
+    const lapsed = { ...begun.ticket, mark: begun.ticket.mark - 61000 };
+    // As the Worker sends it: with the mark's time.
+    const dUnsubscribe = () => repoHubStub(repo.id).unsubscribe(x.id, lapsed.mark);
+    let dResult: boolean | "kept" | undefined;
+    if (unsubscribeLandsFirst) dResult = await dUnsubscribe();
+    // The renewal: checkSubscription takes the lapsed mark over, RepoHub
+    // renews X (or makes it afresh), and D's unsubscribe lands now if it
+    // hasn't, before the renewal's save.
+    if (!unsubscribeLandsFirst) {
+      const realSubscribe = RepoHub.prototype.subscribe;
+      vi.spyOn(RepoHub.prototype, "subscribe").mockImplementation(function (this: RepoHub, ...args: Parameters<RepoHub["subscribe"]>) {
+        const result = realSubscribe.apply(this, args);
+        // Same object, synchronously: D's unsubscribe lands right after.
+        dResult = this.unsubscribe(x.id, lapsed.mark);
+        return result;
+      });
+    }
+    const renewal = await subscribe(user.auth, { repo: fullName(repo), pr: 7 });
+    // D goes on as the Worker does: RepoHub kept X, so it cancels;
+    // otherwise its last step finds its mark taken over.
+    let finished: boolean;
+    if (dResult === "kept") {
+      await account.cancelDeleteInbox("box", lapsed, []);
+      finished = false;
+    } else {
+      finished = await account.deleteInbox("box", lapsed, begun.subscriptions.map((s) => s.id));
+    }
+    return { user, repo, x, renewal, dResult, finished };
+  }
+  const repoHubStub = (id: number) => env.REPO_HUB.get(env.REPO_HUB.idFromName(`repo:${id}`));
+
+  it("keeps a subscription renewed after a slow delete's mark lapsed, though the delete's unsubscribe lands after", async () => {
+    const { user, repo, x, renewal, dResult, finished } = await slowDelete(false);
+    expect(renewal.status).toBe(200);
+    expect((await renewal.json<SubscriptionInfo>()).id).toBe(x.id);
+    expect(dResult).toBe("kept");
+    expect(finished).toBe(false);
+    expect((await hubStats(repo.id)).subscriptions.map((s) => s.id)).toEqual([x.id]);
+    expect((await list(user.auth)).map((s) => s.id)).toEqual([x.id]);
+  });
+
+  it("makes a renewal afresh when a slow delete's unsubscribe landed first, and keeps it", async () => {
+    const { user, repo, x, renewal, dResult, finished } = await slowDelete(true);
+    expect(dResult).toBe(true);
+    expect(renewal.status).toBe(201);
+    const fresh = await renewal.json<SubscriptionInfo>();
+    expect(fresh.id).not.toBe(x.id);
+    expect(finished).toBe(false);
+    // X is gone from both; the new one is in both.
+    expect((await hubStats(repo.id)).subscriptions.map((s) => s.id)).toEqual([fresh.id]);
+    expect((await list(user.auth)).map((s) => s.id)).toEqual([fresh.id]);
+  });
+
+  it("answers 503 when RepoHub keeps a subscription renewed after the delete's mark lapsed", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const x = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 })).json<SubscriptionInfo>();
+    // Through the Worker: D's unsubscribe is held up until a renewal,
+    // checked once D's mark has lapsed, has been through RepoHub.
+    const realUnsubscribe = RepoHub.prototype.unsubscribe;
+    vi.spyOn(RepoHub.prototype, "unsubscribe").mockImplementation(function (this: RepoHub, id: string, notCheckedSince?: number) {
+      // As if 61 seconds have passed: the renewal's check is that far on.
+      (this as unknown as { sql: SqlStorage }).sql.exec("UPDATE subscriptions SET checked_at = ? WHERE id = ?", notCheckedSince! + 61000, id);
+      return realUnsubscribe.call(this, id, notCheckedSince);
+    });
+    const del = await call("/v1/inboxes/box", { method: "DELETE", headers: user.auth });
+    expect(del.status).toBe(503);
+    expect((await hubStats(repo.id)).subscriptions.map((s) => s.id)).toEqual([x.id]);
+    expect((await list(user.auth)).map((s) => s.id)).toEqual([x.id]);
+    expect((await call("/v1/inboxes/box", { headers: user.auth })).status).toBe(200);
+  });
+
   it("answers 503, putting the subscriptions back in order, when the last step fails", async () => {
     const user = await signedIn();
     const repo = newRepo();

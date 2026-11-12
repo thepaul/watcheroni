@@ -146,7 +146,9 @@ CREATE TABLE subscriptions (
   spec TEXT NOT NULL,            -- JSON: kinds, ignore, base, author
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL,   -- pushed later by Account on each read
-  verified_until INTEGER         -- private repos only
+  verified_until INTEGER,        -- private repos only
+  checked_at INTEGER             -- Account's checkSubscription time of the
+                                 -- latest request that made or renewed it
 );
 CREATE INDEX subscriptions_pr ON subscriptions (pr);
 
@@ -189,7 +191,7 @@ interface RepoHub {
 
   // From Account.
   subscribe(sub: NewSubscription, repo: RepoInfo, baseline?: PrBaseline): Promise<SubscriptionRow>;
-  unsubscribe(subId: string): Promise<void>;
+  unsubscribe(subId: string, notCheckedSince?: number): Promise<boolean | "kept">;  // "kept": see DELETE /v1/inboxes/{name}
   touch(subIds: string[], expiresAt: number): Promise<void>;
   verify(subId: string, verifiedUntil: number): Promise<void>;
 
@@ -560,7 +562,8 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
      life. That means for certain that nothing was saved since step 1
      and the inbox wasn't dropped or made again: a save refuses while
      the mark is live, and takes it over once it lapses; `dropInbox`
-     removes it. An index row step 1 didn't list is logged as a bug.
+     removes it. An index row step 1 didn't list is logged as a bug, and
+     the delete gives up rather than drop it.
 
   A delete that can't finish puts back what it can and answers `503`:
   `Account.cancelDeleteInbox` drops from the index the subscriptions that
@@ -579,17 +582,35 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   no longer live, `checkSubscription` answers the time it checked, and
   `saveSubscription` refuses with `409 inbox_deleting` if a delete began
   on the inbox at or after that time, or the inbox was made again since.
+  These times (inboxes' `created_at`, marks, `checked_at`) come from
+  `Account.tick()`: milliseconds, but strictly increasing and kept in
+  `meta`, so no two are equal and their order is the order they were
+  taken.
 
   A mark lasts 60 seconds (`DELETE_MARK_MS`). It outlives its delete only
   if the Worker dies between steps 1 and 3; step 2 is one request's
   `unsubscribe` calls, run at once, each a few SQL statements in one
   RepoHub, so a live delete is through it in well under a second. The
   runtime sets no fixed wall-clock limit on a request, though, so a
-  delete can be slower than its mark. Whatever next finds a lapsed mark
-  takes it over (a check or save makes it not live; a new delete writes
-  its own), and the slow delete then can't finish, answering `503`
-  rather than dropping anything saved meanwhile. A mark whose delete
-  died, with nothing else touching the inbox, holds it 60 seconds.
+  delete can be slower than its mark, and what's guaranteed then is
+  this. Whatever next finds a lapsed mark takes it over (a check or save
+  makes it not live; a new delete writes its own), and the slow delete
+  then can't finish or lift a newer mark. Its step-2 calls may still land
+  late, after a client has asked for one of its subscriptions again, so
+  each `unsubscribe` carries the mark's time, and RepoHub keeps
+  (answering `"kept"`) a subscription whose stored `checked_at` (the
+  Account check of the latest request that made or renewed it, passed
+  through `subscribe`) is at or after it. The delete treats that as a
+  failure: it cancels, leaving the subscription in RepoHub and the index,
+  and answers `503`. If instead the late `unsubscribe` lands first, the
+  renewal finds nothing in RepoHub and makes a new subscription, which
+  the client gets, and the slow delete's last step finds its mark gone,
+  forgets only what it listed, and answers `503`. Either way no
+  subscription a client was told about after the mark lapsed is ended by
+  the slow delete. Rows from before `checked_at` was kept, and `/debug`
+  ones, have none and are ended as before; other callers of `unsubscribe`
+  pass no bound. A mark whose delete died, with nothing else touching the
+  inbox, holds it 60 seconds.
 
   RepoHub's deliveries (`deliver(items, false)`) never make an inbox, so
   an event already queued in its outbox for the deleted inbox is dropped

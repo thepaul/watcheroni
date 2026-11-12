@@ -130,18 +130,26 @@ const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 // once (Promise.allSettled), each a few SQL statements in one RepoHub, so
 // a live delete gets through them in well under a second. 60 seconds is
 // far beyond that, while short enough that an inbox left marked isn't
-// refused subscriptions for long. The runtime sets the Worker no fixed
-// wall-clock limit, so a slow delete can still outlive its mark; nothing
-// is lost then. Whatever finds the mark lapsed (deletingMark) takes it
-// over first, and deleteInbox and cancelDeleteInbox act on a mark only
-// while it is the one their ticket names, still live: the late delete is
-// refused rather than dropping a subscription saved meanwhile.
+// refused subscriptions for long.
+//
+// The runtime sets the Worker no fixed wall-clock limit, so a slow delete
+// can still outlive its mark. What holds then: whatever finds the mark
+// lapsed (deletingMark) takes it over, and deleteInbox and
+// cancelDeleteInbox act on a mark only while it is the one their ticket
+// names, still live, so the late delete can't finish or lift a newer
+// mark. Its RepoHub.unsubscribe calls may still land late, but each
+// carries the mark's time, and RepoHub keeps any subscription made or
+// renewed by a request checked (checkSubscription) at or after it. So a
+// subscription a client was told about after the mark lapsed is never
+// ended by the late delete; the delete answers 503 instead.
 const DELETE_MARK_MS = 60 * 1000;
 
 export class Account extends DurableObject<Env> {
   private readonly instance = crypto.randomUUID();
   private readonly startedAt = Date.now();
   private readonly sql: SqlStorage;
+  // The last tick() handed out; read from `meta` on first use.
+  private lastTick: number | null = null;
   // Whether this account's tables exist. The Worker turns away keys
   // without a valid tag, but checking the key's hash is this object's job;
   // as a second line of defence, it writes nothing until login makes the
@@ -171,6 +179,19 @@ export class Account extends DurableObject<Env> {
       "DELETE FROM wakes WHERE rowid NOT IN (SELECT rowid FROM wakes ORDER BY at DESC LIMIT ?)",
       WAKES_KEPT,
     );
+  }
+
+  // Account's clock for the times compared to tell what happened first:
+  // inboxes' `created_at`, deleting marks, and checkSubscription's
+  // `checked_at` (which RepoHub keeps, for unsubscribe). Milliseconds, as
+  // Date.now(), but strictly increasing, kept in `meta` across restarts,
+  // so no two share a value and their order is the order they were taken.
+  private tick(): number {
+    this.lastTick ??= Number(this.sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = 'tick'").toArray()[0]?.v ?? 0);
+    const t = Math.max(Date.now(), this.lastTick + 1);
+    this.lastTick = t;
+    this.sql.exec("INSERT INTO meta (k, v) VALUES ('tick', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", String(t));
+    return t;
   }
 
   private migrate(): void {
@@ -362,7 +383,7 @@ export class Account extends DurableObject<Env> {
     const inbox = this.inbox(name);
     if (!inbox) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
     this.open();
-    const now = Date.now();
+    const now = this.tick();
     if (this.deletingMark(name, now)?.active) return beingDeletedRefusal();
     if (since !== null) {
       const used = this.usedSince(inbox, since);
@@ -419,7 +440,10 @@ export class Account extends DurableObject<Env> {
     const unlisted = (this.listSubscriptions(name) ?? []).filter((s) => !known.has(s.id));
     if (unlisted.length) {
       // Unreachable, by the mark: there's no way to save one without it.
+      // Should it happen, the delete gives up rather than drop them.
       console.error(`deleting inbox ${name}: subscriptions saved during the delete: ${unlisted.map((s) => s.id).join(", ")}`);
+      this.cancelDeleteInbox(name, ticket, listed);
+      return false;
     }
     this.dropInbox(name);
     for (const ws of this.ctx.getWebSockets(`inbox:${name}`)) ws.close(4004, "inbox deleted");
@@ -516,7 +540,7 @@ export class Account extends DurableObject<Env> {
       .toArray()[0];
     this.sql.exec(
       "INSERT INTO inboxes (name, created_at, head, acked) VALUES (?, ?, ?, ?)",
-      name, Date.now(), old?.head ?? 0, old?.acked ?? 0,
+      name, this.tick(), old?.head ?? 0, old?.acked ?? 0,
     );
     if (old) this.sql.exec("DELETE FROM deleted_inboxes WHERE name = ?", name);
     return this.inbox(name)!;
@@ -584,13 +608,13 @@ export class Account extends DurableObject<Env> {
   // being deleted takes no new subscription.
   checkSubscription(inbox: string): SubscriptionCheck {
     if (!this.inbox(inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
-    const now = Date.now();
-    if (this.deletingMark(inbox, now)?.active) return beingDeletedRefusal();
+    this.open();
+    if (this.deletingMark(inbox)?.active) return beingDeletedRefusal();
     const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions").one().n;
     if (n >= ACCOUNT_MAX_SUBSCRIPTIONS) {
       return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many subscriptions on this account (at most ${ACCOUNT_MAX_SUBSCRIPTIONS})` };
     }
-    this.open();
+    const now = this.tick();
     this.sql.exec(
       "INSERT INTO subscribing (inbox, at) VALUES (?, ?) ON CONFLICT (inbox) DO UPDATE SET at = excluded.at",
       inbox, now,
@@ -612,7 +636,7 @@ export class Account extends DurableObject<Env> {
     const { baseline: _, ...rest } = sub;
     const inbox = this.inbox(rest.inbox);
     if (!inbox) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
-    if (inbox.created_at > checkedAt) {
+    if (inbox.created_at >= checkedAt) {
       return { ok: false, status: 409, code: "inbox_deleting", detail: "Inbox was deleted and made again while subscribing; try again" };
     }
     const mark = this.deletingMark(rest.inbox);

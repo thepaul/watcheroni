@@ -117,6 +117,7 @@ export async function createSubscription(
       ignore: parsed.ignore,
       ttl_seconds: parsed.ttl_seconds,
       verified_until: verifiedUntil,
+      checked_at: room.checked_at,
     },
     repo,
     baseline,
@@ -226,8 +227,9 @@ export async function deleteSubscription(env: Env, account: AccountStub, inbox: 
 // Whenever it can't finish, the delete answers 503 having put back what
 // it can: the subscriptions that did end are dropped from the index, so it
 // says what RepoHub has, and the mark is lifted, so the inbox takes
-// subscriptions again. That's when a RepoHub can't be reached, when
-// Account fails at the last step, and when the mark is no longer this
+// subscriptions again. That's when a RepoHub can't be reached, or keeps
+// a subscription renewed since the mark (see below), when Account fails
+// at the last step, and when the mark is no longer this
 // delete's at the last step: it lapsed and was taken over, or the inbox
 // was dropped (and maybe made again) meanwhile. The client tries again,
 // with the inbox as it is then.
@@ -254,11 +256,21 @@ export async function deleteInbox(env: Env, account: AccountStub, inbox: string,
       console.error(`deleting inbox ${inbox}: cancelling failed`, e);
     }
   };
-  const results = await Promise.allSettled(subs.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id)));
-  const failed = results.flatMap((r, i) => (r.status === "rejected" ? [[subs[i], r.reason] as const] : []));
-  if (failed.length) {
-    for (const [sub, reason] of failed) console.error(`deleting inbox ${inbox}: unsubscribing ${sub.id} failed`, reason);
-    await cancel(subs.filter((_, i) => results[i].status === "fulfilled").map((s) => s.id));
+  // Each carries the mark's time: RepoHub keeps ("kept") a subscription a
+  // request checked at or after it made or renewed, which can happen only
+  // once the mark has lapsed under a slow delete. That one is newer than
+  // this delete's list, so the delete gives up, as if it had failed.
+  const results = await Promise.allSettled(subs.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id, ticket.mark)));
+  const ended = (i: number) => {
+    const r = results[i];
+    return r.status === "fulfilled" && r.value !== "kept";
+  };
+  if (!subs.every((_, i) => ended(i))) {
+    results.forEach((r, i) => {
+      if (r.status === "rejected") console.error(`deleting inbox ${inbox}: unsubscribing ${subs[i].id} failed`, r.reason);
+      else if (r.value === "kept") console.warn(`deleting inbox ${inbox}: ${subs[i].id} was renewed after the delete began; keeping it`);
+    });
+    await cancel(subs.filter((_, i) => ended(i)).map((s) => s.id));
     return unavailable("Couldn't end all of the inbox's subscriptions");
   }
   const ids = subs.map((s) => s.id);

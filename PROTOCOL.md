@@ -221,7 +221,12 @@ subscriptions again at once. That happens when a subscription can't be
 ended, and when the inbox changed under the delete (it was deleted to
 make room, or made again, meanwhile; `Retry-After: 1`). One whose work
 on the server stopped halfway holds the inbox for at most 60 seconds. A
-retry is a new delete, judged by the inbox as it is then.
+retry is a new delete, judged by the inbox as it is then; if the
+server's last step failed after deleting the inbox, the retry answers
+`404`. A subscription the server accepts (`200` or `201`) while a
+delete is under way, which it can only once the delete is slow enough
+for its hold to lapse, is never ended by that delete; the delete
+answers `503` instead.
 
 With `unused_since`, an RFC 3339 timestamp (`2026-11-04T12:00:00Z`; `T`
 and `Z` upper case, an offset's `+` encoded as `%2B`), `DELETE` deletes
