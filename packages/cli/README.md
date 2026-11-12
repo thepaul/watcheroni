@@ -231,8 +231,10 @@ An inbox nobody has opened or closed for a week is deleted the next time a
 `wait`, `stream` or `exec` runs, with what it watched and any events left
 in it, unless a process is using it; `default` and the rest start out
 empty if used again. With a server, its inbox of the same name is deleted
-there first, with its subscriptions and unread events, unless it was made
-or read there within the week (from another machine, say). The local file
+there first, with its subscriptions and unread events, unless the server
+says someone has used it within the week: made, read, subscribed to it,
+or is connected to it now (from another machine, say). A server too old
+to check that isn't asked, and its inbox ends by itself. The local file
 stays until the server's inbox is gone, so a server that can't be reached
 or can't delete it yet is asked again next time; a few inboxes are taken
 to the server at a time. (A server stops feeding an inbox after a week

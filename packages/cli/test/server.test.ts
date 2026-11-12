@@ -1257,28 +1257,56 @@ describe("sweeping old inboxes on the server", () => {
     expect(messages).toEqual([]);
   });
 
-  it("deletes only the local file when the server's inbox is gone or was made or read elsewhere this week", async () => {
+  it("asks the server to delete it only if unused for the week", async () => {
+    old("gone");
+    const before = Date.now();
+    await sweep("current", onServer(), wait);
+    const del = fake.requests.find((r) => r.startsWith("DELETE"))!;
+    const since = Date.parse(new URL(del.slice("DELETE ".length), fake.url).searchParams.get("unused_since")!);
+    expect(since).toBeGreaterThanOrEqual(before - WEEK);
+    expect(since).toBeLessThanOrEqual(Date.now() - WEEK);
+  });
+
+  it("deletes only the local file when the server's inbox is gone or in use elsewhere", async () => {
     old("missing");
     fake.inboxes.delete("missing");
     old("elsewhere", 8, 1);
     old("remade", 8, null);
     fake.inbox("remade").createdAt = daysAgo(2).toISOString();
+    // Streamed from elsewhere over one socket since long ago.
+    old("streamed");
+    await reader("streamed").start();
+    fake.inbox("streamed").lastReadAt = daysAgo(8).toISOString();
     await sweep("current", onServer(), wait);
     expect(fake.deletedInboxes).toEqual([]);
     expect(Inbox.names()).toEqual([]);
-    expect(fake.inboxes.has("elsewhere") && fake.inboxes.has("remade")).toBe(true);
+    expect(["elsewhere", "remade", "streamed"].every((n) => fake.inboxes.has(n))).toBe(true);
+    expect(messages).toEqual([]);
   });
 
-  it("deletes only local files with a server from before inboxes could be deleted", async () => {
+  it("deletes only local files with a server whose DELETE takes no unused_since", async () => {
     // As many as there are: the server isn't asked for each.
     for (let i = 0; i < 7; i++) old(`b${i}`);
     old("a");
-    fake.noInboxList = true;
+    fake.features = ["ws", "longpoll", "repo_scope"];
     await sweep("current", onServer(), wait);
     expect(Inbox.names()).toEqual([]);
     expect(fake.inboxes.has("a")).toBe(true);
-    expect(fake.requests.filter((r) => r.startsWith("GET /v1/inboxes/") || r.startsWith("DELETE"))).toEqual([]);
+    expect(fake.requests.filter((r) => r !== "GET /v1/meta")).toEqual([]);
     expect(messages).toEqual([]);
+  });
+
+  it("leaves one another delete is under way on for a later sweep, going on to the rest", async () => {
+    old("a");
+    old("b");
+    fake.deleting.add("a");
+    await sweep("current", onServer(), wait);
+    expect(fake.deletedInboxes).toEqual(["b"]);
+    expect(Inbox.names()).toEqual(["a"]);
+    expect(messages).toEqual([]);
+    fake.deleting.clear();
+    await sweep("current", onServer(), wait);
+    expect(Inbox.names()).toEqual([]);
   });
 
   for (const status of [503, 429]) {
@@ -1306,7 +1334,7 @@ describe("sweeping old inboxes on the server", () => {
     await sweep("current", onServer(), wait);
     // Three tries at the first, then the rest are left for another sweep.
     expect(waits).toEqual([1000, 1000]);
-    expect(fake.requests.filter((r) => r.startsWith("DELETE"))).toEqual(["DELETE /v1/inboxes/next", "DELETE /v1/inboxes/next", "DELETE /v1/inboxes/next"]);
+    expect(fake.requests.filter((r) => r.startsWith("DELETE")).map((r) => r.split("?")[0])).toEqual(["DELETE /v1/inboxes/next", "DELETE /v1/inboxes/next", "DELETE /v1/inboxes/next"]);
     expect(Inbox.names()).toEqual(["next", "stuck"]);
     expect(readdirSync(dir()).filter((f) => !f.endsWith(".json"))).toEqual([]);
     // A 503 with a Retry-After too far off isn't waited for; one without
@@ -1336,15 +1364,6 @@ describe("sweeping old inboxes on the server", () => {
     expect(Inbox.names()).toEqual(["a", "b"]);
     expect(messages).toEqual([expect.stringMatching(/^couldn't delete inbox a, unused here for a week, on http:\/\/127\.0\.0\.1:\d+: .* rejected the API key/)]);
     expect(fake.deletedInboxes).toEqual([]);
-  });
-
-  it("keeps the server's inbox when its answer doesn't say when it was made or read", async () => {
-    old("odd");
-    fake.inbox("odd").createdAt = "yesterday-ish";
-    await sweep("current", onServer(), wait);
-    expect(fake.deletedInboxes).toEqual([]);
-    expect(Inbox.names()).toEqual(["odd"]);
-    expect(messages).toEqual([expect.stringMatching(/^couldn't delete inbox odd, .*doesn't say when it was made and last read$/)]);
   });
 
   it("takes a few inboxes to the server each sweep", async () => {

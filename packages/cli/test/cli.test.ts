@@ -335,14 +335,14 @@ describe("wait against a server", () => {
     utimesSync(join(env.WATCHERONI_STATE_DIR, "inboxes", "old.json"), t, t);
     Object.assign(fake.inbox("old"), { createdAt: t.toISOString(), lastReadAt: t.toISOString() });
     expect(await cli(["unwatch", "octo/widgets#1"]).code).toBe(0);
-    expect(fake.requests.filter((r) => r.startsWith("GET /v1/inboxes?") || r === "GET /v1/inboxes")).toEqual([]);
-    fake.hangInboxList = true;
+    expect(fake.requests.filter((r) => r === "GET /v1/meta" || r.startsWith("DELETE"))).toEqual([]);
+    fake.hangMeta = true;
     fake.inject("box", "comment.created", { comment_id: 9 });
     const started = Date.now();
     const run = cli(["wait", "--settle", "0"]);
     expect(await run.code).toBe(0);
     // Cut short while it waited on the server, after the grace.
-    expect(fake.requests).toContain("GET /v1/inboxes");
+    expect(fake.requests).toContain("GET /v1/meta");
     expect(Date.now() - started).toBeGreaterThan(2500);
     expect(Date.now() - started).toBeLessThan(6000);
     expect(Inbox.names()).toContain("old");

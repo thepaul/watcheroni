@@ -65,16 +65,16 @@ export const STALE_MS = 7 * 24 * 3600 * 1000;
 // when to try again, and the longest it waits for that.
 const SWEEP_TRIES = 3;
 const SWEEP_RETRY_MAX_SECONDS = 60;
-// How many stale inboxes one sweep takes to the server, at two requests
-// each: a backlog, such as Claude Code sessions' inboxes, is cleared a few
-// at a time rather than crowd the account's rate limit.
+// How many stale inboxes one sweep takes to the server: a backlog, such
+// as Claude Code sessions' inboxes, is cleared a few at a time rather than
+// crowd the account's rate limit.
 const SWEEP_SERVER_MAX = 5;
 // How long Inbox.openWaiting() waits for a sweep that holds the inbox's
-// lock while asking the server: at most three requests (the first inbox
-// of a sweep also asks whether the server can delete inboxes at all), each
+// lock while asking the server: at most two requests (the first inbox of
+// a sweep also asks whether the server can delete inboxes safely), each
 // given SWEEP_REQUEST_MS.
 export const SWEEP_REQUEST_MS = 10_000;
-const SWEEP_HOLD_MS = 3 * SWEEP_REQUEST_MS + 5000;
+const SWEEP_HOLD_MS = 2 * SWEEP_REQUEST_MS + 5000;
 
 export class InboxBusy extends Error {}
 
@@ -458,7 +458,9 @@ export const prKey = (e: { repo: { full_name: string } | null; pr: number | null
 // there's none left for this machine to delete; otherwise `retryAfter`
 // (seconds) if the server said when to try again.
 // `local` when the server can't delete inboxes, so it wasn't asked.
-export type DeleteOnServer = (name: string) => Promise<{ done: true; local?: true } | { done: false; retryAfter: number | null }>;
+// `later` when another delete of it is under way, so it's left for a later
+// sweep.
+export type DeleteOnServer = (name: string) => Promise<{ done: true; local?: true } | { done: false; retryAfter: number | null; later?: true }>;
 
 // Deletes the inboxes nobody has opened for STALE_MS, except `keep` and
 // any in use, with what they watched and any events never acknowledged.
@@ -517,7 +519,8 @@ function mtime(dir: string, file: string): number | null {
 
 // Sweeps one inbox if it's stale and not in use. Returns "skipped" if it
 // isn't to be swept; "done" once it's deleted without asking the server,
-// "asked" once with; the seconds to wait before trying again, if the
+// "asked" once with (or left for later, if another delete of it is under
+// way); the seconds to wait before trying again, if the
 // server said; or "stop" if the server couldn't delete it and didn't say
 // when to try again.
 //
@@ -574,7 +577,7 @@ async function sweepOne(dir: string, name: string, deleteOnServer: DeleteOnServe
       }
     }
     const outcome = await deleteOnServer(name);
-    if (!outcome.done) return outcome.retryAfter ?? "stop";
+    if (!outcome.done) return "later" in outcome ? "asked" : outcome.retryAfter ?? "stop";
     // Used again, by `watch`, while the server was asked?
     if (stale(dir, json)) deleteFiles(dir, name);
     return "local" in outcome ? "done" : "asked";

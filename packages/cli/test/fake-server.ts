@@ -126,10 +126,12 @@ export class FakeServer {
   failDeletes = 0;
   deleteStatus = 503;
   deleteRetryAfter: string | null = "1";
-  // Answer GET /v1/inboxes with 404, as a server from before it did; or
-  // never answer it.
-  noInboxList = false;
-  hangInboxList = false;
+  // What /v1/meta lists (without inbox_delete: a server whose DELETE takes
+  // no unused_since), or never answer it.
+  features = ["ws", "longpoll", "repo_scope", "inbox_delete"];
+  hangMeta = false;
+  // Inboxes another DELETE is under way on.
+  readonly deleting = new Set<string>();
   // Private subscriptions' verified_until, by ID, and the verify calls seen.
   readonly verifiedUntil = new Map<string, string>();
   readonly verified: { id: string; githubToken: string | null }[] = [];
@@ -374,10 +376,9 @@ export class FakeServer {
       return this.refreshLimited ? json(429, { status: 429, code: "rate_limited" }) : json(200, this.refreshAnswer);
     }
     if (!this.authorized(req)) return json(401, { status: 401, code: "unauthorized" });
-    if (req.method === "GET" && url.pathname === "/v1/inboxes") {
-      if (this.hangInboxList) return;
-      if (this.noInboxList) return json(404, { status: 404, code: "not_found", title: "No such endpoint" });
-      return json(200, { inboxes: [...this.inboxes.keys()].map((name) => ({ name })) });
+    if (req.method === "GET" && url.pathname === "/v1/meta") {
+      if (this.hangMeta) return;
+      return json(200, { protocol: 1, server: "fake", features: this.features, limits: {} });
     }
     const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?(?:\/([^/]+)(\/[a-z]+)?)?$/);
     if (!m) return json(404, { status: 404, code: "not_found" });
@@ -391,6 +392,18 @@ export class FakeServer {
           name, created_at: known.createdAt, head: known.head, acked: known.acked, oldest: known.events[0]?.seq ?? known.head + 1,
           subscriptions: this.subscriptions.filter((s) => s.inbox === name).length, last_read_at: known.lastReadAt,
         });
+      }
+      if (this.deleting.has(name)) return json(409, { status: 409, code: "inbox_deleting", title: "The inbox is being deleted" });
+      const since = url.searchParams.get("unused_since");
+      if (since !== null && this.features.includes("inbox_delete")) {
+        const t = Date.parse(since);
+        if (!/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(since) || Number.isNaN(t) || t > Date.now()) {
+          return json(400, { status: 400, code: "invalid_request", title: "unused_since must be one RFC 3339 timestamp" });
+        }
+        const used = Date.parse(known.createdAt) >= t ? "made"
+          : known.lastReadAt && Date.parse(known.lastReadAt) >= t ? "read"
+          : [...this.sockets].some((sock) => sock.inbox === name) ? "connected" : null;
+        if (used) return json(409, { status: 409, code: "inbox_in_use", title: `The inbox was ${used} since then` });
       }
       if (this.failDeletes > 0) {
         this.failDeletes--;
