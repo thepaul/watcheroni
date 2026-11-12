@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { EventsPage, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
+import type { EventsPage, Meta, ServerMessage, SubscriptionInfo, SubscriptionRequest, SubscriptionsResponse, WatchEvent } from "@watcheroni/protocol";
 import pkg from "../package.json" with { type: "json" };
 import { type ServerConfig, checkServerUrl, configDir } from "./config.ts";
 import { clean, PROSE_LENGTH } from "./format.ts";
@@ -231,6 +231,84 @@ export async function subscribe(client: ServerClient, inbox: string, target: Tar
     }
     throw e;
   }
+}
+
+// What became of a stale inbox's copy on the server (see sweep() in
+// inbox.ts): `done` once there's none left for this machine to delete
+// (`local` if the server can't delete inboxes, so wasn't asked); `later`
+// if another delete of it is under way; otherwise `retryAfter` (seconds)
+// if the server said when to try again.
+export type StaleInboxOutcome = { done: true; local?: true } | { done: false; retryAfter: number | null; later?: true };
+
+// The /v1/meta feature of a server that deletes an inbox only if nobody
+// has used it since a given time (DELETE /v1/inboxes/{name}?unused_since).
+export const INBOX_UNUSED_SINCE_FEATURE = "inbox_unused_since";
+
+// Deletes, for one sweep, the server's copies of inboxes nobody has opened
+// on this machine for `staleMs`, with their subscriptions (PROTOCOL.md,
+// "Inboxes"). The local inbox is the server's of the same name: every
+// command that reads one with a server makes sure of the other
+// (ensureInbox).
+//
+// The server decides, in one step, whether anyone has used it in that
+// time: made, read or subscribed to it, or is connected to it now (from
+// another machine, say). If so (409 inbox_in_use) it's kept there, and
+// only the local file goes.
+//
+// - A server without the feature can't be asked safely (one from before
+//   it would delete the inbox whoever uses it): the local file goes; on
+//   the server, its subscriptions expire, and the inbox stays until the
+//   account needs room.
+// - One the server doesn't have (404) is done.
+// - One being deleted already (409 inbox_deleting) is left for a later
+//   sweep.
+// - One that can't be deleted now (unreachable, refused, or a 503 when not
+//   every subscription could be ended) isn't done: its local file is kept
+//   so a later sweep tries again.
+export function staleInboxDeleter(
+  client: ServerClient,
+  staleMs: number,
+  log: (msg: string) => void,
+  timeoutMs: number,
+  deleteTimeoutMs: number,
+): (name: string) => Promise<StaleInboxOutcome> {
+  let supported: Promise<boolean | StaleInboxOutcome> | null = null;
+  const failed = (name: string, e: unknown): StaleInboxOutcome => {
+    if (e instanceof Unreachable) {
+      // A server that answered, but not when to try again, is worth a word;
+      // one that can't be reached is said by the command itself.
+      if (e.code !== null && e.retryAfter === null) log(`couldn't delete inbox ${name}, unused here for a week, on ${client.url}: ${e.message}`);
+      return { done: false, retryAfter: e.retryAfter };
+    }
+    if (e instanceof ServerError || e instanceof LoginNeeded) {
+      log(`couldn't delete inbox ${name}, unused here for a week, on ${client.url}: ${e.message}`);
+      return { done: false, retryAfter: null };
+    }
+    throw e;
+  };
+  return async (name) => {
+    supported ??= client.request<Meta>("GET", "/v1/meta", { timeoutMs }).then(
+      (meta) => Array.isArray(meta?.features) && meta.features.includes(INBOX_UNUSED_SINCE_FEATURE),
+      (e: unknown) => failed(name, e),
+    );
+    const ok = await supported;
+    if (ok === false) return { done: true, local: true };
+    if (ok !== true) {
+      // Asked again next time; only a definite answer is kept.
+      supported = null;
+      return ok;
+    }
+    const query = new URLSearchParams({ unused_since: new Date(Date.now() - staleMs).toISOString() });
+    try {
+      await client.request("DELETE", `/v1/inboxes/${name}?${query}`, { timeoutMs: deleteTimeoutMs });
+      return { done: true };
+    } catch (e) {
+      if (e instanceof ServerError && e.status === 404) return { done: true };
+      if (e instanceof ServerError && e.code === "inbox_in_use") return { done: true };
+      if (e instanceof ServerError && e.code === "inbox_deleting") return { done: false, retryAfter: null, later: true };
+      return failed(name, e);
+    }
+  };
 }
 
 // How long before `verified_until` a private subscription is renewed, and

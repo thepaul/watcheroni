@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WatchEvent } from "@watcheroni/protocol";
@@ -6,9 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Feed } from "../src/feed.ts";
 import { formatText } from "../src/format.ts";
 import { LoginNeeded } from "../src/github.ts";
-import { Inbox } from "../src/inbox.ts";
+import { Inbox, InboxBusy, sweep } from "../src/inbox.ts";
 import { type Credentials, type ServerCredentials, githubTokenFor } from "../src/login.ts";
-import { MalformedAnswer, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, subscribe } from "../src/server.ts";
+import { MalformedAnswer, ReadingStopped, ServerClient, ServerError, ServerReader, Unreachable, renewSubscriptions, staleInboxDeleter, subscribe } from "../src/server.ts";
 import type { Snapshot } from "../src/snapshot.ts";
 import { targetKey } from "../src/targets.ts";
 import { FakeServer } from "./fake-server.ts";
@@ -1211,5 +1212,213 @@ describe("what the server says", () => {
       vi.unstubAllEnvs();
       delete process.env.WATCHERONI_CREDENTIALS;
     }
+  });
+});
+
+describe("sweeping old inboxes on the server", () => {
+  const WEEK = 7 * 24 * 3600_000;
+  const dir = () => join(process.env.WATCHERONI_STATE_DIR!, "inboxes");
+  const daysAgo = (days: number) => new Date(Date.now() - days * 24 * 3600_000);
+  // An inbox saved here, last used `days` ago, and on the server, made and
+  // last read then too (or read `readDaysAgo` ago, null for never).
+  const old = (name: string, days = 8, readDaysAgo: number | null = days) => {
+    const i = Inbox.edit(name);
+    i.append([]);
+    utimesSync(join(dir(), `${name}.json`), daysAgo(days), daysAgo(days));
+    Object.assign(fake.inbox(name), {
+      createdAt: daysAgo(days).toISOString(),
+      lastReadAt: readDaysAgo === null ? null : daysAgo(readDaysAgo).toISOString(),
+    });
+  };
+  // One opened, never saved, by a process that has gone.
+  const unsaved = (name: string) => {
+    mkdirSync(dir(), { recursive: true });
+    writeFileSync(join(dir(), `${name}.lock`), "999999");
+    utimesSync(join(dir(), `${name}.lock`), daysAgo(8), daysAgo(8));
+    fake.inbox(name).createdAt = daysAgo(8).toISOString();
+  };
+  const client = (url = fake.url, key = fake.token) => new ServerClient({ url, apiKey: key });
+  const onServer = (c = client()) => staleInboxDeleter(c, WEEK, (m) => messages.push(m), 2000, 2000);
+  const waits: number[] = [];
+  const wait = async (ms: number) => void waits.push(ms);
+  beforeEach(() => {
+    waits.length = 0;
+  });
+
+  it("deletes a stale inbox on the server, then here", async () => {
+    old("gone");
+    old("never", 8, null);
+    old("recent", 6);
+    await sweep("current", onServer(), wait);
+    expect(fake.deletedInboxes.sort()).toEqual(["gone", "never"]);
+    expect(Inbox.names()).toEqual(["recent"]);
+    expect(fake.inboxes.has("recent")).toBe(true);
+    expect(readdirSync(dir()).filter((f) => !f.endsWith(".json"))).toEqual([]);
+    expect(messages).toEqual([]);
+  });
+
+  it("asks the server to delete it only if unused for the week", async () => {
+    old("gone");
+    const before = Date.now();
+    await sweep("current", onServer(), wait);
+    const del = fake.requests.find((r) => r.startsWith("DELETE"))!;
+    const since = Date.parse(new URL(del.slice("DELETE ".length), fake.url).searchParams.get("unused_since")!);
+    expect(since).toBeGreaterThanOrEqual(before - WEEK);
+    expect(since).toBeLessThanOrEqual(Date.now() - WEEK);
+  });
+
+  it("deletes only the local file when the server's inbox is gone or in use elsewhere", async () => {
+    old("missing");
+    fake.inboxes.delete("missing");
+    old("elsewhere", 8, 1);
+    old("remade", 8, null);
+    fake.inbox("remade").createdAt = daysAgo(2).toISOString();
+    // Streamed from elsewhere over one socket since long ago.
+    old("streamed");
+    await reader("streamed").start();
+    fake.inbox("streamed").lastReadAt = daysAgo(8).toISOString();
+    await sweep("current", onServer(), wait);
+    expect(fake.deletedInboxes).toEqual([]);
+    expect(Inbox.names()).toEqual([]);
+    expect(["elsewhere", "remade", "streamed"].every((n) => fake.inboxes.has(n))).toBe(true);
+    expect(messages).toEqual([]);
+  });
+
+  it("deletes only local files with a server whose DELETE takes no unused_since", async () => {
+    // As many as there are: the server isn't asked for each.
+    for (let i = 0; i < 7; i++) old(`b${i}`);
+    old("a");
+    fake.features = ["ws", "longpoll", "repo_scope"];
+    await sweep("current", onServer(), wait);
+    expect(Inbox.names()).toEqual([]);
+    expect(fake.inboxes.has("a")).toBe(true);
+    expect(fake.requests.filter((r) => r !== "GET /v1/meta")).toEqual([]);
+    expect(messages).toEqual([]);
+  });
+
+  it("leaves one another delete is under way on for a later sweep, going on to the rest", async () => {
+    old("a");
+    old("b");
+    fake.deleting.add("a");
+    await sweep("current", onServer(), wait);
+    expect(fake.deletedInboxes).toEqual(["b"]);
+    expect(Inbox.names()).toEqual(["a"]);
+    expect(messages).toEqual([]);
+    fake.deleting.clear();
+    await sweep("current", onServer(), wait);
+    expect(Inbox.names()).toEqual([]);
+  });
+
+  for (const status of [503, 429]) {
+    it(`tries again after the Retry-After of a ${status}, letting go of the inbox meanwhile`, async () => {
+      old("busy");
+      fake.failDeletes = 2;
+      fake.deleteStatus = status;
+      fake.deleteRetryAfter = "4";
+      const locked: boolean[] = [];
+      await sweep("current", onServer(), async (ms) => {
+        waits.push(ms);
+        locked.push(existsSync(join(dir(), "busy.lock")) || existsSync(join(dir(), "busy.sweep")));
+      });
+      expect(waits).toEqual([4000, 4000]);
+      expect(locked).toEqual([false, false]);
+      expect(fake.deletedInboxes).toEqual(["busy"]);
+      expect(Inbox.names()).toEqual([]);
+    });
+  }
+
+  it("keeps the local file, still stale, while the server's inbox can't be deleted, and deletes both later", async () => {
+    old("next");
+    old("stuck");
+    fake.failDeletes = 100;
+    await sweep("current", onServer(), wait);
+    // Three tries at the first, then the rest are left for another sweep.
+    expect(waits).toEqual([1000, 1000]);
+    expect(fake.requests.filter((r) => r.startsWith("DELETE")).map((r) => r.split("?")[0])).toEqual(["DELETE /v1/inboxes/next", "DELETE /v1/inboxes/next", "DELETE /v1/inboxes/next"]);
+    expect(Inbox.names()).toEqual(["next", "stuck"]);
+    expect(readdirSync(dir()).filter((f) => !f.endsWith(".json"))).toEqual([]);
+    // A 503 with a Retry-After too far off isn't waited for; one without
+    // isn't either, and is said.
+    waits.length = 0;
+    fake.deleteRetryAfter = "3600";
+    await sweep("current", onServer(), wait);
+    expect(messages).toEqual([]);
+    fake.deleteRetryAfter = null;
+    await sweep("current", onServer(), wait);
+    expect(waits).toEqual([]);
+    expect(messages).toEqual([expect.stringMatching(/^couldn't delete inbox next, unused here for a week, on .* answered 503/)]);
+    expect(Inbox.names()).toEqual(["next", "stuck"]);
+    fake.failDeletes = 0;
+    await sweep("current", onServer(), wait);
+    expect(fake.deletedInboxes).toEqual(["next", "stuck"]);
+    expect(Inbox.names()).toEqual([]);
+  });
+
+  it("keeps everything when the server can't be reached or refuses", async () => {
+    old("a");
+    old("b");
+    await sweep("current", onServer(client("http://127.0.0.1:1")), wait);
+    expect(Inbox.names()).toEqual(["a", "b"]);
+    expect(messages).toEqual([]);
+    await sweep("current", onServer(client(fake.url, "wrong")), wait);
+    expect(Inbox.names()).toEqual(["a", "b"]);
+    expect(messages).toEqual([expect.stringMatching(/^couldn't delete inbox a, unused here for a week, on http:\/\/127\.0\.0\.1:\d+: .* rejected the API key/)]);
+    expect(fake.deletedInboxes).toEqual([]);
+  });
+
+  it("takes a few inboxes to the server each sweep", async () => {
+    for (let i = 0; i < 7; i++) old(`old${i}`);
+    await sweep("current", onServer(), wait);
+    expect(fake.deletedInboxes.length).toBe(5);
+    expect(Inbox.names().length).toBe(2);
+    await sweep("current", onServer(), wait);
+    expect(Inbox.names()).toEqual([]);
+  });
+
+  it("keeps a record of an inbox opened but never saved before asking the server", async () => {
+    unsaved("unsaved");
+    fake.failDeletes = 100;
+    fake.deleteRetryAfter = null;
+    await sweep("current", onServer(), wait);
+    expect(Inbox.names()).toEqual(["unsaved"]);
+    expect(statSync(join(dir(), "unsaved.json")).mtimeMs).toBeLessThan(Date.now() - WEEK);
+    fake.failDeletes = 0;
+    await sweep("current", onServer(), wait);
+    expect(fake.deletedInboxes).toEqual(["unsaved"]);
+    expect(readdirSync(dir())).toEqual([]);
+  });
+
+  it("keeps what `watch` saves while the server is asked", async () => {
+    old("saved");
+    unsaved("unsaved");
+    const target = { owner: "octo", name: "widgets", number: 1 };
+    const watched: string[] = [];
+    await sweep("current", async (name) => {
+      Inbox.edit(name).watch(targetKey(target), target);
+      watched.push(name);
+      return { done: true };
+    }, wait);
+    expect(watched.sort()).toEqual(["saved", "unsaved"]);
+    for (const name of watched) expect(Inbox.peek(name).watched.map((w) => targetKey(w.target))).toEqual(["octo/widgets#1"]);
+  });
+
+  it("makes Inbox.openWaiting wait for a sweep deleting it on the server, but not for a reader", async () => {
+    mkdirSync(dir(), { recursive: true });
+    // Another process, holding the lock for a while, then letting go.
+    const lockFile = join(dir(), "held.lock");
+    const holder = spawn(process.execPath, ["-e", `setTimeout(() => require("fs").unlinkSync(${JSON.stringify(lockFile)}), 1000)`]);
+    const exited = new Promise((r) => holder.on("exit", r));
+    writeFileSync(lockFile, String(holder.pid));
+    // A reader, not a sweep: in use.
+    await expect(Inbox.openWaiting("held")).rejects.toThrow(/is in use by process/);
+    writeFileSync(join(dir(), "held.sweep"), String(holder.pid));
+    // The event loop goes on meanwhile.
+    let ticks = 0;
+    const ticking = setInterval(() => ticks++, 50);
+    (await Inbox.openWaiting("held", (m) => messages.push(m))).close();
+    expect(messages).toEqual(["waiting for another process to finish deleting inbox held on the server, as nobody had used it for a week"]);
+    clearInterval(ticking);
+    expect(ticks).toBeGreaterThan(2);
+    await exited;
   });
 });

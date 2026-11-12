@@ -11,6 +11,8 @@ interface FakeInbox {
   head: number;
   acked: number;
   events: WatchEvent[];
+  createdAt: string;
+  lastReadAt: string | null;
 }
 
 class FakeSocket {
@@ -118,6 +120,18 @@ export class FakeServer {
   }[] = [];
   // Subscription IDs deleted.
   readonly deleted: string[] = [];
+  // Inboxes deleted, and how many more deletes to answer with a 503 (with
+  // this Retry-After, if any) as if a subscription couldn't be ended.
+  readonly deletedInboxes: string[] = [];
+  failDeletes = 0;
+  deleteStatus = 503;
+  deleteRetryAfter: string | null = "1";
+  // What /v1/meta lists (without inbox_unused_since: a server whose
+  // DELETE ignores unused_since, deleting whatever), or never answer it.
+  features = ["ws", "longpoll", "repo_scope", "inbox_unused_since"];
+  hangMeta = false;
+  // Inboxes another DELETE is under way on.
+  readonly deleting = new Set<string>();
   // Private subscriptions' verified_until, by ID, and the verify calls seen.
   readonly verifiedUntil = new Map<string, string>();
   readonly verified: { id: string; githubToken: string | null }[] = [];
@@ -169,7 +183,7 @@ export class FakeServer {
 
   inbox(name: string): FakeInbox {
     let inbox = this.inboxes.get(name);
-    if (!inbox) this.inboxes.set(name, (inbox = { head: 0, acked: 0, events: [] }));
+    if (!inbox) this.inboxes.set(name, (inbox = { head: 0, acked: 0, events: [], createdAt: new Date().toISOString(), lastReadAt: null }));
     return inbox;
   }
 
@@ -258,6 +272,7 @@ export class FakeServer {
     const inbox = this.inbox(s.inbox);
     if (msg.type === "hello") {
       this.helloTimes.push(Date.now());
+      inbox.lastReadAt = new Date().toISOString();
       s.pos = msg.after ?? inbox.acked;
       const head = this.noHead ? (undefined as unknown as number) : inbox.head;
       s.send({ type: "ready", inbox: s.inbox, head, acked: this.malformedReady ? ("x" as unknown as number) : inbox.acked });
@@ -361,10 +376,45 @@ export class FakeServer {
       return this.refreshLimited ? json(429, { status: 429, code: "rate_limited" }) : json(200, this.refreshAnswer);
     }
     if (!this.authorized(req)) return json(401, { status: 401, code: "unauthorized" });
+    if (req.method === "GET" && url.pathname === "/v1/meta") {
+      if (this.hangMeta) return;
+      return json(200, { protocol: 1, server: "fake", features: this.features, limits: {} });
+    }
     const m = url.pathname.match(/^\/v1\/inboxes\/([^/]+)(\/[a-z]+)?(?:\/([^/]+)(\/[a-z]+)?)?$/);
     if (!m) return json(404, { status: 404, code: "not_found" });
     const name = decodeURIComponent(m[1]);
     const route = `${req.method} ${m[2] ?? ""}${m[3] ? `/{id}${m[4] ?? ""}` : ""}`;
+    if (route === "GET " || route === "DELETE ") {
+      const known = this.inboxes.get(name);
+      if (!known) return json(404, { status: 404, code: "not_found" });
+      if (route === "GET ") {
+        return json(200, {
+          name, created_at: known.createdAt, head: known.head, acked: known.acked, oldest: known.events[0]?.seq ?? known.head + 1,
+          subscriptions: this.subscriptions.filter((s) => s.inbox === name).length, last_read_at: known.lastReadAt,
+        });
+      }
+      if (this.deleting.has(name)) return json(409, { status: 409, code: "inbox_deleting", title: "The inbox is being deleted" });
+      const since = url.searchParams.get("unused_since");
+      if (since !== null && this.features.includes("inbox_unused_since")) {
+        const t = Date.parse(since);
+        if (!/^\d{4}-\d\d-\d\dT[\d:.]+Z$/.test(since) || Number.isNaN(t) || t > Date.now()) {
+          return json(400, { status: 400, code: "invalid_request", title: "unused_since must be one RFC 3339 timestamp" });
+        }
+        const used = Date.parse(known.createdAt) >= t ? "made"
+          : known.lastReadAt && Date.parse(known.lastReadAt) >= t ? "read"
+          : [...this.sockets].some((sock) => sock.inbox === name) ? "connected" : null;
+        if (used) return json(409, { status: 409, code: "inbox_in_use", title: `The inbox was ${used} since then` });
+      }
+      if (this.failDeletes > 0) {
+        this.failDeletes--;
+        if (this.deleteRetryAfter) res.setHeader("Retry-After", this.deleteRetryAfter);
+        return json(this.deleteStatus, { status: this.deleteStatus, code: "unavailable", title: "Couldn't end every subscription; try again" });
+      }
+      this.inboxes.delete(name);
+      this.deletedInboxes.push(name);
+      res.writeHead(204).end();
+      return;
+    }
     if (this.tooManyInboxes && !this.inboxes.has(name)) {
       return json(422, { status: 422, code: "quota_exceeded", title: "Too many inboxes on this account (at most 500)" });
     }
@@ -415,6 +465,7 @@ export class FakeServer {
     }
     if (route === "GET /events" && this.malformedPage !== undefined) return json(200, this.malformedPage);
     if (route === "GET /events") {
+      inbox.lastReadAt = new Date().toISOString();
       const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : inbox.acked;
       const wait = Number(url.searchParams.get("wait") ?? 0);
       const page = () => {
