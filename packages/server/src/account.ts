@@ -483,6 +483,9 @@ export class Account extends DurableObject<Env> {
     if (!this.created) return null;
     const row = this.sql.exec<{ at: number; active: number }>("SELECT at, active FROM deleting WHERE inbox = ?", name).toArray()[0];
     if (!row) return null;
+    // A mark is tick() time, which never goes back; should the wall clock
+    // go back, the mark lapses that much later. That's the safe way: an
+    // inbox held longer, never a delete's hold cut short.
     if (row.active && row.at <= now - DELETE_MARK_MS) {
       this.sql.exec("UPDATE deleting SET active = 0 WHERE inbox = ?", name);
       return { at: row.at, active: false };

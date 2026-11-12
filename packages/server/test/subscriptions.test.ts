@@ -540,6 +540,48 @@ describe("subscribing to a public repo", () => {
     expect((await call("/v1/inboxes/box", { headers: user.auth })).status).toBe(200);
   });
 
+  it("doesn't take back a subscription a later request renewed after its inbox was deleted and made again", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    let checkedA = 0;
+    let x = "";
+    // Request A: RepoHub makes X. Then, before A's save, B (the same
+    // spec, checked later) renews X in RepoHub.
+    const realSubscribe = RepoHub.prototype.subscribe;
+    vi.spyOn(RepoHub.prototype, "subscribe").mockImplementation(function (this: RepoHub, ...args: Parameters<RepoHub["subscribe"]>) {
+      const made = realSubscribe.apply(this, args);
+      if (!made.ok || !made.created) throw new Error("expected a new subscription");
+      checkedA = args[0].checked_at!;
+      x = made.subscription.id;
+      // B's check came after A's: by Account's clock at least one later.
+      expect(realSubscribe.call(this, { ...args[0], checked_at: checkedA + 1 }, args[1], args[2])).toMatchObject({ ok: true, created: false });
+      return made;
+    });
+    // At A's save: delete D runs to the end (X isn't in the index, so D
+    // doesn't list it), a PUT makes the inbox again, and B checks and saves
+    // X, answered 200. Then A's own save.
+    const realSave = Account.prototype.saveSubscription;
+    vi.spyOn(Account.prototype, "saveSubscription").mockImplementation(function (this: Account, sub: SubscriptionInfo, checkedAt: number) {
+      const begun = this.beginDeleteInbox(sub.inbox, null);
+      if (!begun.ok) throw new Error("not begun");
+      expect(begun.subscriptions).toEqual([]);
+      expect(this.deleteInbox(sub.inbox, begun.ticket, [])).toBe(true);
+      expect(this.openInbox(sub.inbox)).toMatchObject({ ok: true });
+      const checkB = this.checkSubscription(sub.inbox);
+      if (!checkB.ok) throw new Error("B refused");
+      expect(realSave.call(this, sub, checkB.checked_at)).toEqual({ ok: true });
+      return realSave.call(this, sub, checkedAt);
+    });
+    const res = await subscribe(user.auth, { repo: fullName(repo), pr: 7 });
+    // A is refused; its take-back leaves X, which B holds, alone.
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: "inbox_deleting" });
+    expect(checkedA).toBeGreaterThan(0);
+    expect((await hubStats(repo.id)).subscriptions.map((s) => s.id)).toEqual([x]);
+    expect((await list(user.auth)).map((s) => s.id)).toEqual([x]);
+  });
+
   it("answers 503, putting the subscriptions back in order, when the last step fails", async () => {
     const user = await signedIn();
     const repo = newRepo();

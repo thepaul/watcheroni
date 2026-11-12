@@ -148,11 +148,15 @@ export async function createSubscription(
     // from taking it for idle, deleted to make room. Or a delete began
     // meanwhile (409 inbox_deleting), and may have ended this very
     // subscription. Take back what RepoHub just made; one RepoHub already
-    // had (a renewal) the delete has ended or will. That isn't atomic
-    // with the answer: should this request die first, RepoHub keeps a
-    // subscription Account doesn't know until it expires, its events
-    // dropped since its deliveries never make an inbox.
-    if (result.created) await repoHubStub(env, repo.id).unsubscribe(sub.id);
+    // had (a renewal) the delete has ended or will. Only if no request
+    // checked after this one has renewed it since: that one may have been
+    // answered with it (say the inbox was deleted and made again, and
+    // asked for the same subscription), so RepoHub keeps it ("kept"), and
+    // so does this. That isn't atomic with the answer: should this
+    // request die first, RepoHub keeps a subscription Account doesn't
+    // know until it expires, its events dropped since its deliveries
+    // never make an inbox.
+    if (result.created) await repoHubStub(env, repo.id).unsubscribe(sub.id, room.checked_at + 1);
     return problem(saved.status, saved.code, saved.detail);
   }
   await installation.addRepo(repo.id);

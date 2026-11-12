@@ -608,7 +608,14 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   forgets only what it listed, and answers `503`. Either way no
   subscription a client was told about after the mark lapsed is ended by
   the slow delete. Rows from before `checked_at` was kept, and `/debug`
-  ones, have none and are ended as before; other callers of `unsubscribe`
+  ones, have none and are ended as before; so do renewals made by an
+  older Worker version during a gradual deploy, which sends no
+  `checked_at` and leaves the stored one as it was (NULL for a new row).
+  `createSubscription`'s take-back, when Account refuses the save of a
+  subscription RepoHub just made, passes its own check time plus one, so
+  it leaves the subscription be if a request checked later has renewed
+  it (and may have been answered with it, the inbox having been deleted
+  and made again meanwhile). The subscription `DELETE` route and `/debug`
   pass no bound. A mark whose delete died, with nothing else touching the
   inbox, holds it 60 seconds.
 
