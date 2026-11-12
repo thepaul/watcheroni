@@ -234,7 +234,8 @@ empty if used again. With a server, its inbox of the same name is deleted
 there first, with its subscriptions and unread events, unless the server
 says someone has used it within the week: made, read, subscribed to it,
 or is connected to it now (from another machine, say). A server too old
-to check that isn't asked, and its inbox ends by itself. The local file
+to check that isn't asked: there, the inbox's subscriptions expire, and
+the inbox stays until the account needs room. The local file
 stays until the server's inbox is gone, so a server that can't be reached
 or can't delete it yet is asked again next time; a few inboxes are taken
 to the server at a time. (A server stops feeding an inbox after a week

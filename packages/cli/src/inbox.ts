@@ -69,12 +69,13 @@ const SWEEP_RETRY_MAX_SECONDS = 60;
 // as Claude Code sessions' inboxes, is cleared a few at a time rather than
 // crowd the account's rate limit.
 const SWEEP_SERVER_MAX = 5;
-// How long Inbox.openWaiting() waits for a sweep that holds the inbox's
-// lock while asking the server: at most two requests (the first inbox of
-// a sweep also asks whether the server can delete inboxes safely), each
-// given SWEEP_REQUEST_MS.
+// How long a sweep gives the server to say whether it can delete inboxes
+// safely, and to delete one: longer than the 60 s a server's delete may
+// hold an inbox, so a sweep never lets go of one the server may still
+// delete. Inbox.openWaiting() waits for a sweep holding the lock that long.
 export const SWEEP_REQUEST_MS = 10_000;
-const SWEEP_HOLD_MS = 2 * SWEEP_REQUEST_MS + 5000;
+export const SWEEP_DELETE_MS = 70_000;
+const SWEEP_HOLD_MS = SWEEP_REQUEST_MS + SWEEP_DELETE_MS + 5000;
 
 export class InboxBusy extends Error {}
 

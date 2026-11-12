@@ -1238,7 +1238,7 @@ describe("sweeping old inboxes on the server", () => {
     fake.inbox(name).createdAt = daysAgo(8).toISOString();
   };
   const client = (url = fake.url, key = fake.token) => new ServerClient({ url, apiKey: key });
-  const onServer = (c = client()) => staleInboxDeleter(c, WEEK, (m) => messages.push(m), 2000);
+  const onServer = (c = client()) => staleInboxDeleter(c, WEEK, (m) => messages.push(m), 2000, 2000);
   const waits: number[] = [];
   const wait = async (ms: number) => void waits.push(ms);
   beforeEach(() => {

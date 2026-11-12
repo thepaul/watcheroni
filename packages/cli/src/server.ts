@@ -256,8 +256,9 @@ export const INBOX_UNUSED_SINCE_FEATURE = "inbox_unused_since";
 // only the local file goes.
 //
 // - A server without the feature can't be asked safely (one from before
-//   it would delete the inbox whoever uses it): the local file goes, and
-//   the server's inbox ends by itself.
+//   it would delete the inbox whoever uses it): the local file goes; on
+//   the server, its subscriptions expire, and the inbox stays until the
+//   account needs room.
 // - One the server doesn't have (404) is done.
 // - One being deleted already (409 inbox_deleting) is left for a later
 //   sweep.
@@ -269,6 +270,7 @@ export function staleInboxDeleter(
   staleMs: number,
   log: (msg: string) => void,
   timeoutMs: number,
+  deleteTimeoutMs: number,
 ): (name: string) => Promise<StaleInboxOutcome> {
   let supported: Promise<boolean | StaleInboxOutcome> | null = null;
   const failed = (name: string, e: unknown): StaleInboxOutcome => {
@@ -298,7 +300,7 @@ export function staleInboxDeleter(
     }
     const query = new URLSearchParams({ unused_since: new Date(Date.now() - staleMs).toISOString() });
     try {
-      await client.request("DELETE", `/v1/inboxes/${name}?${query}`, { timeoutMs });
+      await client.request("DELETE", `/v1/inboxes/${name}?${query}`, { timeoutMs: deleteTimeoutMs });
       return { done: true };
     } catch (e) {
       if (e instanceof ServerError && e.status === 404) return { done: true };

@@ -6,7 +6,7 @@ import { loadServer } from "./config.ts";
 import { Feed } from "./feed.ts";
 import { clean, command, formatText, footer, PROSE_LENGTH, printable, toJson } from "./format.ts";
 import { LoginNeeded } from "./github.ts";
-import { Inbox, InboxBusy, STALE_MS, SWEEP_REQUEST_MS, sweep } from "./inbox.ts";
+import { Inbox, InboxBusy, STALE_MS, SWEEP_DELETE_MS, SWEEP_REQUEST_MS, sweep } from "./inbox.ts";
 import { LoginFailed, githubTokenFor, login, logout } from "./login.ts";
 import { pollOnce } from "./poll.ts";
 import { selfhost } from "./selfhost.ts";
@@ -234,7 +234,7 @@ async function main(argv: string[]): Promise<number> {
   // Other inboxes nobody has used for a week are deleted meanwhile, on the
   // server too, while this one is read.
   if (verb !== "watch" && verb !== "unwatch") {
-    sweeping = sweep(inboxName, client && staleInboxDeleter(client, STALE_MS, log, SWEEP_REQUEST_MS)).catch((e: unknown) => {
+    sweeping = sweep(inboxName, client && staleInboxDeleter(client, STALE_MS, log, SWEEP_REQUEST_MS, SWEEP_DELETE_MS)).catch((e: unknown) => {
       log(`couldn't clear away old inboxes: ${clean(e instanceof Error ? e.message : String(e), PROSE_LENGTH)}`);
     });
   }
