@@ -1415,7 +1415,8 @@ describe("sweeping old inboxes on the server", () => {
     // The event loop goes on meanwhile.
     let ticks = 0;
     const ticking = setInterval(() => ticks++, 50);
-    (await Inbox.openWaiting("held")).close();
+    (await Inbox.openWaiting("held", (m) => messages.push(m))).close();
+    expect(messages).toEqual(["waiting for another process to finish deleting inbox held on the server, as nobody had used it for a week"]);
     clearInterval(ticking);
     expect(ticks).toBeGreaterThan(2);
     await exited;

@@ -71,8 +71,11 @@ const SWEEP_RETRY_MAX_SECONDS = 60;
 const SWEEP_SERVER_MAX = 5;
 // How long a sweep gives the server to say whether it can delete inboxes
 // safely, and to delete one: longer than the 60 s a server's delete may
-// hold an inbox, so a sweep never lets go of one the server may still
-// delete. Inbox.openWaiting() waits for a sweep holding the lock that long.
+// hold an inbox, so a sweep that isn't cut short never lets go of one the
+// server may still delete. (One cut short, by the exit grace or a signal,
+// can: a reader that opens the inbox then may be closed with 4004 if the
+// server's delete finishes.) Inbox.openWaiting() waits for a sweep
+// holding the lock that long.
 export const SWEEP_REQUEST_MS = 10_000;
 export const SWEEP_DELETE_MS = 70_000;
 const SWEEP_HOLD_MS = SWEEP_REQUEST_MS + SWEEP_DELETE_MS + 5000;
@@ -118,13 +121,17 @@ export class Inbox {
   // the inbox on the server, waits till it's done (without blocking, so
   // Ctrl-C still works), and the inbox then starts out empty. Stops waiting
   // once whoever holds the lock is no longer a sweep.
-  static async openWaiting(name: string): Promise<Inbox> {
+  static async openWaiting(name: string, log: (msg: string) => void = () => {}): Promise<Inbox> {
     const dir = inboxDir(name);
-    for (const until = Date.now() + SWEEP_HOLD_MS; ; ) {
+    for (let until = 0; ; ) {
       try {
         return Inbox.open(name);
       } catch (e) {
         if (!(e instanceof InboxBusy) || !beingSwept(dir, name)) throw e;
+        if (!until) {
+          until = Date.now() + SWEEP_HOLD_MS;
+          log(`waiting for another process to finish deleting inbox ${name} on the server, as nobody had used it for a week`);
+        }
         if (Date.now() > until) throw new InboxBusy(`Inbox ${name} is still being deleted, as nobody had used it for a week; try again shortly`);
       }
       await pauseAsync(100);
