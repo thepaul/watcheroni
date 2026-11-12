@@ -294,7 +294,8 @@ earliest due time, or clears it.
   "Installation"), or straight from
   `POST /debug/repos/{repo id}/subscriptions` (and `DELETE .../{sub}`,
   `GET /debug/repos/{repo id}` for the object's state) behind
-  `DEBUG_TOKEN`, with no GitHub checks and no Account index row. RepoHub
+  `DEBUG_TOKEN`, with no GitHub checks and no Account index row (it makes
+  the inbox, since RepoHub's deliveries don't). RepoHub
   delivers to `acct:<account>`, the Account object that the account's API
   keys read from.
 - **`revokeAll(reason, eventBase)`** sends each subscription a
@@ -365,8 +366,8 @@ CREATE UNIQUE INDEX events_dedupe ON events (inbox, id);
 CREATE TABLE ticket_nonces (nonce TEXT PRIMARY KEY, exp INTEGER);
 CREATE TABLE buckets (name TEXT PRIMARY KEY, tokens REAL, updated_at INTEGER);
 
--- Where each inbox deleted for being idle had got to; one made again
--- under its name carries on from there, so seqs are never reused.
+-- Where each deleted inbox had got to; one made again under its name
+-- carries on from there, so seqs are never reused.
 CREATE TABLE deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER, acked INTEGER);
 -- When a subscription to each inbox was last asked for; keeps it from
 -- being deleted as idle while the Worker makes one.
@@ -376,10 +377,13 @@ CREATE TABLE subscribing (inbox TEXT PRIMARY KEY, at INTEGER);
 `deleted_inboxes` keeps a deleted name until the name is used again,
 however long that is: forgetting one would let a recreated inbox start
 again at seq 1, and a client still holding a position from before would
-silently skip its first events. It grows only when an account at the
-inbox cap deletes inboxes nobody has read for 30 days. Everything deleted
-in a 30-day window already existed at its start, so it grows by about the
-cap (500 rows) per 30 days at most, at roughly 50-100 bytes a row.
+silently skip its first events. An inbox that never had an event leaves
+no row, since it would start again the same without one. So it grows
+only by inboxes that had events, which only GitHub activity on a
+subscription makes, when an account at the inbox cap deletes ones nobody
+has read for 30 days or a client deletes one (`DELETE
+/v1/inboxes/{name}`). Each row is roughly 50-100 bytes, and making a
+deleted name again removes its row.
 
 RPC methods:
 
@@ -411,7 +415,7 @@ position (or that finds none, from before `head`) has missed some: it
 starts with an `inbox.gap`, made at read time, not stored, whose `seq` is
 just before the first event kept. A position ahead of `head` gets one
 too, then everything kept: an `ack` past `head` is ignored, and an inbox
-deleted for being idle leaves its `head` and `acked` in
+deleted, for being idle or by `DELETE`, leaves its `head` and `acked` in
 `deleted_inboxes` for one made again under its name to carry on from, so
 `seq`s are never reused and such a position can't be one the inbox gave
 out. If it doesn't recognise a subscription (the user deleted it, but
@@ -520,6 +524,19 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   keeps the index that `GET` and `DELETE` read, and drops a row when a
   `watch.*` event for it is delivered, so it follows RepoHub ending
   watches.
+- `DELETE /v1/inboxes/{name}` (`deleteInbox` in `src/subscriptions.ts`)
+  takes the inbox's subscriptions back from their RepoHubs first; if one
+  fails, it drops the ones that did end from the index, so the index
+  still says what RepoHub has, and answers `503` with the inbox kept.
+  Then
+  `Account.deleteInbox` deletes the inbox, its events and its index rows,
+  remembers its numbering in `deleted_inboxes`, and closes its sockets
+  with `4004`. A subscription saved in between comes back from
+  `deleteInbox` and is taken back from its RepoHub then. RepoHub's
+  deliveries (`deliver(items, false)`) never make an inbox, so an event
+  already queued in its outbox for the deleted inbox is dropped rather
+  than bringing it back; `/debug` injection still makes them. Nor does a
+  long poll's bridge: one opened after the delete answers `404`.
 - The install URL (in `/v1/meta`, `app_not_installed` and the landing
   page) comes from the `GITHUB_APP_SLUG` var, through `installUrl(env)`
   in `src/subscriptions.ts`; a self-hosted copy has its own App.

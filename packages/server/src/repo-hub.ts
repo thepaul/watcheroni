@@ -845,7 +845,7 @@ export class RepoHub extends DurableObject<Env> {
   // Separate so tests can make an account fail.
   protected async sendToAccount(account: number, items: Delivery[]): Promise<void> {
     const stub = this.env.ACCOUNT.get(this.env.ACCOUNT.idFromName(`acct:${account}`));
-    await stub.deliver(items);
+    await stub.deliver(items, false);
   }
 
   // The single alarm covers outbox retries, the end of a throttle,

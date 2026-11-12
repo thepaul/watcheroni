@@ -17,7 +17,8 @@ What's here, compared with the full design:
   per-account limit of 120 requests a minute, and limits per IPv4
   address or IPv6 /64 on `/v1/login` and `/v1/github/refresh` (Rate
   Limiting bindings, which `wrangler dev` and the tests simulate
-  locally; a config without them limits nothing). Inboxes, numbered events
+  locally; a config without them limits nothing). Inboxes
+  (`PUT / GET / DELETE /v1/inboxes/{name}`, `GET /v1/inboxes`), numbered events
   with dedupe by `id`, `ack`, `GET .../events?after=&wait=&limit=`
   long-polling through the Worker bridge, the WebSocket protocol (`hello`,
   `ready`, `events`, `ack`, `ping`/`pong` answered by the runtime), and
@@ -27,17 +28,18 @@ What's here, compared with the full design:
   Installation instead. `POST / GET / DELETE /v1/inboxes/{name}/subscriptions`
   check the App's installation (and, for private repos, the user's own
   token), take a PR baseline with the installation token and subscribe
-  RepoHub. The Installation object signs App JWTs and caches installation
-  tokens encrypted with `STORAGE_KEY`.
+  RepoHub; `.../{id}/verify` re-verifies a private repo's subscription,
+  and RepoHub expires subscriptions whose inbox nobody reads. The
+  Installation object signs App JWTs and caches installation tokens
+  encrypted with `STORAGE_KEY`. The `github_app_authorization` webhook
+  revokes the user's keys. Control redelivers failed webhooks from a cron
+  job.
 - **Stand-ins:** with `DEBUG_TOKEN` set, `/debug/accounts/{id}/...` mints
   keys without GitHub and injects events instead of webhooks and RepoHub,
   `/debug/repos/{id}/subscriptions` subscribes without the GitHub checks,
   and `/debug/{accounts,repos,installations}/{id}` show what an object is
   doing (see "Worker routes" in DESIGN.md).
-- **Not yet:** Control, re-verifying private
-  subscriptions (`/verify`), expiring subscriptions, revoking keys on the
-  `github_app_authorization` webhook (`Account.revokeAllKeys` is ready for
-  it). The tests stub GitHub.
+- **Not yet:** nothing in PROTOCOL.md's routes. The tests stub GitHub.
 
 ## Develop
 

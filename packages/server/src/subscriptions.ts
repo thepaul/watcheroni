@@ -142,13 +142,13 @@ export async function createSubscription(
   };
   const saved = await account.saveSubscription(info);
   if (!saved.ok) {
-    // The inbox went meanwhile. checkSubscription makes that all but
-    // impossible: its note in `subscribing` keeps roomForInbox from
-    // taking the inbox for idle for 30 days, far longer than this request
-    // runs. If it happens anyway, take back what RepoHub just made. That
-    // isn't atomic with the answer: should this request die first,
-    // RepoHub keeps a subscription Account doesn't know until it
-    // expires, and its deliveries could make the inbox again.
+    // The inbox went meanwhile: deleted (DELETE /v1/inboxes/{name}), or,
+    // though checkSubscription's note in `subscribing` keeps roomForInbox
+    // from taking it for idle, deleted to make room. Take back what
+    // RepoHub just made. That isn't atomic with the answer: should this
+    // request die first, RepoHub keeps a subscription Account doesn't
+    // know until it expires, its events dropped since its deliveries
+    // never make an inbox.
     if (result.created) await repoHubStub(env, repo.id).unsubscribe(sub.id);
     return problem(saved.status, saved.code, saved.detail);
   }
@@ -206,6 +206,39 @@ export async function deleteSubscription(env: Env, account: AccountStub, inbox: 
   const sub = await account.removeSubscription(inbox, id);
   if (!sub) return problem(404, "not_found", "No such subscription");
   await repoHubStub(env, sub.repo.id).unsubscribe(id);
+  return new Response(null, { status: 204 });
+}
+
+// DELETE /v1/inboxes/{name}. The RepoHubs give up their subscriptions
+// first, so the inbox goes only once nothing routes to it; a RepoHub
+// still routing to a deleted inbox would only have its events dropped
+// (Account.deliver), but would keep its repo watched. If one can't be
+// reached, the subscriptions that did end are dropped from the index too,
+// so it says what RepoHub has, and the client is told to try again. A
+// RepoHub that didn't know a subscription (`unsubscribe` false) has
+// nothing to give up, which is as good as ending it. A subscription made
+// meanwhile comes back from Account.deleteInbox and is taken back from
+// its RepoHub then.
+export async function deleteInbox(env: Env, account: AccountStub, inbox: string): Promise<Response> {
+  const subs = await account.listSubscriptions(inbox);
+  if (!subs) return problem(404, "not_found", "No such inbox");
+  const unsubscribe = (list: SubscriptionInfo[]) =>
+    Promise.allSettled(list.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id)));
+  const results = await unsubscribe(subs);
+  const failed = results.flatMap((r, i) => (r.status === "rejected" ? [[subs[i], r.reason] as const] : []));
+  if (failed.length) {
+    for (const [sub, reason] of failed) console.error(`deleting inbox ${inbox}: unsubscribing ${sub.id} failed`, reason);
+    const ended = subs.filter((_, i) => results[i].status === "fulfilled");
+    for (const sub of ended) await account.removeSubscription(inbox, sub.id);
+    return unavailable("Couldn't end all of the inbox's subscriptions");
+  }
+  const removed = await account.deleteInbox(inbox);
+  if (!removed) return problem(404, "not_found", "No such inbox");
+  const done = new Set(subs.map((s) => s.id));
+  const late = removed.filter((s) => !done.has(s.id));
+  (await unsubscribe(late)).forEach((r, i) => {
+    if (r.status === "rejected") console.error(`deleting inbox ${inbox}: unsubscribing ${late[i].id} failed`, r.reason);
+  });
   return new Response(null, { status: 204 });
 }
 
