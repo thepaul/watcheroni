@@ -1,7 +1,7 @@
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { AccountStats } from "../src/account";
+import type { Account, AccountStats } from "../src/account";
 import {
   ACCOUNT_MAX_INBOXES,
   ACCOUNT_MAX_LONG_POLLS,
@@ -562,17 +562,18 @@ describe("per-account caps", () => {
     };
     // The Worker checks, then calls RepoHub, then saves. A PUT in between
     // finds a subscription being made to the inbox, so not idle: no room.
-    expect(await stub.checkSubscription("target")).toEqual({ ok: true });
+    const checked = await stub.checkSubscription("target");
+    if (!checked.ok) throw new Error("refused");
     expect((await call("/v1/inboxes/newcomer", { method: "PUT" })).status).toBe(422);
-    expect(await stub.saveSubscription(sub)).toEqual({ ok: true });
+    expect(await stub.saveSubscription(sub, checked.checked_at)).toEqual({ ok: true });
     expect((await stub.listSubscriptions("target"))?.map((s) => s.id)).toEqual(["sub_race"]);
 
     // Had it gone anyway, the save is refused rather than kept for no inbox.
-    expect(await stub.checkSubscription("fake1")).toEqual({ ok: true });
+    expect(await stub.checkSubscription("fake1")).toMatchObject({ ok: true });
     await runInDurableObject(stub, (_, state) => {
       state.storage.sql.exec("DELETE FROM inboxes WHERE name = 'fake1'");
     });
-    expect(await stub.saveSubscription({ ...sub, id: "sub_lost", inbox: "fake1" })).toMatchObject({ ok: false, status: 404, code: "not_found" });
+    expect(await stub.saveSubscription({ ...sub, id: "sub_lost", inbox: "fake1" }, Date.now())).toMatchObject({ ok: false, status: 404, code: "not_found" });
     expect(await stub.getSubscription("fake1", "sub_lost")).toBeNull();
   });
 
@@ -785,5 +786,254 @@ describe("inboxes", () => {
     // /debug still makes inboxes as it goes.
     expect(await stub.deliver([{ inbox: "gone", event }])).toEqual({ delivered: 1, duplicates: 0, dropped: 0 });
     expect((await call("/v1/inboxes/gone")).status).toBe(200);
+  });
+});
+
+describe("conditional inbox delete (unused_since)", () => {
+  const DAY = 24 * 3600 * 1000;
+  // A week ago, as a client sweeping inboxes idle for 7 days asks.
+  const weekAgo = () => new Date(Date.now() - 7 * DAY).toISOString();
+  let nextAccount = 7500;
+  async function account() {
+    const id = nextAccount++;
+    const res = await exports.default.fetch(`${BASE}/debug/accounts/${id}/keys`, { method: "POST", headers: DEBUG });
+    const auth = { Authorization: `Bearer ${(await res.json<LoginResponse>()).api_key}` };
+    const call = (path: string, init: RequestInit = {}) =>
+      exports.default.fetch(`${BASE}${path}`, { ...init, headers: { ...auth, ...init.headers } });
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
+    const sql = (query: string, ...bindings: unknown[]) =>
+      runInDurableObject(stub, (_, state) => state.storage.sql.exec(query, ...bindings).toArray());
+    // An inbox made, and last read, 8 days ago.
+    const oldInbox = async (name: string) => {
+      expect((await call(`/v1/inboxes/${name}`, { method: "PUT" })).status).toBe(200);
+      const old = Date.now() - 8 * DAY;
+      await sql("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = ?", old, old, name);
+    };
+    const del = (name: string, since: string | null = weekAgo()) =>
+      call(`/v1/inboxes/${name}${since === null ? "" : `?unused_since=${encodeURIComponent(since)}`}`, { method: "DELETE" });
+    const inUse = async (name: string, why: string) => {
+      const res = await del(name);
+      expect(res.status).toBe(409);
+      const body = await res.json<{ code: string; title: string }>();
+      expect(body.code).toBe("inbox_in_use");
+      expect(body.title).toMatch(/^Inbox has been used since \d{4}-\d\d-\d\dT.*Z: /);
+      expect(body.title).toContain(why);
+      // Refusing leaves the inbox as it was, unmarked.
+      expect((await call(`/v1/inboxes/${name}`)).status).toBe(200);
+      expect(await sql("SELECT * FROM deleting")).toEqual([]);
+    };
+    return { call, stub, sql, oldInbox, del, inUse };
+  }
+
+  it("deletes an inbox nobody has used since, with 204", async () => {
+    const { call, oldInbox, del } = await account();
+    await oldInbox("idle");
+    expect((await del("idle")).status).toBe(204);
+    expect((await call("/v1/inboxes/idle")).status).toBe(404);
+    expect((await del("idle")).status).toBe(404);
+  });
+
+  it("refuses an inbox made since", async () => {
+    const { call, inUse } = await account();
+    expect((await call("/v1/inboxes/new", { method: "PUT" })).status).toBe(200);
+    await inUse("new", "created at ");
+  });
+
+  it("refuses an inbox read since, over HTTP or by a WebSocket's hello", async () => {
+    const { call, oldInbox, inUse } = await account();
+    await oldInbox("polled");
+    expect((await call("/v1/inboxes/polled/events")).status).toBe(200);
+    await inUse("polled", "read at ");
+
+    await oldInbox("hello");
+    const ws = (await call("/v1/inboxes/hello/ws", { headers: { Upgrade: "websocket" } })).webSocket!;
+    const ready = new Promise((resolve) => ws.addEventListener("message", resolve));
+    ws.accept();
+    ws.send(JSON.stringify({ type: "hello" }));
+    await ready;
+    ws.close();
+    await sleep(50);
+    await inUse("hello", "read at ");
+  });
+
+  it("refuses an inbox a subscription was asked for or made for since", async () => {
+    const { oldInbox, sql, del, inUse } = await account();
+    await oldInbox("asked");
+    // As checkSubscription notes every attempt, renewals too.
+    await sql("INSERT INTO subscribing (inbox, at) VALUES ('asked', ?)", Date.now());
+    await inUse("asked", "a subscription asked for at ");
+
+    await oldInbox("subbed");
+    await sql(
+      "INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at) VALUES ('sub_n', 'subbed', 1, 'o/r', 0, 1, '{}', ?, ?)",
+      Date.now(), Date.now() + DAY,
+    );
+    await inUse("subbed", "a subscription made at ");
+
+    // Ones from before don't count.
+    await oldInbox("before");
+    const old = Date.now() - 8 * DAY;
+    await sql("INSERT INTO subscribing (inbox, at) VALUES ('before', ?)", old);
+    await sql(
+      "INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at) VALUES ('sub_o', 'before', 1, 'o/r', 0, 1, '{}', ?, ?)",
+      old, Date.now() + DAY,
+    );
+    // RepoHub never had sub_o; giving it up is as good as ending it.
+    expect((await del("before")).status).toBe(204);
+  });
+
+  it("refuses an inbox with a socket open, however long since its hello", async () => {
+    const { call, oldInbox, sql, del, inUse } = await account();
+    await oldInbox("streaming");
+    const ws = (await call("/v1/inboxes/streaming/ws", { headers: { Upgrade: "websocket" } })).webSocket!;
+    const ready = new Promise((resolve) => ws.addEventListener("message", resolve));
+    const closed = new Promise<number>((resolve) => ws.addEventListener("close", (ev) => resolve(ev.code)));
+    ws.accept();
+    ws.send(JSON.stringify({ type: "hello" }));
+    await ready;
+    // Streaming over the one socket for more than a week since its hello.
+    const old = Date.now() - 8 * DAY;
+    await sql("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'streaming'", old, old);
+    await inUse("streaming", "1 connection open");
+
+    // Without unused_since, DELETE is unconditional, as before.
+    expect((await del("streaming", null)).status).toBe(204);
+    expect(await closed).toBe(4004);
+    expect((await call("/v1/inboxes/streaming")).status).toBe(404);
+  });
+
+  it("refuses an inbox a long poll is waiting on", async () => {
+    const { call, oldInbox, sql, inUse } = await account();
+    await oldInbox("waiting");
+    const poll = call("/v1/inboxes/waiting/events?wait=30");
+    await sleep(200);
+    // The poll's read counts on its own; leave only its bridge.
+    const old = Date.now() - 8 * DAY;
+    await sql("UPDATE inboxes SET last_read_at = ? WHERE name = 'waiting'", old);
+    await inUse("waiting", "1 connection open");
+    expect((await call("/v1/inboxes/waiting", { method: "DELETE" })).status).toBe(204);
+    expect((await (await poll).json<EventsPage>()).events).toEqual([]);
+  });
+
+  it("answers 400 for an unused_since that isn't one past timestamp", async () => {
+    const { call, oldInbox, del } = await account();
+    await oldInbox("box");
+    const bad = [
+      "", "yesterday", "1730000000", "2026-11-04", "2026-11-04T12:00:00", "2026-11-04 12:00:00Z", "2026-11-04t12:00:00z",
+      "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-11-04T24:00:00Z", "2026-11-04T12:00:60Z", "2026-11-04T12:00:00+25:00",
+    ];
+    for (const since of bad) {
+      const res = await del("box", since);
+      expect(res.status, since).toBe(400);
+      expect(await res.json()).toMatchObject({ code: "invalid_request", title: expect.stringContaining("unused_since must be") });
+    }
+    const twice = await call(`/v1/inboxes/box?unused_since=${encodeURIComponent(weekAgo())}&unused_since=${encodeURIComponent(weekAgo())}`, { method: "DELETE" });
+    expect(twice.status).toBe(400);
+    const future = await del("box", new Date(Date.now() + 60_000).toISOString());
+    expect(future.status).toBe(400);
+    expect(await future.json()).toMatchObject({ code: "invalid_request", title: "unused_since is in the future" });
+    expect((await call("/v1/inboxes/box")).status).toBe(200);
+    // An offset's `+` sent unencoded reads as a space, so isn't one.
+    expect((await call(`/v1/inboxes/box?unused_since=2026-11-04T12:00:00+02:00`, { method: "DELETE" })).status).toBe(400);
+    // Encoded, with an offset or with digits past milliseconds, it is.
+    const plusTwo = new Date(Date.now() - 7 * DAY + 2 * 3600 * 1000).toISOString().replace(/Z$/, "456+02:00");
+    expect((await del("box", plusTwo)).status).toBe(204);
+  });
+
+  it("refuses a second delete while one holds its mark, and takes over a lapsed mark", async () => {
+    const { call, stub, sql, oldInbox, del } = await account();
+    await oldInbox("box");
+    const first = await stub.beginDeleteInbox("box", null);
+    expect(first).toMatchObject({ ok: true, subscriptions: [] });
+    const busy = await del("box", null);
+    expect(busy.status).toBe(409);
+    expect(await busy.json()).toMatchObject({ code: "inbox_deleting", title: "Inbox is being deleted" });
+
+    // The first delete's Worker died; past DELETE_MARK_MS its mark lapses.
+    await sql("UPDATE deleting SET at = at - 61000");
+    expect((await del("box")).status).toBe(204);
+    expect((await call("/v1/inboxes/box")).status).toBe(404);
+    expect(await sql("SELECT * FROM deleting")).toEqual([]);
+  });
+
+  it("won't let a delete that outlived its mark finish, or lift its successor's", async () => {
+    const { stub, oldInbox } = await account();
+    await oldInbox("box");
+    await runInDurableObject(stub, (instance: Account, state) => {
+      const begun = instance.beginDeleteInbox("box", null);
+      if (!begun.ok) throw new Error("not begun");
+      // As if it began 61 seconds ago.
+      state.storage.sql.exec("UPDATE deleting SET at = at - 61000");
+      const stale = { ...begun.ticket, mark: begun.ticket.mark - 61000 };
+      // A lapsed mark doesn't stop subscribing; finding it takes it over.
+      expect(instance.checkSubscription("box")).toMatchObject({ ok: true });
+      // So the first delete wasn't dead after all, but can't finish.
+      expect(instance.deleteInbox("box", stale, [])).toBe(false);
+      expect(instance.inboxInfo("box")).not.toBeNull();
+      const fresh = instance.beginDeleteInbox("box", null);
+      if (!fresh.ok) throw new Error("not begun again");
+      // Nor can it lift the new mark.
+      instance.cancelDeleteInbox("box", stale, []);
+      expect(instance.checkSubscription("box")).toMatchObject({ ok: false, status: 409, code: "inbox_deleting" });
+      instance.cancelDeleteInbox("box", fresh.ticket, []);
+      expect(instance.checkSubscription("box")).toMatchObject({ ok: true });
+    });
+  });
+
+  it("won't save a subscription checked before a delete began, even once that delete is cancelled", async () => {
+    const { stub, oldInbox } = await account();
+    await oldInbox("box");
+    const now = new Date().toISOString();
+    const sub: SubscriptionInfo = {
+      id: "sub_renewed", inbox: "box", repo: { id: 1, full_name: "o/r", private: false }, pr: 1, kinds: [],
+      ignore: { self: false, bots: false, actors: [] }, created_at: now, expires_at: now, verified_until: null, state: "active",
+    };
+    // A renewal is checked; a delete begins, ends the subscription in
+    // RepoHub, fails on another and is cancelled; then the renewal's save.
+    const checked = await stub.checkSubscription("box");
+    if (!checked.ok) throw new Error("refused");
+    const begun = await stub.beginDeleteInbox("box", null);
+    if (!begun.ok) throw new Error("not begun");
+    await stub.cancelDeleteInbox("box", begun.ticket, []);
+    const saved = await stub.saveSubscription(sub, checked.checked_at);
+    expect(saved).toMatchObject({ ok: false, status: 409, code: "inbox_deleting", detail: "A delete of the inbox began while subscribing; try again" });
+    expect(await stub.listSubscriptions("box")).toEqual([]);
+    // Checked again, it's saved.
+    const again = await stub.checkSubscription("box");
+    if (!again.ok) throw new Error("refused");
+    expect(await stub.saveSubscription(sub, again.checked_at)).toEqual({ ok: true });
+  });
+
+  it("won't finish a delete whose inbox was dropped and made again meanwhile, nor touch the new one", async () => {
+    const { call, stub, sql, oldInbox } = await account();
+    await oldInbox("box");
+    const insertSub = (id: string) =>
+      sql(
+        "INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at) VALUES (?, 'box', 1, 'o/r', 0, 1, '{}', ?, ?)",
+        id, Date.now() - 8 * DAY, Date.now() + DAY,
+      );
+    // Idle long enough for roomForInbox to drop it.
+    const idle = Date.now() - (INBOX_IDLE_DAYS + 1) * DAY;
+    await sql("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'box'", idle, idle);
+    await insertSub("sub_shared");
+    const begun = await stub.beginDeleteInbox("box", Date.now() - 7 * DAY);
+    if (!begun.ok) throw new Error(`not begun: ${JSON.stringify(begun)}`);
+    expect(begun.subscriptions.map((s) => s.id)).toEqual(["sub_shared"]);
+    // While RepoHub gives it up, its `watch.*` event drops it from the
+    // index, and at the inbox cap a PUT drops the idle inbox to make room
+    // (roomForInbox). Then the name is made again, with a subscription
+    // RepoHub gave the same ID.
+    await sql("DELETE FROM subscriptions WHERE id = 'sub_shared'");
+    for (let i = 1; i < ACCOUNT_MAX_INBOXES; i++) await sql("INSERT INTO inboxes (name, created_at) VALUES (?, ?)", `fake${i}`, Date.now());
+    expect((await call("/v1/inboxes/newcomer", { method: "PUT" })).status).toBe(200);
+    expect((await call("/v1/inboxes/box")).status).toBe(404);
+    await sql("DELETE FROM inboxes WHERE name = 'fake1'");
+    expect((await call("/v1/inboxes/box", { method: "PUT" })).status).toBe(200);
+    await insertSub("sub_shared");
+    await insertSub("sub_new");
+
+    expect(await stub.deleteInbox("box", begun.ticket, ["sub_shared"])).toBe(false);
+    expect((await call("/v1/inboxes/box")).status).toBe(200);
+    expect((await stub.listSubscriptions("box"))?.map((s) => s.id).sort()).toEqual(["sub_new", "sub_shared"]);
   });
 });

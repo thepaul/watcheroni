@@ -166,7 +166,7 @@ async function api(
       return info ? json(info) : problem(404, "not_found", "No such inbox");
     }
     case "DELETE /v1/inboxes/{name}":
-      return deleteInbox(env, account, name);
+      return deleteInbox(env, account, name, url.searchParams.getAll("unused_since"));
 
     case "POST /v1/inboxes/{name}/subscriptions":
       return createSubscription(request, env, account, accountId, name);
@@ -209,7 +209,7 @@ function meta(env: Env): Meta {
   return {
     protocol: 1,
     server: `watcheroni/${pkg.version}`,
-    features: ["ws", "longpoll", "repo_scope"],
+    features: ["ws", "longpoll", "repo_scope", "inbox_unused_since"],
     ...(env.GITHUB_CLIENT_ID
       ? {
           github: {

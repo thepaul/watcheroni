@@ -117,6 +117,7 @@ export async function createSubscription(
       ignore: parsed.ignore,
       ttl_seconds: parsed.ttl_seconds,
       verified_until: verifiedUntil,
+      checked_at: room.checked_at,
     },
     repo,
     baseline,
@@ -140,16 +141,22 @@ export async function createSubscription(
     verified_until: sub.verified_until === null ? null : new Date(sub.verified_until).toISOString(),
     state: "active",
   };
-  const saved = await account.saveSubscription(info);
+  const saved = await account.saveSubscription(info, room.checked_at);
   if (!saved.ok) {
     // The inbox went meanwhile: deleted (DELETE /v1/inboxes/{name}), or,
     // though checkSubscription's note in `subscribing` keeps roomForInbox
-    // from taking it for idle, deleted to make room. Take back what
-    // RepoHub just made. That isn't atomic with the answer: should this
+    // from taking it for idle, deleted to make room. Or a delete began
+    // meanwhile (409 inbox_deleting), and may have ended this very
+    // subscription. Take back what RepoHub just made; one RepoHub already
+    // had (a renewal) the delete has ended or will. Only if no request
+    // checked after this one has renewed it since: that one may have been
+    // answered with it (say the inbox was deleted and made again, and
+    // asked for the same subscription), so RepoHub keeps it ("kept"), and
+    // so does this. That isn't atomic with the answer: should this
     // request die first, RepoHub keeps a subscription Account doesn't
     // know until it expires, its events dropped since its deliveries
     // never make an inbox.
-    if (result.created) await repoHubStub(env, repo.id).unsubscribe(sub.id);
+    if (result.created) await repoHubStub(env, repo.id).unsubscribe(sub.id, room.checked_at + 1);
     return problem(saved.status, saved.code, saved.detail);
   }
   await installation.addRepo(repo.id);
@@ -209,37 +216,98 @@ export async function deleteSubscription(env: Env, account: AccountStub, inbox: 
   return new Response(null, { status: 204 });
 }
 
-// DELETE /v1/inboxes/{name}. The RepoHubs give up their subscriptions
-// first, so the inbox goes only once nothing routes to it; a RepoHub
-// still routing to a deleted inbox would only have its events dropped
-// (Account.deliver), but would keep its repo watched. If one can't be
-// reached, the subscriptions that did end are dropped from the index too,
-// so it says what RepoHub has, and the client is told to try again. A
-// RepoHub that didn't know a subscription (`unsubscribe` false) has
-// nothing to give up, which is as good as ending it. A subscription made
-// meanwhile comes back from Account.deleteInbox and is taken back from
-// its RepoHub then.
-export async function deleteInbox(env: Env, account: AccountStub, inbox: string): Promise<Response> {
-  const subs = await account.listSubscriptions(inbox);
-  if (!subs) return problem(404, "not_found", "No such inbox");
-  const unsubscribe = (list: SubscriptionInfo[]) =>
-    Promise.allSettled(list.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id)));
-  const results = await unsubscribe(subs);
-  const failed = results.flatMap((r, i) => (r.status === "rejected" ? [[subs[i], r.reason] as const] : []));
-  if (failed.length) {
-    for (const [sub, reason] of failed) console.error(`deleting inbox ${inbox}: unsubscribing ${sub.id} failed`, reason);
-    const ended = subs.filter((_, i) => results[i].status === "fulfilled");
-    for (const sub of ended) await account.removeSubscription(inbox, sub.id);
+// DELETE /v1/inboxes/{name}[?unused_since=...], in three steps.
+// Account.beginDeleteInbox answers the inbox's subscriptions and marks it
+// as being deleted, so no subscription can be made meanwhile only to be
+// dropped; with `unused_since`, it refuses instead if the inbox has been
+// used since then, checked in the same step. The RepoHubs then give up
+// the subscriptions, so the inbox goes only once nothing routes to it; a
+// RepoHub still routing to a deleted inbox would only have its events
+// dropped (Account.deliver), but would keep its repo watched. A RepoHub
+// that didn't know a subscription (`unsubscribe` false) has nothing to
+// give up, which is as good as ending it. Last, Account.deleteInbox
+// deletes the inbox, if the mark is still this delete's.
+//
+// Whenever it can't finish, the delete answers 503 having put back what
+// it can: the subscriptions that did end are dropped from the index, so it
+// says what RepoHub has, and the mark is lifted, so the inbox takes
+// subscriptions again. That's when a RepoHub can't be reached, or keeps
+// a subscription renewed since the mark (see below), when Account fails
+// at the last step, and when the mark is no longer this
+// delete's at the last step: it lapsed and was taken over, or the inbox
+// was dropped (and maybe made again) meanwhile. The client tries again,
+// with the inbox as it is then.
+export async function deleteInbox(env: Env, account: AccountStub, inbox: string, unusedSince: string[]): Promise<Response> {
+  let since: number | null = null;
+  if (unusedSince.length) {
+    const parsed = unusedSince.length === 1 ? parseTimestamp(unusedSince[0]) : null;
+    if (parsed === null) {
+      return problem(400, "invalid_request", "unused_since must be one RFC 3339 timestamp, like 2026-11-04T12:00:00Z (encode + as %2B)");
+    }
+    if (parsed > Date.now()) return problem(400, "invalid_request", "unused_since is in the future");
+    since = parsed;
+  }
+  const begun = await account.beginDeleteInbox(inbox, since);
+  if (!begun.ok) return problem(begun.status, begun.code, begun.detail);
+  const { ticket, subscriptions: subs } = begun;
+  // Best effort: should this fail too, the mark lapses by itself, and the
+  // index keeps subscriptions RepoHub has ended until a delete ends them
+  // again.
+  const cancel = async (ended: string[]) => {
+    try {
+      await account.cancelDeleteInbox(inbox, ticket, ended);
+    } catch (e) {
+      console.error(`deleting inbox ${inbox}: cancelling failed`, e);
+    }
+  };
+  // Each carries the mark's time: RepoHub keeps ("kept") a subscription a
+  // request checked at or after it made or renewed, which can happen only
+  // once the mark has lapsed under a slow delete. That one is newer than
+  // this delete's list, so the delete gives up, as if it had failed.
+  const results = await Promise.allSettled(subs.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id, ticket.mark)));
+  const ended = (i: number) => {
+    const r = results[i];
+    return r.status === "fulfilled" && r.value !== "kept";
+  };
+  if (!subs.every((_, i) => ended(i))) {
+    results.forEach((r, i) => {
+      if (r.status === "rejected") console.error(`deleting inbox ${inbox}: unsubscribing ${subs[i].id} failed`, r.reason);
+      else if (r.value === "kept") console.warn(`deleting inbox ${inbox}: ${subs[i].id} was renewed after the delete began; keeping it`);
+    });
+    await cancel(subs.filter((_, i) => ended(i)).map((s) => s.id));
     return unavailable("Couldn't end all of the inbox's subscriptions");
   }
-  const removed = await account.deleteInbox(inbox);
-  if (!removed) return problem(404, "not_found", "No such inbox");
-  const done = new Set(subs.map((s) => s.id));
-  const late = removed.filter((s) => !done.has(s.id));
-  (await unsubscribe(late)).forEach((r, i) => {
-    if (r.status === "rejected") console.error(`deleting inbox ${inbox}: unsubscribing ${late[i].id} failed`, r.reason);
-  });
+  const ids = subs.map((s) => s.id);
+  let deleted: boolean;
+  try {
+    deleted = await account.deleteInbox(inbox, ticket, ids);
+  } catch (e) {
+    console.error(`deleting inbox ${inbox}: the last step failed`, e);
+    await cancel(ids);
+    return unavailable("Couldn't delete the inbox");
+  }
+  if (!deleted) return withRetryAfter(problem(503, "unavailable", "The inbox changed while it was being deleted; try again"), 1);
   return new Response(null, { status: 204 });
+}
+
+// An RFC 3339 timestamp (ISO 8601's profile with a full date and time, and
+// `Z` or an offset), as milliseconds since the epoch; null for anything
+// else, a date that doesn't exist included. Digits past milliseconds are
+// dropped, which moves the time earlier.
+const TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(?:Z|([+-])(\d{2}):(\d{2}))$/;
+
+export function parseTimestamp(s: string): number | null {
+  const m = TIMESTAMP.exec(s);
+  if (!m) return null;
+  const [y, mo, d, h, mi, sec] = m.slice(1, 7).map(Number);
+  const ms = Number((m[7] ?? "").padEnd(3, "0").slice(0, 3));
+  const [oh, om] = [Number(m[9] ?? 0), Number(m[10] ?? 0)];
+  if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || sec > 59 || oh > 23 || om > 59) return null;
+  const date = new Date(0);
+  date.setUTCFullYear(y, mo - 1, d);
+  if (date.getUTCFullYear() !== y || date.getUTCMonth() !== mo - 1 || date.getUTCDate() !== d) return null;
+  date.setUTCHours(h, mi, sec, ms);
+  return date.getTime() - (m[8] === "-" ? -1 : 1) * (oh * 60 + om) * 60_000;
 }
 
 // The repo's first `base` or `author` filter: RepoHub learns its open PRs
