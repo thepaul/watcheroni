@@ -140,14 +140,14 @@ export async function createSubscription(
     verified_until: sub.verified_until === null ? null : new Date(sub.verified_until).toISOString(),
     state: "active",
   };
-  const saved = await account.saveSubscription(info);
+  const saved = await account.saveSubscription(info, room.checked_at);
   if (!saved.ok) {
     // The inbox went meanwhile: deleted (DELETE /v1/inboxes/{name}), or,
     // though checkSubscription's note in `subscribing` keeps roomForInbox
     // from taking it for idle, deleted to make room. Or a delete began
-    // meanwhile (409 inbox_deleting), which would drop the subscription
-    // without a word. Take back what RepoHub just made; one RepoHub
-    // already had (a renewal) is the delete's to end. That isn't atomic
+    // meanwhile (409 inbox_deleting), and may have ended this very
+    // subscription. Take back what RepoHub just made; one RepoHub already
+    // had (a renewal) the delete has ended or will. That isn't atomic
     // with the answer: should this request die first, RepoHub keeps a
     // subscription Account doesn't know until it expires, its events
     // dropped since its deliveries never make an inbox.
@@ -218,50 +218,59 @@ export async function deleteSubscription(env: Env, account: AccountStub, inbox: 
 // used since then, checked in the same step. The RepoHubs then give up
 // the subscriptions, so the inbox goes only once nothing routes to it; a
 // RepoHub still routing to a deleted inbox would only have its events
-// dropped (Account.deliver), but would keep its repo watched. If one
-// can't be reached, Account.cancelDeleteInbox drops the subscriptions
-// that did end from the index, so it says what RepoHub has, and lifts the
-// mark, and the client is told to try again. A RepoHub that didn't know a
-// subscription (`unsubscribe` false) has nothing to give up, which is as
-// good as ending it. Last, Account.deleteInbox deletes the inbox.
+// dropped (Account.deliver), but would keep its repo watched. A RepoHub
+// that didn't know a subscription (`unsubscribe` false) has nothing to
+// give up, which is as good as ending it. Last, Account.deleteInbox
+// deletes the inbox, if the mark is still this delete's.
+//
+// Whenever it can't finish, the delete answers 503 having put back what
+// it can: the subscriptions that did end are dropped from the index, so it
+// says what RepoHub has, and the mark is lifted, so the inbox takes
+// subscriptions again. That's when a RepoHub can't be reached, when
+// Account fails at the last step, and when the mark is no longer this
+// delete's at the last step: it lapsed and was taken over, or the inbox
+// was dropped (and maybe made again) meanwhile. The client tries again,
+// with the inbox as it is then.
 export async function deleteInbox(env: Env, account: AccountStub, inbox: string, unusedSince: string[]): Promise<Response> {
   let since: number | null = null;
   if (unusedSince.length) {
     const parsed = unusedSince.length === 1 ? parseTimestamp(unusedSince[0]) : null;
-    if (parsed === null) return problem(400, "invalid_request", "unused_since must be one ISO 8601 timestamp, like 2026-11-04T12:00:00Z");
+    if (parsed === null) {
+      return problem(400, "invalid_request", "unused_since must be one RFC 3339 timestamp, like 2026-11-04T12:00:00Z (encode + as %2B)");
+    }
     if (parsed > Date.now()) return problem(400, "invalid_request", "unused_since is in the future");
     since = parsed;
   }
   const begun = await account.beginDeleteInbox(inbox, since);
   if (!begun.ok) return problem(begun.status, begun.code, begun.detail);
-  const subs = begun.subscriptions;
-  const unsubscribe = (list: SubscriptionInfo[]) =>
-    Promise.allSettled(list.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id)));
-  const results = await unsubscribe(subs);
+  const { ticket, subscriptions: subs } = begun;
+  // Best effort: should this fail too, the mark lapses by itself, and the
+  // index keeps subscriptions RepoHub has ended until a delete ends them
+  // again.
+  const cancel = async (ended: string[]) => {
+    try {
+      await account.cancelDeleteInbox(inbox, ticket, ended);
+    } catch (e) {
+      console.error(`deleting inbox ${inbox}: cancelling failed`, e);
+    }
+  };
+  const results = await Promise.allSettled(subs.map((s) => repoHubStub(env, s.repo.id).unsubscribe(s.id)));
   const failed = results.flatMap((r, i) => (r.status === "rejected" ? [[subs[i], r.reason] as const] : []));
   if (failed.length) {
     for (const [sub, reason] of failed) console.error(`deleting inbox ${inbox}: unsubscribing ${sub.id} failed`, reason);
-    const ended = subs.filter((_, i) => results[i].status === "fulfilled").map((s) => s.id);
-    try {
-      await account.cancelDeleteInbox(inbox, begun.mark, ended);
-    } catch (e) {
-      // The mark lapses by itself; the index keeps subscriptions RepoHub
-      // has ended until the next delete takes them back again.
-      console.error(`deleting inbox ${inbox}: cancelling failed`, e);
-    }
+    await cancel(subs.filter((_, i) => results[i].status === "fulfilled").map((s) => s.id));
     return unavailable("Couldn't end all of the inbox's subscriptions");
   }
-  const removed = await account.deleteInbox(inbox);
-  if (!removed) return problem(404, "not_found", "No such inbox");
-  // A safety net: the mark keeps any subscription from being saved since
-  // beginDeleteInbox, so there should be none here. There could be one
-  // only if this delete outlived its mark (Account's DELETE_MARK_MS), and
-  // it's taken back from its RepoHub rather than left routing to nothing.
-  const done = new Set(subs.map((s) => s.id));
-  const late = removed.filter((s) => !done.has(s.id));
-  (await unsubscribe(late)).forEach((r, i) => {
-    if (r.status === "rejected") console.error(`deleting inbox ${inbox}: unsubscribing ${late[i].id} failed`, r.reason);
-  });
+  const ids = subs.map((s) => s.id);
+  let deleted: boolean;
+  try {
+    deleted = await account.deleteInbox(inbox, ticket, ids);
+  } catch (e) {
+    console.error(`deleting inbox ${inbox}: the last step failed`, e);
+    await cancel(ids);
+    return unavailable("Couldn't delete the inbox");
+  }
+  if (!deleted) return withRetryAfter(problem(503, "unavailable", "The inbox changed while it was being deleted; try again"), 1);
   return new Response(null, { status: 204 });
 }
 

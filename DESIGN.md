@@ -373,9 +373,11 @@ CREATE TABLE deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER, acked INTEGER
 -- being deleted as idle while the Worker makes one, and counts as use
 -- for DELETE ?unused_since.
 CREATE TABLE subscribing (inbox TEXT PRIMARY KEY, at INTEGER);
--- Inboxes a DELETE is taking apart, and since when; they take no new
--- subscriptions meanwhile. A mark older than 60 seconds is ignored.
-CREATE TABLE deleting (inbox TEXT PRIMARY KEY, at INTEGER);
+-- When a DELETE last began on each inbox, and whether it's under way
+-- (active); the inbox takes no new subscriptions meanwhile. A mark older
+-- than 60 seconds is taken over. Kept once the delete ends, so a
+-- subscription checked before it began isn't saved after.
+CREATE TABLE deleting (inbox TEXT PRIMARY KEY, at INTEGER, active INTEGER);
 ```
 
 `deleted_inboxes` keeps a deleted name until the name is used again,
@@ -532,45 +534,67 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
 - `DELETE /v1/inboxes/{name}` (`deleteInbox` in `src/subscriptions.ts`)
   runs in three steps, so that nothing races it.
   1. `Account.beginDeleteInbox(name, since)` answers the inbox's
-     subscriptions and writes a mark in `deleting`. With `unused_since`
-     (`since`), it first refuses with `409 inbox_in_use` if the inbox has
-     been used since: `created_at`, `last_read_at`, a `subscribing` row
-     or a subscription's `created_at` at or after `since`, or any socket
+     subscriptions and a ticket, and marks the inbox in `deleting` (the
+     mark's time, live). With `unused_since` (`since`), it first refuses
+     with `409 inbox_in_use` if the inbox has been used since:
+     `created_at`, `last_read_at`, a `subscribing` row or a
+     subscription's `created_at` at or after `since`, or any socket
      tagged `inbox:{name}` open now (a client's or a long poll's bridge).
      `last_read_at` alone isn't enough: it moves only on `hello` and HTTP
      reads, so a client streaming over one socket for a week looks idle.
      All of it is read, and the mark written, in one synchronous step, so
-     no subscribe or read can land between the check and the mark. A
-     second delete meanwhile gets `409 inbox_deleting`.
+     no subscription can land between the check and the mark. A second
+     delete meanwhile gets `409 inbox_deleting`. The ticket is the mark's
+     time and the inbox's `created_at`, which tells this life of the name
+     from one made again later.
   2. The Worker takes the subscriptions back from their RepoHubs. While
-     the mark stands, `checkSubscription` and `saveSubscription` refuse
+     the mark is live, `checkSubscription` and `saveSubscription` refuse
      with `409 inbox_deleting`; a refused save has the Worker take the
      subscription back from RepoHub, as for a vanished inbox, and the
-     client gets the `409`. Without the mark, a subscribe landing here
-     would be saved and then dropped by step 3 with a `201` already
-     given. Readers aren't refused; they're closed with `4004` in step 3.
-     If a RepoHub can't be reached, `Account.cancelDeleteInbox` drops the
-     subscriptions that did end from the index, so it still says what
-     RepoHub has, and lifts the mark; the Worker answers `503` with the
-     inbox kept.
-  3. `Account.deleteInbox` deletes the inbox, its events, its index rows
-     and its mark, remembers its numbering in `deleted_inboxes`, and
-     closes its sockets with `4004`. Any subscription it finds that step
-     1 didn't list is taken back from its RepoHub; the mark makes that
-     unreachable but for the case below, and it stays as a safety net.
+     client gets the `409`. Readers aren't refused; they're closed with
+     `4004` in step 3.
+  3. `Account.deleteInbox(name, ticket, listed)` deletes the inbox, its
+     events, its index rows and its mark, remembers its numbering in
+     `deleted_inboxes`, and closes its sockets with `4004`, but only if
+     the ticket's mark is still there and live and the inbox is the same
+     life. That means for certain that nothing was saved since step 1
+     and the inbox wasn't dropped or made again: a save refuses while
+     the mark is live, and takes it over once it lapses; `dropInbox`
+     removes it. An index row step 1 didn't list is logged as a bug.
+
+  A delete that can't finish puts back what it can and answers `503`:
+  `Account.cancelDeleteInbox` drops from the index the subscriptions that
+  did end, so it still says what RepoHub has, and lifts the mark. That
+  happens when a RepoHub can't be reached in step 2, when step 3 throws,
+  and when step 3 finds the mark gone or not live (`deleteInbox` does
+  the same rollback itself and answers false; the client gets
+  `Retry-After: 1`). Either way, the index rows are dropped only if the
+  inbox is still the life the ticket names, so a name made again keeps
+  its own, and a mark is lifted only if it is still the ticket's.
+
+  A subscription checked before a delete began mustn't be saved after it,
+  even if the delete was cancelled: the delete may have ended it in
+  RepoHub (a renewal of one it listed), and saving it would answer `201`
+  for a dead subscription. So `deleting` keeps a cancelled delete's row,
+  no longer live, `checkSubscription` answers the time it checked, and
+  `saveSubscription` refuses with `409 inbox_deleting` if a delete began
+  on the inbox at or after that time, or the inbox was made again since.
 
   A mark lasts 60 seconds (`DELETE_MARK_MS`). It outlives its delete only
   if the Worker dies between steps 1 and 3; step 2 is one request's
   `unsubscribe` calls, run at once, each a few SQL statements in one
-  RepoHub, so a live delete is through it in well under a second. After
-  60 seconds the mark is ignored, so subscribing works again and another
-  delete can take over. The Worker hands the mark's time back to
-  `cancelDeleteInbox`, which lifts only that mark, so a delete that
-  somehow outlived its mark can't lift its successor's. RepoHub's
-  deliveries (`deliver(items, false)`) never make an inbox, so an event
-  already queued in its outbox for the deleted inbox is dropped rather
-  than bringing it back; `/debug` injection still makes them. Nor does a
-  long poll's bridge: one opened after the delete answers `404`.
+  RepoHub, so a live delete is through it in well under a second. The
+  runtime sets no fixed wall-clock limit on a request, though, so a
+  delete can be slower than its mark. Whatever next finds a lapsed mark
+  takes it over (a check or save makes it not live; a new delete writes
+  its own), and the slow delete then can't finish, answering `503`
+  rather than dropping anything saved meanwhile. A mark whose delete
+  died, with nothing else touching the inbox, holds it 60 seconds.
+
+  RepoHub's deliveries (`deliver(items, false)`) never make an inbox, so
+  an event already queued in its outbox for the deleted inbox is dropped
+  rather than bringing it back; `/debug` injection still makes them. Nor
+  does a long poll's bridge: one opened after the delete answers `404`.
 - The install URL (in `/v1/meta`, `app_not_installed` and the landing
   page) comes from the `GITHUB_APP_SLUG` var, through `installUrl(env)`
   in `src/subscriptions.ts`; a self-hosted copy has its own App.

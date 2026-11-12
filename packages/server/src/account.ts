@@ -59,11 +59,20 @@ type SubscriptionRow = {
 
 // An account cap that refused a request, as the problem the Worker answers with.
 export type Refusal = { ok: false; status: number; code: string; detail: string };
-export type SubscriptionCheck = { ok: true } | Refusal;
+// `checked_at` goes back to saveSubscription, which refuses if the inbox
+// was deleted, or a delete began on it, since.
+export type SubscriptionCheck = { ok: true; checked_at: number } | Refusal;
+export type SubscriptionSave = { ok: true } | Refusal;
+// Which delete, of which inbox: the deleting mark's time, and the inbox's
+// `created_at`, which tells one life of a name from the next.
+export interface DeleteTicket {
+  mark: number;
+  life: number;
+}
 // The first step of DELETE /v1/inboxes/{name}: the subscriptions to take
-// back from their RepoHubs, and the deleting mark, which the Worker hands
-// back to cancelDeleteInbox if it can't finish.
-export type DeleteBegun = { ok: true; mark: number; subscriptions: SubscriptionInfo[] } | Refusal;
+// back from their RepoHubs, and the ticket the Worker hands back to
+// deleteInbox, or to cancelDeleteInbox if it can't finish.
+export type DeleteBegun = { ok: true; ticket: DeleteTicket; subscriptions: SubscriptionInfo[] } | Refusal;
 
 type KeyRow = {
   id: string;
@@ -116,16 +125,17 @@ const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 // How long a deleting mark (beginDeleteInbox) holds. A mark outlives its
 // delete only if the Worker running it dies between beginDeleteInbox and
 // deleteInbox or cancelDeleteInbox; after this it's taken for abandoned,
-// subscribing works again and another delete can take over. What runs
+// so subscribing works again and another delete can take over. What runs
 // between those calls is one request's RepoHub.unsubscribe calls, run at
 // once (Promise.allSettled), each a few SQL statements in one RepoHub, so
 // a live delete gets through them in well under a second. 60 seconds is
 // far beyond that, while short enough that an inbox left marked isn't
-// refused subscriptions for long. Should a delete outlive its mark after
-// all (the runtime sets the Worker no fixed wall-clock limit), the mark
-// it hands back no longer matches, so it can't clear its successor's, and
-// a subscription saved once the mark lapsed is taken back by deleteInbox's
-// last step.
+// refused subscriptions for long. The runtime sets the Worker no fixed
+// wall-clock limit, so a slow delete can still outlive its mark; nothing
+// is lost then. Whatever finds the mark lapsed (deletingMark) takes it
+// over first, and deleteInbox and cancelDeleteInbox act on a mark only
+// while it is the one their ticket names, still live: the late delete is
+// refused rather than dropping a subscription saved meanwhile.
 const DELETE_MARK_MS = 60 * 1000;
 
 export class Account extends DurableObject<Env> {
@@ -215,9 +225,11 @@ export class Account extends DurableObject<Env> {
       -- When a subscription to each inbox was last asked for, so it isn't
       -- taken for idle while the Worker makes one (checkSubscription).
       CREATE TABLE IF NOT EXISTS subscribing (inbox TEXT PRIMARY KEY, at INTEGER NOT NULL);
-      -- Inboxes a DELETE is taking apart, and since when; they take no
-      -- new subscriptions meanwhile (beginDeleteInbox).
-      CREATE TABLE IF NOT EXISTS deleting (inbox TEXT PRIMARY KEY, at INTEGER NOT NULL);
+      -- When a DELETE last began on each inbox, and whether it's still
+      -- under way (active); the inbox takes no new subscriptions
+      -- meanwhile (beginDeleteInbox). Kept once it ends, so a
+      -- subscription checked before it began isn't saved after.
+      CREATE TABLE IF NOT EXISTS deleting (inbox TEXT PRIMARY KEY, at INTEGER NOT NULL, active INTEGER NOT NULL);
     `);
   }
 
@@ -349,8 +361,9 @@ export class Account extends DurableObject<Env> {
   beginDeleteInbox(name: string, since: number | null): DeleteBegun {
     const inbox = this.inbox(name);
     if (!inbox) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
+    this.open();
     const now = Date.now();
-    if (this.beingDeleted(name, now)) return beingDeletedRefusal();
+    if (this.deletingMark(name, now)?.active) return beingDeletedRefusal();
     if (since !== null) {
       const used = this.usedSince(inbox, since);
       if (used.length) {
@@ -362,33 +375,55 @@ export class Account extends DurableObject<Env> {
         };
       }
     }
-    this.open();
-    // A lapsed mark, left by a delete that died, is taken over.
-    this.sql.exec("INSERT INTO deleting (inbox, at) VALUES (?, ?) ON CONFLICT (inbox) DO UPDATE SET at = excluded.at", name, now);
-    return { ok: true, mark: now, subscriptions: this.listSubscriptions(name)! };
+    this.sql.exec(
+      "INSERT INTO deleting (inbox, at, active) VALUES (?, ?, 1) ON CONFLICT (inbox) DO UPDATE SET at = excluded.at, active = 1",
+      name, now,
+    );
+    return { ok: true, ticket: { mark: now, life: inbox.created_at }, subscriptions: this.listSubscriptions(name)! };
   }
 
-  // RPC, when the Worker couldn't end all of the inbox's subscriptions:
-  // forgets the ones that did end, so the index says what RepoHub has, and
-  // lifts the deleting mark, so the inbox can be subscribed to again. A
-  // mark that isn't `mark` is another delete's, which took over this one's
-  // once it lapsed, and is left alone.
-  cancelDeleteInbox(name: string, mark: number, ended: string[]): void {
-    for (const id of ended) this.sql.exec("DELETE FROM subscriptions WHERE inbox = ? AND id = ?", name, id);
-    this.sql.exec("DELETE FROM deleting WHERE inbox = ? AND at = ?", name, mark);
+  // RPC, when the Worker couldn't finish a delete: forgets the
+  // subscriptions that did end (`ended`), so the index says what RepoHub
+  // has, and lifts the mark, so the inbox can be subscribed to again. The
+  // index is touched only if the inbox is the one the delete began on, not
+  // one made again under its name since, and the mark only if it is still
+  // this delete's.
+  cancelDeleteInbox(name: string, ticket: DeleteTicket, ended: string[]): void {
+    if (this.inbox(name)?.created_at === ticket.life) {
+      for (const id of ended) this.sql.exec("DELETE FROM subscriptions WHERE inbox = ? AND id = ?", name, id);
+    }
+    if (this.created) this.sql.exec("UPDATE deleting SET active = 0 WHERE inbox = ? AND at = ? AND active = 1", name, ticket.mark);
   }
 
-  // RPC: deletes the inbox with its events and subscriptions, and hangs up
-  // its sockets. Returns the subscriptions it had, so the Worker can take
-  // them back from their RepoHubs, or null if there was no such inbox.
-  // Clears the deleting mark with the rest (dropInbox).
-  deleteInbox(name: string): SubscriptionInfo[] | null {
-    if (!this.inbox(name)) return null;
+  // RPC, the last step of DELETE /v1/inboxes/{name}, once the RepoHubs
+  // have given up all of `listed`: deletes the inbox with its events and
+  // subscriptions, and hangs up its sockets. Only if the delete's mark is
+  // still there and live, which means for certain that since
+  // beginDeleteInbox no subscription was saved (saveSubscription refuses
+  // while it's live, and takes it over, ending it, once it lapses) and the
+  // inbox wasn't dropped or made again (dropInbox removes the mark).
+  // Otherwise returns false, having forgotten `listed` as
+  // cancelDeleteInbox does, since RepoHub has ended them; the Worker asks
+  // the client to try again.
+  deleteInbox(name: string, ticket: DeleteTicket, listed: string[]): boolean {
+    const inbox = this.inbox(name);
+    const mark = this.created
+      ? this.sql.exec<{ at: number; active: number }>("SELECT at, active FROM deleting WHERE inbox = ?", name).toArray()[0]
+      : undefined;
+    if (!inbox || inbox.created_at !== ticket.life || !mark || mark.at !== ticket.mark || !mark.active) {
+      this.cancelDeleteInbox(name, ticket, listed);
+      return false;
+    }
     this.open();
-    const subs = this.listSubscriptions(name) ?? [];
+    const known = new Set(listed);
+    const unlisted = (this.listSubscriptions(name) ?? []).filter((s) => !known.has(s.id));
+    if (unlisted.length) {
+      // Unreachable, by the mark: there's no way to save one without it.
+      console.error(`deleting inbox ${name}: subscriptions saved during the delete: ${unlisted.map((s) => s.id).join(", ")}`);
+    }
     this.dropInbox(name);
     for (const ws of this.ctx.getWebSockets(`inbox:${name}`)) ws.close(4004, "inbox deleted");
-    return subs;
+    return true;
   }
 
   // Has the inbox been used at `since` or later? Each way it has, said for
@@ -416,10 +451,19 @@ export class Account extends DurableObject<Env> {
     return used;
   }
 
-  // Whether a delete holds a live mark on the inbox (beginDeleteInbox).
-  private beingDeleted(name: string, now = Date.now()): boolean {
-    if (!this.created) return false;
-    return this.sql.exec("SELECT 1 FROM deleting WHERE inbox = ? AND at > ?", name, now - DELETE_MARK_MS).toArray().length > 0;
+  // The inbox's deleting mark (beginDeleteInbox): when a delete last
+  // began on it, and whether it's under way. A live mark that has lapsed
+  // (DELETE_MARK_MS) is taken over first, made not live, so the delete
+  // that wrote it can't finish (deleteInbox) after whatever comes next.
+  private deletingMark(name: string, now = Date.now()): { at: number; active: boolean } | null {
+    if (!this.created) return null;
+    const row = this.sql.exec<{ at: number; active: number }>("SELECT at, active FROM deleting WHERE inbox = ?", name).toArray()[0];
+    if (!row) return null;
+    if (row.active && row.at <= now - DELETE_MARK_MS) {
+      this.sql.exec("UPDATE deleting SET active = 0 WHERE inbox = ?", name);
+      return { at: row.at, active: false };
+    }
+    return { at: row.at, active: !!row.active };
   }
 
   // The inbox as the API shows it. `oldest` leaves out events past
@@ -540,7 +584,8 @@ export class Account extends DurableObject<Env> {
   // being deleted takes no new subscription.
   checkSubscription(inbox: string): SubscriptionCheck {
     if (!this.inbox(inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
-    if (this.beingDeleted(inbox)) return beingDeletedRefusal();
+    const now = Date.now();
+    if (this.deletingMark(inbox, now)?.active) return beingDeletedRefusal();
     const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM subscriptions").one().n;
     if (n >= ACCOUNT_MAX_SUBSCRIPTIONS) {
       return { ok: false, status: 422, code: "quota_exceeded", detail: `Too many subscriptions on this account (at most ${ACCOUNT_MAX_SUBSCRIPTIONS})` };
@@ -548,21 +593,33 @@ export class Account extends DurableObject<Env> {
     this.open();
     this.sql.exec(
       "INSERT INTO subscribing (inbox, at) VALUES (?, ?) ON CONFLICT (inbox) DO UPDATE SET at = excluded.at",
-      inbox, Date.now(),
+      inbox, now,
     );
-    return { ok: true };
+    return { ok: true, checked_at: now };
   }
 
-  // RPC, once RepoHub has the subscription. Refuses if the inbox is gone
-  // after all (deleted, or deleted to make room), so no subscription is
-  // ever kept for a missing inbox, or if a delete began meanwhile, which
-  // would otherwise end the subscription without telling anyone; the
-  // Worker then takes it back from RepoHub. This runs without an await,
-  // so nothing can delete the inbox between the check and the insert.
-  saveSubscription(sub: SubscriptionInfo): SubscriptionCheck {
+  // RPC, once RepoHub has the subscription; `checkedAt` is what
+  // checkSubscription answered. Refuses if the inbox is gone after all
+  // (deleted, or deleted to make room), so no subscription is ever kept
+  // for a missing inbox. Refuses too if a delete began on it since the
+  // check, even one that has ended (a 503 that put the inbox back): that
+  // delete may have ended this very subscription in RepoHub, as for a
+  // renewal checked before it began, and saving it would answer 201 for a
+  // dead one. Likewise if the inbox was deleted and made again since. The
+  // Worker then takes back what RepoHub made. This runs without an await,
+  // so nothing can delete the inbox between the checks and the insert.
+  saveSubscription(sub: SubscriptionInfo, checkedAt: number): SubscriptionSave {
     const { baseline: _, ...rest } = sub;
-    if (!this.inbox(rest.inbox)) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
-    if (this.beingDeleted(rest.inbox)) return beingDeletedRefusal();
+    const inbox = this.inbox(rest.inbox);
+    if (!inbox) return { ok: false, status: 404, code: "not_found", detail: "No such inbox" };
+    if (inbox.created_at > checkedAt) {
+      return { ok: false, status: 409, code: "inbox_deleting", detail: "Inbox was deleted and made again while subscribing; try again" };
+    }
+    const mark = this.deletingMark(rest.inbox);
+    if (mark?.active) return beingDeletedRefusal();
+    if (mark && mark.at >= checkedAt) {
+      return { ok: false, status: 409, code: "inbox_deleting", detail: "A delete of the inbox began while subscribing; try again" };
+    }
     this.open();
     this.sql.exec(
       `INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at, verified_until)

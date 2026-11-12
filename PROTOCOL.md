@@ -207,19 +207,30 @@ not_found`. An inbox made again under a deleted one's name carries on
 its numbering, as below.
 
 While a `DELETE` is under way, the inbox takes no new subscriptions:
-creating one answers `409 inbox_deleting`, as does a second `DELETE`, so
-a subscription is never made only to be ended by a delete that began
-first. Reading it still works until the delete finishes, when its
-sockets close with `4004` as above. A delete that answers `503` lets
-the inbox take subscriptions again, and one whose work on the server
-stopped halfway holds it for at most 60 seconds.
+creating one answers `409 inbox_deleting`, so a subscription is never
+made only to be ended by a delete that began first. A subscription
+being made when the delete began is refused the same way, even if the
+delete then fails; try it again. A second `DELETE` meanwhile also
+answers `409 inbox_deleting`, including a client's own retry while its
+first attempt is still running. Reading the inbox still works until the
+delete finishes, when its sockets close with `4004` as above.
 
-With `unused_since`, an RFC 3339 timestamp (`2026-11-04T12:00:00Z`;
-encode an offset's `+` as `%2B`), `DELETE` deletes the inbox only if
-nobody has used it since then, checked in the same step that starts the
-delete, so nothing can come in between. Otherwise it answers `409
-inbox_in_use`, keeping the inbox, with a `title` that says how it was
-used. Use is any of:
+A `DELETE` that can't finish answers `503` with `Retry-After` and keeps
+the inbox, with any subscriptions it couldn't end; it takes
+subscriptions again at once. That happens when a subscription can't be
+ended, and when the inbox changed under the delete (it was deleted to
+make room, or made again, meanwhile; `Retry-After: 1`). One whose work
+on the server stopped halfway holds the inbox for at most 60 seconds. A
+retry is a new delete, judged by the inbox as it is then.
+
+With `unused_since`, an RFC 3339 timestamp (`2026-11-04T12:00:00Z`; `T`
+and `Z` upper case, an offset's `+` encoded as `%2B`), `DELETE` deletes
+the inbox only if nobody has used it since then. That is checked in the
+same step that stops new subscriptions, so none can come in between;
+a reader can still connect after the check, and is closed with `4004`
+like any other. If it has been used, the answer is `409 inbox_in_use`,
+keeping the inbox, with a `title` that says how it was used. Use is any
+of:
 
 - the inbox was made then or later;
 - it was read then or later (`GET .../events`, or a WebSocket's `hello`);

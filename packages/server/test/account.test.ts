@@ -562,17 +562,18 @@ describe("per-account caps", () => {
     };
     // The Worker checks, then calls RepoHub, then saves. A PUT in between
     // finds a subscription being made to the inbox, so not idle: no room.
-    expect(await stub.checkSubscription("target")).toEqual({ ok: true });
+    const checked = await stub.checkSubscription("target");
+    if (!checked.ok) throw new Error("refused");
     expect((await call("/v1/inboxes/newcomer", { method: "PUT" })).status).toBe(422);
-    expect(await stub.saveSubscription(sub)).toEqual({ ok: true });
+    expect(await stub.saveSubscription(sub, checked.checked_at)).toEqual({ ok: true });
     expect((await stub.listSubscriptions("target"))?.map((s) => s.id)).toEqual(["sub_race"]);
 
     // Had it gone anyway, the save is refused rather than kept for no inbox.
-    expect(await stub.checkSubscription("fake1")).toEqual({ ok: true });
+    expect(await stub.checkSubscription("fake1")).toMatchObject({ ok: true });
     await runInDurableObject(stub, (_, state) => {
       state.storage.sql.exec("DELETE FROM inboxes WHERE name = 'fake1'");
     });
-    expect(await stub.saveSubscription({ ...sub, id: "sub_lost", inbox: "fake1" })).toMatchObject({ ok: false, status: 404, code: "not_found" });
+    expect(await stub.saveSubscription({ ...sub, id: "sub_lost", inbox: "fake1" }, Date.now())).toMatchObject({ ok: false, status: 404, code: "not_found" });
     expect(await stub.getSubscription("fake1", "sub_lost")).toBeNull();
   });
 
@@ -955,7 +956,7 @@ describe("conditional inbox delete (unused_since)", () => {
     expect(await sql("SELECT * FROM deleting")).toEqual([]);
   });
 
-  it("lets only the delete holding the mark lift it", async () => {
+  it("won't let a delete that outlived its mark finish, or lift its successor's", async () => {
     const { stub, oldInbox } = await account();
     await oldInbox("box");
     await runInDurableObject(stub, (instance: Account, state) => {
@@ -963,17 +964,76 @@ describe("conditional inbox delete (unused_since)", () => {
       if (!begun.ok) throw new Error("not begun");
       // As if it began 61 seconds ago.
       state.storage.sql.exec("UPDATE deleting SET at = at - 61000");
-      const stale = { mark: begun.mark - 61000 };
-      // A lapsed mark doesn't stop subscribing.
-      expect(instance.checkSubscription("box")).toEqual({ ok: true });
+      const stale = { ...begun.ticket, mark: begun.ticket.mark - 61000 };
+      // A lapsed mark doesn't stop subscribing; finding it takes it over.
+      expect(instance.checkSubscription("box")).toMatchObject({ ok: true });
+      // So the first delete wasn't dead after all, but can't finish.
+      expect(instance.deleteInbox("box", stale, [])).toBe(false);
+      expect(instance.inboxInfo("box")).not.toBeNull();
       const fresh = instance.beginDeleteInbox("box", null);
-      if (!fresh.ok) throw new Error("not taken over");
-      // The first delete wasn't dead after all, and gives up: its mark is
-      // gone, so it leaves the new one.
-      instance.cancelDeleteInbox("box", stale.mark, []);
+      if (!fresh.ok) throw new Error("not begun again");
+      // Nor can it lift the new mark.
+      instance.cancelDeleteInbox("box", stale, []);
       expect(instance.checkSubscription("box")).toMatchObject({ ok: false, status: 409, code: "inbox_deleting" });
-      instance.cancelDeleteInbox("box", fresh.mark, []);
-      expect(instance.checkSubscription("box")).toEqual({ ok: true });
+      instance.cancelDeleteInbox("box", fresh.ticket, []);
+      expect(instance.checkSubscription("box")).toMatchObject({ ok: true });
     });
+  });
+
+  it("won't save a subscription checked before a delete began, even once that delete is cancelled", async () => {
+    const { stub, oldInbox } = await account();
+    await oldInbox("box");
+    const now = new Date().toISOString();
+    const sub: SubscriptionInfo = {
+      id: "sub_renewed", inbox: "box", repo: { id: 1, full_name: "o/r", private: false }, pr: 1, kinds: [],
+      ignore: { self: false, bots: false, actors: [] }, created_at: now, expires_at: now, verified_until: null, state: "active",
+    };
+    // A renewal is checked; a delete begins, ends the subscription in
+    // RepoHub, fails on another and is cancelled; then the renewal's save.
+    const checked = await stub.checkSubscription("box");
+    if (!checked.ok) throw new Error("refused");
+    const begun = await stub.beginDeleteInbox("box", null);
+    if (!begun.ok) throw new Error("not begun");
+    await stub.cancelDeleteInbox("box", begun.ticket, []);
+    const saved = await stub.saveSubscription(sub, checked.checked_at);
+    expect(saved).toMatchObject({ ok: false, status: 409, code: "inbox_deleting", detail: "A delete of the inbox began while subscribing; try again" });
+    expect(await stub.listSubscriptions("box")).toEqual([]);
+    // Checked again, it's saved.
+    const again = await stub.checkSubscription("box");
+    if (!again.ok) throw new Error("refused");
+    expect(await stub.saveSubscription(sub, again.checked_at)).toEqual({ ok: true });
+  });
+
+  it("won't finish a delete whose inbox was dropped and made again meanwhile, nor touch the new one", async () => {
+    const { call, stub, sql, oldInbox } = await account();
+    await oldInbox("box");
+    const insertSub = (id: string) =>
+      sql(
+        "INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at) VALUES (?, 'box', 1, 'o/r', 0, 1, '{}', ?, ?)",
+        id, Date.now() - 8 * DAY, Date.now() + DAY,
+      );
+    // Idle long enough for roomForInbox to drop it.
+    const idle = Date.now() - (INBOX_IDLE_DAYS + 1) * DAY;
+    await sql("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'box'", idle, idle);
+    await insertSub("sub_shared");
+    const begun = await stub.beginDeleteInbox("box", Date.now() - 7 * DAY);
+    if (!begun.ok) throw new Error(`not begun: ${JSON.stringify(begun)}`);
+    expect(begun.subscriptions.map((s) => s.id)).toEqual(["sub_shared"]);
+    // While RepoHub gives it up, its `watch.*` event drops it from the
+    // index, and at the inbox cap a PUT drops the idle inbox to make room
+    // (roomForInbox). Then the name is made again, with a subscription
+    // RepoHub gave the same ID.
+    await sql("DELETE FROM subscriptions WHERE id = 'sub_shared'");
+    for (let i = 1; i < ACCOUNT_MAX_INBOXES; i++) await sql("INSERT INTO inboxes (name, created_at) VALUES (?, ?)", `fake${i}`, Date.now());
+    expect((await call("/v1/inboxes/newcomer", { method: "PUT" })).status).toBe(200);
+    expect((await call("/v1/inboxes/box")).status).toBe(404);
+    await sql("DELETE FROM inboxes WHERE name = 'fake1'");
+    expect((await call("/v1/inboxes/box", { method: "PUT" })).status).toBe(200);
+    await insertSub("sub_shared");
+    await insertSub("sub_new");
+
+    expect(await stub.deleteInbox("box", begun.ticket, ["sub_shared"])).toBe(false);
+    expect((await call("/v1/inboxes/box")).status).toBe(200);
+    expect((await stub.listSubscriptions("box"))?.map((s) => s.id).sort()).toEqual(["sub_new", "sub_shared"]);
   });
 });
