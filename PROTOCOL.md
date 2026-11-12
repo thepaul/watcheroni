@@ -51,7 +51,7 @@ No authentication. Returns everything a client needs to start:
 {
   "protocol": 1,
   "server": "watcheroni/0.1.0",
-  "features": ["ws", "longpoll", "repo_scope"],
+  "features": ["ws", "longpoll", "repo_scope", "inbox_unused_since"],
   "github": {
     "app_slug": "watcheroni",
     "client_id": "Iv23liABCDEF123456",
@@ -227,6 +227,10 @@ server's last step failed after deleting the inbox, the retry answers
 delete is under way, which it can only once the delete is slow enough
 for its hold to lapse, is never ended by that delete; the delete
 answers `503` instead.
+
+A server that supports `unused_since` lists `inbox_unused_since` in
+`/v1/meta` `features`. A server without it ignores the parameter and
+deletes unconditionally, so clients MUST NOT send it to one.
 
 With `unused_since`, an RFC 3339 timestamp (`2026-11-04T12:00:00Z`; `T`
 and `Z` upper case, an offset's `+` encoded as `%2B`), `DELETE` deletes
