@@ -186,6 +186,7 @@ PUT    /v1/inboxes/{name}        create, or answer the existing one (idempotent)
 GET    /v1/inboxes               list
 GET    /v1/inboxes/{name}        details
 DELETE /v1/inboxes/{name}        delete, with its subscriptions and events
+       [?unused_since=<timestamp>]  ...only if nobody has used it since
 ```
 
 Names: 1-64 characters from `[A-Za-z0-9._-]`. An inbox stays until it's
@@ -204,6 +205,37 @@ and answers `503`; try again.
 `GET` and `DELETE` on an inbox that doesn't exist answer `404
 not_found`. An inbox made again under a deleted one's name carries on
 its numbering, as below.
+
+While a `DELETE` is under way, the inbox takes no new subscriptions:
+creating one answers `409 inbox_deleting`, as does a second `DELETE`, so
+a subscription is never made only to be ended by a delete that began
+first. Reading it still works until the delete finishes, when its
+sockets close with `4004` as above. A delete that answers `503` lets
+the inbox take subscriptions again, and one whose work on the server
+stopped halfway holds it for at most 60 seconds.
+
+With `unused_since`, an RFC 3339 timestamp (`2026-11-04T12:00:00Z`;
+encode an offset's `+` as `%2B`), `DELETE` deletes the inbox only if
+nobody has used it since then, checked in the same step that starts the
+delete, so nothing can come in between. Otherwise it answers `409
+inbox_in_use`, keeping the inbox, with a `title` that says how it was
+used. Use is any of:
+
+- the inbox was made then or later;
+- it was read then or later (`GET .../events`, or a WebSocket's `hello`);
+- a subscription to it was asked for then or later (a `POST
+  .../subscriptions` that got past the checks with GitHub, renewals
+  included), or one it has was made then or later;
+- a WebSocket or long poll is open on it now, however long ago a
+  WebSocket said `hello`.
+
+`unused_since` that isn't one such timestamp, or that is in the future,
+answers `400 invalid_request`. A client sweeping away inboxes it thinks
+are stale, from what `GET` showed it, should pass the time it judged
+them by, such as a week ago for a week idle: another client may be
+streaming from the inbox over one long-lived socket, which `last_read_at`
+doesn't show, or may subscribe to it between the `GET` and the `DELETE`.
+Without `unused_since`, `DELETE` is unconditional.
 
 An account has at most `limits.inboxes_per_account` inboxes. Creating
 another, with `PUT` or by connecting a WebSocket to a new name, answers
@@ -649,6 +681,8 @@ Errors use `application/problem+json`
 | 404 | `not_found` | No such repo, PR, inbox or subscription. |
 | 409 | `app_not_installed` | Includes `install_url` when the server knows its App's slug. |
 | 409 | `pr_not_open` | Subscribing to a merged or closed PR. |
+| 409 | `inbox_in_use` | `DELETE` with `unused_since`: the inbox has been used since; `title` says how. |
+| 409 | `inbox_deleting` | The inbox is being deleted: no new subscriptions or second `DELETE` meanwhile. |
 | 422 | `quota_exceeded` | Too many inboxes, subscriptions or API keys; `title` says which. |
 | 429 | `rate_limited` | Includes `Retry-After`. |
 | 429 | `too_many_connections` | Too many long polls waiting on the account; includes `Retry-After`. |

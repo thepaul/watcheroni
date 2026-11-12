@@ -370,8 +370,12 @@ CREATE TABLE buckets (name TEXT PRIMARY KEY, tokens REAL, updated_at INTEGER);
 -- carries on from there, so seqs are never reused.
 CREATE TABLE deleted_inboxes (name TEXT PRIMARY KEY, head INTEGER, acked INTEGER);
 -- When a subscription to each inbox was last asked for; keeps it from
--- being deleted as idle while the Worker makes one.
+-- being deleted as idle while the Worker makes one, and counts as use
+-- for DELETE ?unused_since.
 CREATE TABLE subscribing (inbox TEXT PRIMARY KEY, at INTEGER);
+-- Inboxes a DELETE is taking apart, and since when; they take no new
+-- subscriptions meanwhile. A mark older than 60 seconds is ignored.
+CREATE TABLE deleting (inbox TEXT PRIMARY KEY, at INTEGER);
 ```
 
 `deleted_inboxes` keeps a deleted name until the name is used again,
@@ -519,20 +523,50 @@ and token minting in `src/app.ts` and the `/v1` subscription endpoints in
   and `Installation.addRepo`. Other requests reach Account between its
   two calls, so `checkSubscription` notes the inbox in `subscribing`,
   which keeps it from being deleted as idle for 30 days, and
-  `saveSubscription` checks again that it exists (refusing, and the
-  Worker taking the subscription back from RepoHub, if not). Account
+  `saveSubscription` checks again that it exists and that no delete has
+  begun on it (refusing, and the Worker taking the subscription back
+  from RepoHub, if not; see the next item). Account
   keeps the index that `GET` and `DELETE` read, and drops a row when a
   `watch.*` event for it is delivered, so it follows RepoHub ending
   watches.
 - `DELETE /v1/inboxes/{name}` (`deleteInbox` in `src/subscriptions.ts`)
-  takes the inbox's subscriptions back from their RepoHubs first; if one
-  fails, it drops the ones that did end from the index, so the index
-  still says what RepoHub has, and answers `503` with the inbox kept.
-  Then
-  `Account.deleteInbox` deletes the inbox, its events and its index rows,
-  remembers its numbering in `deleted_inboxes`, and closes its sockets
-  with `4004`. A subscription saved in between comes back from
-  `deleteInbox` and is taken back from its RepoHub then. RepoHub's
+  runs in three steps, so that nothing races it.
+  1. `Account.beginDeleteInbox(name, since)` answers the inbox's
+     subscriptions and writes a mark in `deleting`. With `unused_since`
+     (`since`), it first refuses with `409 inbox_in_use` if the inbox has
+     been used since: `created_at`, `last_read_at`, a `subscribing` row
+     or a subscription's `created_at` at or after `since`, or any socket
+     tagged `inbox:{name}` open now (a client's or a long poll's bridge).
+     `last_read_at` alone isn't enough: it moves only on `hello` and HTTP
+     reads, so a client streaming over one socket for a week looks idle.
+     All of it is read, and the mark written, in one synchronous step, so
+     no subscribe or read can land between the check and the mark. A
+     second delete meanwhile gets `409 inbox_deleting`.
+  2. The Worker takes the subscriptions back from their RepoHubs. While
+     the mark stands, `checkSubscription` and `saveSubscription` refuse
+     with `409 inbox_deleting`; a refused save has the Worker take the
+     subscription back from RepoHub, as for a vanished inbox, and the
+     client gets the `409`. Without the mark, a subscribe landing here
+     would be saved and then dropped by step 3 with a `201` already
+     given. Readers aren't refused; they're closed with `4004` in step 3.
+     If a RepoHub can't be reached, `Account.cancelDeleteInbox` drops the
+     subscriptions that did end from the index, so it still says what
+     RepoHub has, and lifts the mark; the Worker answers `503` with the
+     inbox kept.
+  3. `Account.deleteInbox` deletes the inbox, its events, its index rows
+     and its mark, remembers its numbering in `deleted_inboxes`, and
+     closes its sockets with `4004`. Any subscription it finds that step
+     1 didn't list is taken back from its RepoHub; the mark makes that
+     unreachable but for the case below, and it stays as a safety net.
+
+  A mark lasts 60 seconds (`DELETE_MARK_MS`). It outlives its delete only
+  if the Worker dies between steps 1 and 3; step 2 is one request's
+  `unsubscribe` calls, run at once, each a few SQL statements in one
+  RepoHub, so a live delete is through it in well under a second. After
+  60 seconds the mark is ignored, so subscribing works again and another
+  delete can take over. The Worker hands the mark's time back to
+  `cancelDeleteInbox`, which lifts only that mark, so a delete that
+  somehow outlived its mark can't lift its successor's. RepoHub's
   deliveries (`deliver(items, false)`) never make an inbox, so an event
   already queued in its outbox for the deleted inbox is dropped rather
   than bringing it back; `/debug` injection still makes them. Nor does a

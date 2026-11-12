@@ -1,7 +1,7 @@
 import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { AccountStats } from "../src/account";
+import type { Account, AccountStats } from "../src/account";
 import {
   ACCOUNT_MAX_INBOXES,
   ACCOUNT_MAX_LONG_POLLS,
@@ -785,5 +785,195 @@ describe("inboxes", () => {
     // /debug still makes inboxes as it goes.
     expect(await stub.deliver([{ inbox: "gone", event }])).toEqual({ delivered: 1, duplicates: 0, dropped: 0 });
     expect((await call("/v1/inboxes/gone")).status).toBe(200);
+  });
+});
+
+describe("conditional inbox delete (unused_since)", () => {
+  const DAY = 24 * 3600 * 1000;
+  // A week ago, as a client sweeping inboxes idle for 7 days asks.
+  const weekAgo = () => new Date(Date.now() - 7 * DAY).toISOString();
+  let nextAccount = 7500;
+  async function account() {
+    const id = nextAccount++;
+    const res = await exports.default.fetch(`${BASE}/debug/accounts/${id}/keys`, { method: "POST", headers: DEBUG });
+    const auth = { Authorization: `Bearer ${(await res.json<LoginResponse>()).api_key}` };
+    const call = (path: string, init: RequestInit = {}) =>
+      exports.default.fetch(`${BASE}${path}`, { ...init, headers: { ...auth, ...init.headers } });
+    const stub = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${id}`));
+    const sql = (query: string, ...bindings: unknown[]) =>
+      runInDurableObject(stub, (_, state) => state.storage.sql.exec(query, ...bindings).toArray());
+    // An inbox made, and last read, 8 days ago.
+    const oldInbox = async (name: string) => {
+      expect((await call(`/v1/inboxes/${name}`, { method: "PUT" })).status).toBe(200);
+      const old = Date.now() - 8 * DAY;
+      await sql("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = ?", old, old, name);
+    };
+    const del = (name: string, since: string | null = weekAgo()) =>
+      call(`/v1/inboxes/${name}${since === null ? "" : `?unused_since=${encodeURIComponent(since)}`}`, { method: "DELETE" });
+    const inUse = async (name: string, why: string) => {
+      const res = await del(name);
+      expect(res.status).toBe(409);
+      const body = await res.json<{ code: string; title: string }>();
+      expect(body.code).toBe("inbox_in_use");
+      expect(body.title).toMatch(/^Inbox has been used since \d{4}-\d\d-\d\dT.*Z: /);
+      expect(body.title).toContain(why);
+      // Refusing leaves the inbox as it was, unmarked.
+      expect((await call(`/v1/inboxes/${name}`)).status).toBe(200);
+      expect(await sql("SELECT * FROM deleting")).toEqual([]);
+    };
+    return { call, stub, sql, oldInbox, del, inUse };
+  }
+
+  it("deletes an inbox nobody has used since, with 204", async () => {
+    const { call, oldInbox, del } = await account();
+    await oldInbox("idle");
+    expect((await del("idle")).status).toBe(204);
+    expect((await call("/v1/inboxes/idle")).status).toBe(404);
+    expect((await del("idle")).status).toBe(404);
+  });
+
+  it("refuses an inbox made since", async () => {
+    const { call, inUse } = await account();
+    expect((await call("/v1/inboxes/new", { method: "PUT" })).status).toBe(200);
+    await inUse("new", "created at ");
+  });
+
+  it("refuses an inbox read since, over HTTP or by a WebSocket's hello", async () => {
+    const { call, oldInbox, inUse } = await account();
+    await oldInbox("polled");
+    expect((await call("/v1/inboxes/polled/events")).status).toBe(200);
+    await inUse("polled", "read at ");
+
+    await oldInbox("hello");
+    const ws = (await call("/v1/inboxes/hello/ws", { headers: { Upgrade: "websocket" } })).webSocket!;
+    const ready = new Promise((resolve) => ws.addEventListener("message", resolve));
+    ws.accept();
+    ws.send(JSON.stringify({ type: "hello" }));
+    await ready;
+    ws.close();
+    await sleep(50);
+    await inUse("hello", "read at ");
+  });
+
+  it("refuses an inbox a subscription was asked for or made for since", async () => {
+    const { oldInbox, sql, del, inUse } = await account();
+    await oldInbox("asked");
+    // As checkSubscription notes every attempt, renewals too.
+    await sql("INSERT INTO subscribing (inbox, at) VALUES ('asked', ?)", Date.now());
+    await inUse("asked", "a subscription asked for at ");
+
+    await oldInbox("subbed");
+    await sql(
+      "INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at) VALUES ('sub_n', 'subbed', 1, 'o/r', 0, 1, '{}', ?, ?)",
+      Date.now(), Date.now() + DAY,
+    );
+    await inUse("subbed", "a subscription made at ");
+
+    // Ones from before don't count.
+    await oldInbox("before");
+    const old = Date.now() - 8 * DAY;
+    await sql("INSERT INTO subscribing (inbox, at) VALUES ('before', ?)", old);
+    await sql(
+      "INSERT INTO subscriptions (id, inbox, repo_id, repo_name, private, pr, spec, created_at, expires_at) VALUES ('sub_o', 'before', 1, 'o/r', 0, 1, '{}', ?, ?)",
+      old, Date.now() + DAY,
+    );
+    // RepoHub never had sub_o; giving it up is as good as ending it.
+    expect((await del("before")).status).toBe(204);
+  });
+
+  it("refuses an inbox with a socket open, however long since its hello", async () => {
+    const { call, oldInbox, sql, del, inUse } = await account();
+    await oldInbox("streaming");
+    const ws = (await call("/v1/inboxes/streaming/ws", { headers: { Upgrade: "websocket" } })).webSocket!;
+    const ready = new Promise((resolve) => ws.addEventListener("message", resolve));
+    const closed = new Promise<number>((resolve) => ws.addEventListener("close", (ev) => resolve(ev.code)));
+    ws.accept();
+    ws.send(JSON.stringify({ type: "hello" }));
+    await ready;
+    // Streaming over the one socket for more than a week since its hello.
+    const old = Date.now() - 8 * DAY;
+    await sql("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'streaming'", old, old);
+    await inUse("streaming", "1 connection open");
+
+    // Without unused_since, DELETE is unconditional, as before.
+    expect((await del("streaming", null)).status).toBe(204);
+    expect(await closed).toBe(4004);
+    expect((await call("/v1/inboxes/streaming")).status).toBe(404);
+  });
+
+  it("refuses an inbox a long poll is waiting on", async () => {
+    const { call, oldInbox, sql, inUse } = await account();
+    await oldInbox("waiting");
+    const poll = call("/v1/inboxes/waiting/events?wait=30");
+    await sleep(200);
+    // The poll's read counts on its own; leave only its bridge.
+    const old = Date.now() - 8 * DAY;
+    await sql("UPDATE inboxes SET last_read_at = ? WHERE name = 'waiting'", old);
+    await inUse("waiting", "1 connection open");
+    expect((await call("/v1/inboxes/waiting", { method: "DELETE" })).status).toBe(204);
+    expect((await (await poll).json<EventsPage>()).events).toEqual([]);
+  });
+
+  it("answers 400 for an unused_since that isn't one past timestamp", async () => {
+    const { call, oldInbox, del } = await account();
+    await oldInbox("box");
+    const bad = [
+      "", "yesterday", "1730000000", "2026-11-04", "2026-11-04T12:00:00", "2026-11-04 12:00:00Z", "2026-11-04t12:00:00z",
+      "2026-02-30T00:00:00Z", "2026-13-01T00:00:00Z", "2026-11-04T24:00:00Z", "2026-11-04T12:00:60Z", "2026-11-04T12:00:00+25:00",
+    ];
+    for (const since of bad) {
+      const res = await del("box", since);
+      expect(res.status, since).toBe(400);
+      expect(await res.json()).toMatchObject({ code: "invalid_request", title: expect.stringContaining("unused_since must be") });
+    }
+    const twice = await call(`/v1/inboxes/box?unused_since=${encodeURIComponent(weekAgo())}&unused_since=${encodeURIComponent(weekAgo())}`, { method: "DELETE" });
+    expect(twice.status).toBe(400);
+    const future = await del("box", new Date(Date.now() + 60_000).toISOString());
+    expect(future.status).toBe(400);
+    expect(await future.json()).toMatchObject({ code: "invalid_request", title: "unused_since is in the future" });
+    expect((await call("/v1/inboxes/box")).status).toBe(200);
+    // An offset's `+` sent unencoded reads as a space, so isn't one.
+    expect((await call(`/v1/inboxes/box?unused_since=2026-11-04T12:00:00+02:00`, { method: "DELETE" })).status).toBe(400);
+    // Encoded, with an offset or with digits past milliseconds, it is.
+    const plusTwo = new Date(Date.now() - 7 * DAY + 2 * 3600 * 1000).toISOString().replace(/Z$/, "456+02:00");
+    expect((await del("box", plusTwo)).status).toBe(204);
+  });
+
+  it("refuses a second delete while one holds its mark, and takes over a lapsed mark", async () => {
+    const { call, stub, sql, oldInbox, del } = await account();
+    await oldInbox("box");
+    const first = await stub.beginDeleteInbox("box", null);
+    expect(first).toMatchObject({ ok: true, subscriptions: [] });
+    const busy = await del("box", null);
+    expect(busy.status).toBe(409);
+    expect(await busy.json()).toMatchObject({ code: "inbox_deleting", title: "Inbox is being deleted" });
+
+    // The first delete's Worker died; past DELETE_MARK_MS its mark lapses.
+    await sql("UPDATE deleting SET at = at - 61000");
+    expect((await del("box")).status).toBe(204);
+    expect((await call("/v1/inboxes/box")).status).toBe(404);
+    expect(await sql("SELECT * FROM deleting")).toEqual([]);
+  });
+
+  it("lets only the delete holding the mark lift it", async () => {
+    const { stub, oldInbox } = await account();
+    await oldInbox("box");
+    await runInDurableObject(stub, (instance: Account, state) => {
+      const begun = instance.beginDeleteInbox("box", null);
+      if (!begun.ok) throw new Error("not begun");
+      // As if it began 61 seconds ago.
+      state.storage.sql.exec("UPDATE deleting SET at = at - 61000");
+      const stale = { mark: begun.mark - 61000 };
+      // A lapsed mark doesn't stop subscribing.
+      expect(instance.checkSubscription("box")).toEqual({ ok: true });
+      const fresh = instance.beginDeleteInbox("box", null);
+      if (!fresh.ok) throw new Error("not taken over");
+      // The first delete wasn't dead after all, and gives up: its mark is
+      // gone, so it leaves the new one.
+      instance.cancelDeleteInbox("box", stale.mark, []);
+      expect(instance.checkSubscription("box")).toMatchObject({ ok: false, status: 409, code: "inbox_deleting" });
+      instance.cancelDeleteInbox("box", fresh.mark, []);
+      expect(instance.checkSubscription("box")).toEqual({ ok: true });
+    });
   });
 });

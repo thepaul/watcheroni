@@ -345,12 +345,71 @@ describe("subscribing to a public repo", () => {
     expect((await hubStats(down.id)).subscriptions.map((s) => s.id)).toEqual([stuck.id]);
     expect(ended.id).not.toBe(stuck.id);
 
+    // The inbox is no longer marked as being deleted: subscribing works.
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${user.id}`));
+    expect(await runInDurableObject(account, (_, state) => state.storage.sql.exec("SELECT * FROM deleting").toArray())).toEqual([]);
+    const again = await subscribe(user.auth, { repo: fullName(ok), pr: 7 });
+    expect(again.status).toBe(201);
+    expect((await list(user.auth)).map((s) => s.id).sort()).toEqual([stuck.id, (await again.json<SubscriptionInfo>()).id].sort());
+
     spy.mockRestore();
     expect((await call("/v1/inboxes/box", { method: "DELETE", headers: user.auth })).status).toBe(204);
     expect((await hubStats(down.id)).subscriptions).toEqual([]);
+    expect((await hubStats(ok.id)).subscriptions).toEqual([]);
   });
 
-  it("takes back a subscription saved while the inbox is being deleted", async () => {
+  it("refuses to subscribe an inbox being deleted, before asking RepoHub", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${user.id}`));
+    // A delete has begun, and is taking back the inbox's subscriptions.
+    expect(await account.beginDeleteInbox("box", null)).toMatchObject({ ok: true });
+    const res = await subscribe(user.auth, { repo: fullName(repo), pr: 7 });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: "inbox_deleting", title: "Inbox is being deleted" });
+    expect((await hubStats(repo.id)).subscriptions).toEqual([]);
+    expect(await account.deleteInbox("box")).toEqual([]);
+    expect((await call("/v1/inboxes/box", { headers: user.auth })).status).toBe(404);
+  });
+
+  it("refuses, and takes back from RepoHub, a subscription whose inbox a delete began on while RepoHub took it", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${user.id}`));
+    // The delete begins after checkSubscription, before saveSubscription.
+    const original = Account.prototype.saveSubscription;
+    vi.spyOn(Account.prototype, "saveSubscription").mockImplementation(function (this: Account, sub: SubscriptionInfo) {
+      expect(this.beginDeleteInbox(sub.inbox, null)).toMatchObject({ ok: true, subscriptions: [] });
+      return original.call(this, sub);
+    });
+    const res = await subscribe(user.auth, { repo: fullName(repo), pr: 7 });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ code: "inbox_deleting", title: "Inbox is being deleted" });
+    expect((await hubStats(repo.id)).subscriptions).toEqual([]);
+    expect(await runInDurableObject(account, (_, state) => state.storage.sql.exec("SELECT id FROM subscriptions").toArray())).toEqual([]);
+  });
+
+  it("won't delete with unused_since an inbox subscribed to since, and leaves the subscription be", async () => {
+    const user = await signedIn();
+    const repo = newRepo();
+    mockGitHub({ repos: [repo] });
+    const sub = await (await subscribe(user.auth, { repo: fullName(repo), pr: 7 })).json<SubscriptionInfo>();
+    const account = env.ACCOUNT.get(env.ACCOUNT.idFromName(`acct:${user.id}`));
+    const old = Date.now() - 8 * 24 * 3600 * 1000;
+    await runInDurableObject(account, (_, state) => {
+      state.storage.sql.exec("UPDATE inboxes SET created_at = ?, last_read_at = ? WHERE name = 'box'", old, old);
+    });
+    const since = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const res = await call(`/v1/inboxes/box?unused_since=${since}`, { method: "DELETE", headers: user.auth });
+    expect(res.status).toBe(409);
+    expect((await res.json<{ code: string; title: string }>()).title).toMatch(/a subscription asked for at .*a subscription made at /);
+    expect((await hubStats(repo.id)).subscriptions.map((s) => s.id)).toEqual([sub.id]);
+    expect((await list(user.auth)).map((s) => s.id)).toEqual([sub.id]);
+  });
+
+  it("takes back a subscription saved after its delete's mark lapsed", async () => {
     const user = await signedIn();
     const repo = newRepo({ prs: { 7: { state: "open" }, 8: { state: "open" } } });
     mockGitHub({ repos: [repo] });
@@ -365,9 +424,13 @@ describe("subscribing to a public repo", () => {
     expect(res.status).toBe(201);
     const late = await res.json<{ id: string }>();
     // Its save lands just before Account deletes the inbox, after the
-    // Worker listed what to take back.
+    // Worker listed what to take back. The mark refuses it, unless the
+    // delete has outlived its mark; then deleteInbox's last step is the
+    // safety net.
     const original = Account.prototype.deleteInbox;
     vi.spyOn(Account.prototype, "deleteInbox").mockImplementation(function (this: Account, name: string) {
+      expect(this.saveSubscription({ ...first, id: late.id, pr: 8 })).toMatchObject({ ok: false, code: "inbox_deleting" });
+      (this as unknown as { sql: SqlStorage }).sql.exec("UPDATE deleting SET at = at - 61000");
       expect(this.saveSubscription({ ...first, id: late.id, pr: 8 })).toEqual({ ok: true });
       return original.call(this, name);
     });
