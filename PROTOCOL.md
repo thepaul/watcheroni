@@ -51,7 +51,7 @@ No authentication. Returns everything a client needs to start:
 {
   "protocol": 1,
   "server": "watcheroni/0.1.0",
-  "features": ["ws", "longpoll", "repo_scope"],
+  "features": ["ws", "longpoll", "repo_scope", "inbox_unused_since"],
   "github": {
     "app_slug": "watcheroni",
     "client_id": "Iv23liABCDEF123456",
@@ -187,6 +187,7 @@ GET    /v1/inboxes               list
 GET    /v1/inboxes/{name}        details
 DELETE /v1/inboxes/{name}        delete, with its subscriptions and events
        [?unused_since=<timestamp>]  ...only if nobody has used it since
+                                    (feature inbox_unused_since)
 ```
 
 Names: 1-64 characters from `[A-Za-z0-9._-]`. An inbox stays until it's
@@ -230,10 +231,13 @@ answers `503` instead.
 
 With `unused_since`, an RFC 3339 timestamp (`2026-11-04T12:00:00Z`; `T`
 and `Z` upper case, an offset's `+` encoded as `%2B`), `DELETE` deletes
-the inbox only if nobody has used it since then. That is checked in the
-same step that stops new subscriptions, so none can come in between;
-a reader can still connect after the check, and is closed with `4004`
-like any other. If it has been used, the answer is `409 inbox_in_use`,
+the inbox only if nobody has used it since then. Only a server that
+lists `inbox_unused_since` in `/v1/meta` `features` honours it; one that
+doesn't ignores `unused_since` and deletes unconditionally, so clients
+MUST NOT send it there, and a client that needs the condition should not
+delete instead. The condition is checked in the same step that stops new
+subscriptions, so none can come in between; a reader can still connect
+after the check, and is closed with `4004` like any other. If it has been used, the answer is `409 inbox_in_use`,
 keeping the inbox, with a `title` that says how it was used. Use is any
 of:
 

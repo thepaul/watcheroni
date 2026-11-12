@@ -209,7 +209,7 @@ function meta(env: Env): Meta {
   return {
     protocol: 1,
     server: `watcheroni/${pkg.version}`,
-    features: ["ws", "longpoll", "repo_scope"],
+    features: ["ws", "longpoll", "repo_scope", "inbox_unused_since"],
     ...(env.GITHUB_CLIENT_ID
       ? {
           github: {

@@ -208,6 +208,11 @@ describe("meta", () => {
     expect(meta.limits.private_verify_seconds).toBe(7 * 24 * 3600);
   });
 
+  it("lists inbox_unused_since, so clients know a conditional DELETE is honoured", async () => {
+    const meta = await (await call("/v1/meta")).json<Meta>();
+    expect(meta.features).toContain("inbox_unused_since");
+  });
+
   it("builds the install URL from GITHUB_APP_SLUG, for self-hosted Apps", () => {
     expect(installUrl({ GITHUB_APP_SLUG: "watcheroni-acme" })).toBe("https://github.com/apps/watcheroni-acme/installations/new");
     expect(installUrl({ GITHUB_APP_SLUG: "" })).toBeUndefined();
