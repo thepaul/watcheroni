@@ -49,7 +49,7 @@ const RUNS_KEPT_MS = 24 * 3600_000;
 // rather than trusting the number.) 5 added the derived events' `checks`
 // and `rollups`; 6 removed the derived events again, dropping those
 // tables and prs.mergeable, and added `check_runs`.
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 7;
 // Retrying an expiry check whose Account couldn't be reached.
 const EXPIRY_RETRY_MS = 5 * 60_000;
 
@@ -71,6 +71,10 @@ export interface NewSubscription {
   ttl_seconds?: number;
   // Private repos: when access must next be re-checked (ms).
   verified_until?: number | null;
+  // When Account checked the inbox for this request (checkSubscription),
+  // by Account's clock: an inbox delete that began before then mustn't end
+  // it (unsubscribe's `notCheckedSince`).
+  checked_at?: number | null;
 }
 
 // What RepoHub tells an Account when checking whether a subscription has
@@ -156,6 +160,10 @@ type SubRow = {
   // How long it lives unread; null for rows from before schema 2, which
   // all had the default.
   ttl_seconds: number | null;
+  // The latest Account check of a request that made or renewed it
+  // (NewSubscription.checked_at); null for rows from before schema 7, and
+  // for /debug subscriptions.
+  checked_at: number | null;
 };
 
 type PrRow = {
@@ -206,7 +214,8 @@ export class RepoHub extends DurableObject<Env> {
           created_at INTEGER NOT NULL,
           expires_at INTEGER NOT NULL,
           verified_until INTEGER,
-          ttl_seconds INTEGER
+          ttl_seconds INTEGER,
+          checked_at INTEGER
         );
         CREATE INDEX IF NOT EXISTS subscriptions_pr ON subscriptions (pr);
         CREATE TABLE IF NOT EXISTS prs (
@@ -229,6 +238,8 @@ export class RepoHub extends DurableObject<Env> {
         ${BUCKETS_TABLE}
       `);
       this.addColumn("subscriptions", "ttl_seconds", "INTEGER");
+      // 7: when Account last checked a request for it (see unsubscribe).
+      this.addColumn("subscriptions", "checked_at", "INTEGER");
       this.addColumn("prs", "author", "TEXT");
       this.addColumn("prs", "seen_at", "INTEGER");
       // 6: no derived events (DESIGN.md, "Notify, don't interpret"). The
@@ -314,6 +325,12 @@ export class RepoHub extends DurableObject<Env> {
       )
       .toArray()[0];
     if (existing) {
+      // Renewed: a delete that began before this request's check must
+      // leave it be.
+      if (sub.checked_at != null && sub.checked_at > (existing.checked_at ?? -Infinity)) {
+        this.sql.exec("UPDATE subscriptions SET checked_at = ? WHERE id = ?", sub.checked_at, existing.id);
+        existing.checked_at = sub.checked_at;
+      }
       // A private repo's access was just checked again.
       if (sub.verified_until && sub.verified_until > (existing.verified_until ?? 0)) {
         this.sql.exec("UPDATE subscriptions SET verified_until = ? WHERE id = ?", sub.verified_until, existing.id);
@@ -346,10 +363,11 @@ export class RepoHub extends DurableObject<Env> {
       expires_at: now + (sub.ttl_seconds ?? DEFAULT_TTL_SECONDS) * 1000,
       verified_until: sub.verified_until ?? null,
       ttl_seconds: sub.ttl_seconds ?? null,
+      checked_at: sub.checked_at ?? null,
     };
     this.sql.exec(
-      "INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at, verified_until, ttl_seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      row.id, row.account_id, row.inbox, row.pr, row.spec, row.created_at, row.expires_at, row.verified_until, row.ttl_seconds,
+      "INSERT INTO subscriptions (id, account_id, inbox, pr, spec, created_at, expires_at, verified_until, ttl_seconds, checked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      row.id, row.account_id, row.inbox, row.pr, row.spec, row.created_at, row.expires_at, row.verified_until, row.ttl_seconds, row.checked_at,
     );
     if (sub.pr !== null) {
       this.sql.exec("INSERT OR IGNORE INTO prs (number) VALUES (?)", sub.pr);
@@ -389,9 +407,17 @@ export class RepoHub extends DurableObject<Env> {
     return true;
   }
 
-  unsubscribe(subId: string): boolean {
+  // RPC: forgets a subscription, without a `watch.*` event. False if there
+  // was none. An inbox delete passes `notCheckedSince`, its deleting
+  // mark's time (Account's clock): a subscription made or renewed by a
+  // request Account checked at or after then is newer than the delete's
+  // list, so it's kept, answering "kept", and the delete gives up. Every
+  // time compared is Account's, so this is exact, whatever the order the
+  // calls land in.
+  unsubscribe(subId: string, notCheckedSince?: number): boolean | "kept" {
     const row = this.sql.exec<SubRow>("SELECT * FROM subscriptions WHERE id = ?", subId).toArray()[0];
     if (!row) return false;
+    if (notCheckedSince !== undefined && row.checked_at !== null && row.checked_at >= notCheckedSince) return "kept";
     this.sql.exec("DELETE FROM subscriptions WHERE id = ?", subId);
     if (row.pr !== null) this.forgetPrIfUnwatched(row.pr);
     else this.refreshTracking();

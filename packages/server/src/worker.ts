@@ -166,7 +166,7 @@ async function api(
       return info ? json(info) : problem(404, "not_found", "No such inbox");
     }
     case "DELETE /v1/inboxes/{name}":
-      return deleteInbox(env, account, name);
+      return deleteInbox(env, account, name, url.searchParams.getAll("unused_since"));
 
     case "POST /v1/inboxes/{name}/subscriptions":
       return createSubscription(request, env, account, accountId, name);

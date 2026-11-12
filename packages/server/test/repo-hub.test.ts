@@ -506,9 +506,10 @@ describe("schema migration", () => {
         new RepoHub(state, env);
         new RepoHub(state, env);
         const meta = (k: string) => sql.exec<{ v: string }>("SELECT v FROM meta WHERE k = ?", k).toArray()[0]?.v;
-        expect(meta("schema_version")).toBe("6");
-        expect(meta("tracks_all_prs")).toBe("1");
         const cols = (t: string) => sql.exec<{ name: string }>("SELECT name FROM pragma_table_info(?)", t).toArray().map((c) => c.name);
+        expect(meta("schema_version")).toBe("7");
+        expect(cols("subscriptions")).toContain("checked_at");
+        expect(meta("tracks_all_prs")).toBe("1");
         expect(cols("prs")).toEqual(["number", "state", "draft", "head_sha", "base_ref", "author", "seen_at"]);
         expect(sql.exec("SELECT number, head_sha, author FROM prs").toArray()).toEqual([{ number: 5, head_sha: SHA_A, author: shape.author ?? null }]);
         expect(sql.exec("SELECT id FROM subscriptions ORDER BY id").toArray()).toEqual([{ id: "sub_a" }, { id: "sub_b" }]);
@@ -526,6 +527,39 @@ describe("schema migration", () => {
       expect((await stats(repo)).prs[0].base_ref).toBe("main");
     });
   }
+});
+
+describe("unsubscribing for an inbox delete", () => {
+  it("keeps a subscription made or renewed by a request checked at or after the delete's mark", async () => {
+    const repo = fresh();
+    const acct = fresh();
+    const info = { id: repo, full_name: "octo/widgets" };
+    const made = await hub(repo).subscribe({ account: acct, inbox: "i", pr: 1, checked_at: 1000 }, info);
+    if (!made.ok) throw new Error(made.detail);
+    const id = made.subscription.id;
+    // Checked before the mark: the delete ends it.
+    // Renewed by a request checked at the mark or later: it stays.
+    expect(await hub(repo).subscribe({ account: acct, inbox: "i", pr: 1, checked_at: 2000 }, info)).toMatchObject({ created: false });
+    expect(await hub(repo).unsubscribe(id, 2000)).toBe("kept");
+    expect(await hub(repo).unsubscribe(id, 1999)).toBe("kept");
+    // A renewal checked earlier doesn't move it back.
+    expect(await hub(repo).subscribe({ account: acct, inbox: "i", pr: 1, checked_at: 500 }, info)).toMatchObject({ created: false });
+    expect(await hub(repo).unsubscribe(id, 2001)).toBe(true);
+    expect((await stats(repo)).subscriptions).toEqual([]);
+  });
+
+  it("ends rows with no check time, from before it was kept or from /debug, as before", async () => {
+    const repo = fresh();
+    const sub = await subscribe(repo, { account: fresh(), inbox: "i", pr: 1 });
+    expect(await hub(repo).unsubscribe(sub.id, 1)).toBe(true);
+    // Without a bound, as subscription deletes and expiry use it, nothing changes.
+    const again = await subscribe(repo, { account: fresh(), inbox: "i", pr: 1 });
+    await runInDurableObject(hub(repo), (_: RepoHub, state) => {
+      state.storage.sql.exec("UPDATE subscriptions SET checked_at = ?", Date.now());
+    });
+    expect(await hub(repo).unsubscribe(again.id)).toBe(true);
+    expect(await hub(repo).unsubscribe(again.id)).toBe(false);
+  });
 });
 
 describe("dedupe", () => {
